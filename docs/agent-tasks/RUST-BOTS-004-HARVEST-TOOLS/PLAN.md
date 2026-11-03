@@ -49,9 +49,16 @@ Interfaces: runner `-SurvivalGather [-RestoreFrom <id>]`, mutually exclusive Wor
 
 Files: RESULT.md; README.md; ignored per-run audit/evidence.
 
-- [ ] Снять owner fingerprint; preflight/isolation; проверить отсутствие чужих процессов.
-- [ ] Live gather с natural источниками и независимой реконструкцией receipts; автоматический shutdown и cleanup.
-- [ ] Live restore в точном saved world; сверить UID/amount, actor identity/goals/tool state; повторить cleanup и owner fingerprint.
-- [ ] Свежий read-only code review и минимальные необходимые исправления/проверки.
-- [ ] RESULT с полной matrix и честным итогом; две отдельные encoding проверки; exact allowlist/diff/ignore/secret guard.
-- [ ] Exact-path commit, ordinary push origin master, remote SHA receipt; итоговый ответ с SHA и ограничениями.
+- [x] Owner fingerprint всех 3086 файлов: changes=0; preflight/isolation и отсутствие чужих процессов проверены.
+- [x] Live gather 2: NATURAL wood20/stones20, 71,6513 м, native debit и независимая реконструкция; GRACEFUL/cleanup.
+- [x] Live restore 3: exact saved world, 7 UID/41 units + condition/identity/goals/tool; 0 PID/ports/rules/locks и owner changes=0.
+- [x] Read-only code review: timestamp/sample regression RED→GREEN; реальный FSM defect в run1 исправлен по локальному IL/001/003, STATIC RED→GREEN + live2/3.
+- [x] RESULT с полной matrix, GREEN ограниченного test scope; две отдельные encoding проверки 17 файлов; exact allowlist/diff/ignore/secret guard.
+- [x] Implementation exact-path commit/push `1ca21bdf42a8fdd55bb9ffccb046b125130538c4`, remote совпал; final docs commit/SHA receipt отдельно после его push.
+
+## Зафиксированные решения и стоимость
+
+- Сохранён Gen2/RustNav и SERVER_ACCOUNTED_TOOL; native equipment не заявляется. Цена: player animations/PlayerInventory и native player bonuses остаются будущей задачей.
+- Третий запуск использован из-за доказанного FSM scheduler defect, в пределах TASK max3; первый PARTIAL receipt сохранён, не заменён PASS.
+- Cross-restart native source pool ledger не добавлен: TASK требует inventory/actor state restore, который доказан; цена — нельзя объявлять production world economy или persistence истощения источников. Это раскрыто в RESULT/API_DECISION.
+- Использован текущий master по прямому запросу; safety/cache/firewall/process helpers и owner Server не менялись. Следующий Goal не начинался.
