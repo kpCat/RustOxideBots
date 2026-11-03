@@ -6,10 +6,12 @@ foreach ($file in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1')) {
     if ($errors.Count) { throw ($errors | Out-String) }
 }
 Write-Output 'PASS: all PowerShell scripts parse'
-foreach ($test in @('Test-Bootstrap.ps1','Test-OwnedProcess.ps1','Test-ProbeSafety.ps1','Test-ProbeCache.ps1','Test-ProbeFirewall.ps1','Test-WorldRoam.ps1','Test-PluginCompile.ps1')) {
+foreach ($test in @('Test-Bootstrap.ps1','Test-OwnedProcess.ps1','Test-ProbeSafety.ps1','Test-ProbeCache.ps1','Test-ProbeFirewall.ps1','Test-WorldRoam.ps1','Test-Survival.ps1','Test-PluginCompile.ps1')) {
     & (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $test)
     if ($LASTEXITCODE -ne 0) { throw ($test + ' failed') }
 }
 & (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-PluginCompile.ps1') -PluginName RustBotsWorldRoam
 if ($LASTEXITCODE -ne 0) { throw 'World roam offline compile failed' }
+& (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-PluginCompile.ps1') -PluginName RustBotsSurvival
+if ($LASTEXITCODE -ne 0) { throw 'Survival offline compile failed' }
 Write-Output 'PASS: focused bootstrap suite (no real server/update launched)'

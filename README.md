@@ -8,6 +8,15 @@
 
 Сценарий 003 добавляет отдельный test-only `RustBotsWorldRoam`: один Gen2 NPC идёт к геометрии настоящей дороги, подходит к native crate/barrel и переносит реальные Item UID в принадлежащий боту ItemContainer. Фактические результаты и ограничения — в [RESULT 003](docs/agent-tasks/RUST-BOTS-003-WORLD-ROAM-LOOT/RESULT.md), подтверждённые API — в [API_FEASIBILITY](docs/agent-tasks/RUST-BOTS-003-WORLD-ROAM-LOOT/API_FEASIBILITY.md). Это диагностический сценарий; видимая экипировка, PlayerInventory и production AI не реализованы.
 
+Сценарий 004 — отдельный `RustBotsSurvival`: потребности wood/stones, bounded поиск естественных TreeEntity/OreResourceEntity, физический подход и явно обозначенный `SERVER_ACCOUNTED_TOOL`. Начальный kit — один native rock; это не добыча и не native экипировка. Адаптер читает установленный профиль камня, учитывает condition, списывает реальный single-category pool через `ResourceDispenser.DestroyFraction(amount)` и лишь после проверки debit создаёт native output Item. Фактические результаты — в [RESULT 004](docs/agent-tasks/RUST-BOTS-004-HARVEST-TOOLS/RESULT.md), ограничения API — в [API_DECISION](docs/agent-tasks/RUST-BOTS-004-HARVEST-TOOLS/API_DECISION.md).
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -SurvivalGather
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -SurvivalGather -RestoreFrom <completed-gather-run-id>
+```
+
+004 restore дополнительно связывает hash actor/goal/tool state с native inventory и точным завершённым миром; он проверяет прежние UID, amount и condition, затем останавливается без повторной добычи. Runtime pool ResourceDispenser сам по себе не сохраняется native ResourceEntity.Save: восстановление добытых предметов не доказывает сохранение depleted pools. Это ограниченный probe; cross-restart resource ledger, player animations и crafting требуют отдельного этапа. Режимы `-SurvivalGather` и `-WorldRoam` несовместимы; прежние команды 001/003 сохранены.
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -WorldRoam
 # После clean run: native inventory restore в точном сохранённом test world.
