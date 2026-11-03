@@ -3,7 +3,7 @@
 param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
     [ValidateRange(60,1200)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
     [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0, [switch]$WorldRoam,
-    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft)
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft, [switch]$PlayerAvatar)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
 . (Join-Path $PSScriptRoot 'ProbeCache.ps1')
@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'WorldRoamValidation.ps1')
 . (Join-Path $PSScriptRoot 'SurvivalValidation.ps1')
 . (Join-Path $PSScriptRoot 'CraftValidation.ps1')
+. (Join-Path $PSScriptRoot 'AvatarValidation.ps1')
 Initialize-ProbeUtf8
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $source = Join-Path $repo 'Server\rustds'
@@ -28,8 +29,8 @@ $oldScenario = $env:RUST_BOTS_SCENARIO
 $oldRestore = $env:RUST_BOTS_RESTORE
 $oldResume = $env:RUST_BOTS_RESUME_JOURNEY
 $isSurvival = $SurvivalGather -or $SurvivalCraft
-$scenario = if ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
-$pluginName = if ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
+$scenario = if ($PlayerAvatar) {'PLAYER_AVATAR'} elseif ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
+$pluginName = if ($PlayerAvatar) {'RustBotsAvatarProbe'} elseif ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $report = [ordered]@{
     Status = 'BLOCKED'; Reason = ''; RunId = $runId; ServerPid = $null
@@ -55,7 +56,7 @@ function Save-Report {
 }
 
 try {
-    if (([int][bool]$SurvivalGather+[int][bool]$SurvivalCraft+[int][bool]$WorldRoam) -gt 1 -or ($isSurvival -and $ResumeJourney)) { throw 'Survival modes are exclusive with each other and WorldRoam/ResumeJourney' }
+    if (([int][bool]$SurvivalGather+[int][bool]$SurvivalCraft+[int][bool]$WorldRoam+[int][bool]$PlayerAvatar) -gt 1 -or (($isSurvival -or $PlayerAvatar) -and $ResumeJourney)) { throw 'Probe scenario modes are exclusive; avatar/survival do not support ResumeJourney' }
     if ($RestoreFrom -and -not ($WorldRoam -or $isSurvival)) { throw 'RestoreFrom requires WorldRoam or Survival mode' }
     if ($ResumeJourney -and -not $RestoreFrom) { throw 'ResumeJourney requires RestoreFrom' }
     # Check links before the first write, including the ignored parent directories.
@@ -187,7 +188,9 @@ try {
                 $report.Navigation = $nav
                 Copy-Item -LiteralPath $navFile -Destination (Join-Path $runtime 'plugin-result.json')
                 try {
-                    if ($isSurvival) {
+                    if ($PlayerAvatar) {
+                        Assert-AvatarResult $nav
+                    } elseif ($isSurvival) {
                         $expectedMode=if ($RestoreFrom) { 'RESTORE' } elseif ($SurvivalCraft) { 'CRAFT' } else { 'GATHER' }
                         if ($nav.Mode -ne $expectedMode) { throw 'Unexpected survival mode' }
                         Assert-SurvivalScenarioResult $nav $scenario
@@ -271,6 +274,11 @@ try {
         $env:RUST_BOTS_RESTORE = $oldRestore
         $env:RUST_BOTS_RESUME_JOURNEY = $oldResume
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
+        if ($PlayerAvatar -and $report.Status -eq 'GREEN') {
+            $report['AvatarCompletedSave']=Test-ProbeCompletedSave $report (Read-ProbeLog $log)
+            try { Assert-AvatarSafety $report }
+            catch { $report.Status='FAILED'; $report.Reason=$_.Exception.Message }
+        }
         if (Test-Path -LiteralPath $runtime) { Save-Report }
         try {
             if ($isSurvival -and -not $RestoreFrom -and $cache -and $report.Cache.Promoted -and $report.Navigation.Persistence.Saved -and $report.Status -in @('GREEN','PARTIAL')) {

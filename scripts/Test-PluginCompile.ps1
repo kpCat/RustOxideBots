@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-param([ValidateSet('RustBotsNavigationProbe','RustBotsWorldRoam','RustBotsSurvival')][string]$PluginName='RustBotsNavigationProbe')
+param([ValidateSet('RustBotsNavigationProbe','RustBotsWorldRoam','RustBotsSurvival','RustBotsAvatarProbe')][string]$PluginName='RustBotsNavigationProbe')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $plugin = Join-Path $repo ('src\plugins\'+$PluginName+'.cs')
