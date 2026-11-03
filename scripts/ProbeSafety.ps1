@@ -1,5 +1,11 @@
 #Requires -Version 5.1
 # Shared safety checks used before any runtime copy or GREEN claim.
+function Initialize-ProbeUtf8 {
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $global:OutputEncoding = $utf8
+    [Console]::OutputEncoding = $utf8
+    [Console]::InputEncoding = $utf8
+}
 function Assert-ProbePlainPath([string]$path) {
     $item = Get-Item -LiteralPath $path -Force
     while ($null -ne $item) {
@@ -25,9 +31,12 @@ function Read-ProbeLog([string]$path) {
     $stream = $null; $reader = $null
     try {
         $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        $reader = New-Object IO.StreamReader($stream)
+        $reader = New-Object IO.StreamReader($stream, (New-Object Text.UTF8Encoding($false,$true)), $true)
         return $reader.ReadToEnd()
-    } catch [IO.IOException] { return '' } finally {
+    } catch [IO.IOException] {
+        Write-Warning ('Transient log read failed; retry within deadline: ' + $_.Exception.Message)
+        return ''
+    } finally {
         if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() }
     }
 }

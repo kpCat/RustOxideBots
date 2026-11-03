@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 $runner = Join-Path $PSScriptRoot 'Invoke-NavigationProbe.ps1'
 if (-not (Test-Path $runner)) { throw 'Missing fail-closed probe runner' }
@@ -35,6 +35,33 @@ try {
     if ((Read-ProbeLog $logPath) -ne 'Server startup complete') { throw 'Cannot read live writable log' }
 } finally { $writer.Dispose() }
 Write-Output 'PASS: reads log while server holds writable handle'
+
+[IO.File]::WriteAllText($logPath, 'Сделана попытка доступа к сокету. Перевірка UTF-8.', (New-Object Text.UTF8Encoding($false)))
+if ((Read-ProbeLog $logPath) -ne 'Сделана попытка доступа к сокету. Перевірка UTF-8.') { throw 'UTF-8 log was decoded incorrectly' }
+Write-Output 'PASS: UTF-8 Cyrillic log decoded without OEM mojibake'
+
+$consoleScript = Join-Path $fixture 'console-utf8.ps1'
+$consoleSource = @'
+param([string]$Module)
+. $Module
+Initialize-ProbeUtf8
+Write-Output 'Сделана попытка доступа к сокету. Перевірка UTF-8.'
+'@
+[IO.File]::WriteAllText($consoleScript,$consoleSource,(New-Object Text.UTF8Encoding($true)))
+$consoleInfo = New-Object Diagnostics.ProcessStartInfo
+$consoleInfo.FileName = Join-Path $PSHOME 'powershell.exe'
+$consoleInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "'+$consoleScript+'" "'+(Join-Path $PSScriptRoot 'ProbeSafety.ps1')+'"'
+$consoleInfo.UseShellExecute = $false
+$consoleInfo.CreateNoWindow = $true
+$consoleInfo.RedirectStandardOutput = $true
+$consoleInfo.StandardOutputEncoding = New-Object Text.UTF8Encoding($false,$true)
+$consoleProcess = [Diagnostics.Process]::Start($consoleInfo)
+try {
+    $output = $consoleProcess.StandardOutput.ReadToEnd().Trim()
+    $consoleProcess.WaitForExit()
+    if ($consoleProcess.ExitCode -ne 0 -or $output -ne 'Сделана попытка доступа к сокету. Перевірка UTF-8.') { throw 'PowerShell native UTF-8 output corrupted' }
+} finally { $consoleProcess.Dispose() }
+Write-Output 'PASS: Windows PowerShell console emits UTF-8 Cyrillic bytes'
 
 # Regression: a selected runtime directory itself may be a junction.
 $targetDir = Join-Path $fixture 'owner-like-data'

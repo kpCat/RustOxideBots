@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsNavigationProbe", "RustOxideBots", "0.1.0")]
+    [Info("RustBotsNavigationProbe", "RustOxideBots", "0.2.0")]
     [Description("One test-only humanoid navigation probe; inert outside its isolated runner.")]
     public class RustBotsNavigationProbe : RustPlugin
     {
@@ -24,6 +24,12 @@ namespace Oxide.Plugins
         private float previousTime, legStarted, progressTime, traveled, total;
         private int completed, repaths, stuckCount, rejectedSamples;
         private readonly List<object> legs = new List<object>();
+        private readonly Dictionary<string, int> rejections = new Dictionary<string, int>();
+        private readonly Dictionary<string, List<object>> rejectionExamples = new Dictionary<string, List<object>>();
+        private bool beginRequested;
+        private float navWaitStarted, nextNavReport;
+        private float capsuleHeight = 1.9f;
+        private const float CapsuleRadius = 0.45f;
 
         private bool IsTestRoot()
         {
@@ -33,7 +39,8 @@ namespace Oxide.Plugins
             if (string.IsNullOrEmpty(root) || !Guid.TryParseExact(token, "N", out parsed)) return false;
             string cwd = Path.GetFullPath(Directory.GetCurrentDirectory()).TrimEnd('\\', '/');
             if (!string.Equals(cwd, Path.GetFullPath(root).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)) return false;
-            if (!ConVar.Server.identity.Equals("rustbots_probe_" + token, StringComparison.Ordinal)) return false;
+            string identity = Environment.GetEnvironmentVariable("RUST_BOTS_TEST_IDENTITY") ?? ("rustbots_probe_" + token);
+            if (!identity.StartsWith("rustbots_probe_", StringComparison.Ordinal) || !ConVar.Server.identity.Equals(identity, StringComparison.Ordinal)) return false;
             string marker = Path.Combine(root, "rustbots-test.marker");
             return File.Exists(marker) && File.ReadAllText(marker) == token;
         }
@@ -55,15 +62,35 @@ namespace Oxide.Plugins
                         ConsoleSystem.Run(ConsoleSystem.Option.Server, "quit");
                         return;
                     }
+                    if (beginRequested && !finished && !active) WaitForNavigation();
                     if (active && !finished) TickProbe();
                 }
                 catch (Exception ex) { Finish("BLOCKED", "Probe exception: " + ex.GetType().Name); }
             });
             timer.Once(5f, () =>
             {
-                try { BeginProbe(); }
+                try { beginRequested = true; navWaitStarted = Time.realtimeSinceStartup; WaitForNavigation(); }
                 catch (Exception ex) { Finish("BLOCKED", "Probe initialization: " + ex.GetType().Name); }
             });
+        }
+
+        private void WaitForNavigation()
+        {
+            var nav = RustNavigation.Instance;
+            bool ready = ConVar.AI.useUnityNavmesh || (nav != null && nav.IsDefaultNavmeshBuilt());
+            if (ready) { beginRequested = false; BeginProbe(); return; }
+            if (Time.realtimeSinceStartup >= nextNavReport)
+            {
+                nextNavReport = Time.realtimeSinceStartup + 10f;
+                var mesh = nav == null ? null : nav.DefaultNavmesh;
+                Puts("RUSTBOTS_NAV_WAIT " + JsonConvert.SerializeObject(new {
+                    Elapsed = Time.realtimeSinceStartup - navWaitStarted,
+                    BuiltTiles = mesh == null ? 0 : mesh.NumBuiltTiles, TotalTiles = mesh == null ? 0 : mesh.TotalTiles,
+                    IsValid = mesh != null && mesh.IsValid(), IsBuilt = ready
+                }));
+            }
+            if (Time.realtimeSinceStartup - navWaitStarted > 600f)
+                Finish("BLOCKED", "RustNav default mesh not fully built after 600 seconds; see RUSTBOTS_NAV_WAIT tile counts");
         }
 
         private void BeginProbe()
@@ -72,6 +99,7 @@ namespace Oxide.Plugins
             var choices = GameManifest.Current.entities
                 .Where(p => p.EndsWith(".prefab") && p.IndexOf("scientist", StringComparison.OrdinalIgnoreCase) >= 0)
                 .OrderByDescending(p => p.IndexOf("roam", StringComparison.OrdinalIgnoreCase) >= 0)
+                .ThenBy(p => p.IndexOf("heavy", StringComparison.OrdinalIgnoreCase) >= 0)
                 .ThenBy(p => p).ToArray();
             GameObject selected = null;
             foreach (bool modern in new[] { true, false })
@@ -87,6 +115,9 @@ namespace Oxide.Plugins
             }
             if (selected == null) { Finish("BLOCKED", "No installed humanoid prefab with RustNavMeshAgent"); return; }
             var settings = selected.GetComponent<RustNavMeshAgent>();
+            capsuleHeight = Mathf.Clamp(settings.height, 1.9f, 2.5f);
+            Puts("RUSTBOTS_PREFAB " + JsonConvert.SerializeObject(new { Prefab = prefab,
+                AgentType = settings.agentTypeID, AreaMask = settings.areaMask, Height = capsuleHeight, Radius = CapsuleRadius }));
             Vector3 spawn;
             if (!FindSpawn(settings, out spawn)) { Finish("BLOCKED", "No grounded clear spawn on active backend within bounded search"); return; }
             // Exactly one entity. No retry spawning and no reposition/warp after birth.
@@ -116,29 +147,90 @@ namespace Oxide.Plugins
             StartLeg();
         }
 
-        private bool ClearGround(Vector3 p)
+        private bool Reject(string reason, Vector3 candidate, object detail)
         {
+            rejectedSamples++;
+            if (!rejections.ContainsKey(reason)) { rejections[reason] = 0; rejectionExamples[reason] = new List<object>(); }
+            rejections[reason]++;
+            if (rejectionExamples[reason].Count < 3)
+            {
+                var example = new { Reason = reason, Candidate = Point(candidate), TerrainHeight = TerrainMeta.HeightMap.GetHeight(candidate), Detail = detail };
+                rejectionExamples[reason].Add(example);
+                Puts("RUSTBOTS_REJECT " + JsonConvert.SerializeObject(example));
+            }
+            return false;
+        }
+
+        private bool ClearGround(Vector3 navPoint, out Vector3 foot)
+        {
+            foot = navPoint;
             RaycastHit hit;
-            if (p.y < 3f || !Physics.Raycast(p + Vector3.up * 3f, Vector3.down, out hit, 6f,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)) return false;
-            if (Mathf.Abs(hit.point.y - p.y) > 0.7f || hit.normal.y < 0.92f) return false;
-            return !Physics.CheckCapsule(p + Vector3.up * 0.55f, p + Vector3.up * 1.75f,
-                0.4f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            if (!Physics.Raycast(navPoint + Vector3.up * 4f, Vector3.down, out hit, 8f,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)) return Reject("NoGroundRayHit", navPoint, null);
+            float terrain = TerrainMeta.HeightMap.GetHeight(hit.point);
+            if (Mathf.Abs(hit.point.y - navPoint.y) > 1f) return Reject("NavGroundHeightMismatch", navPoint, new { Ground = Point(hit.point), Collider = hit.collider.name });
+            if (Mathf.Abs(hit.point.y - terrain) > 0.8f) return Reject("AboveTerrainStructureOrRock", navPoint, new { Ground = Point(hit.point), Terrain = terrain, Collider = hit.collider.name });
+            if (hit.normal.y < 0.85f) return Reject("SteepGround", navPoint, new { Normal = Point(hit.normal), Collider = hit.collider.name });
+            foot = hit.point + Vector3.up * 0.05f;
+            float water = WaterLevel.GetWaterSurface(foot, true, true, null);
+            if (water - foot.y > 0.15f) return Reject("UnderWater", navPoint, new { Foot = Point(foot), Water = water });
+            var overlaps = Physics.OverlapCapsule(foot + Vector3.up * (CapsuleRadius + 0.12f),
+                foot + Vector3.up * (capsuleHeight - CapsuleRadius), CapsuleRadius,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            if (overlaps.Length != 0) return Reject("CapsuleObstacle", navPoint, new {
+                Foot = Point(foot), Height = capsuleHeight, Radius = CapsuleRadius,
+                Colliders = overlaps.Take(4).Select(c => new { Name = c.name, Type = c.GetType().Name, Layer = c.gameObject.layer }).ToArray()
+            });
+            return true;
         }
 
         private bool FindSpawn(RustNavMeshAgent settings, out Vector3 spawn)
         {
-            // Terrain-relative grid; actual points are sampled on the selected live backend.
-            float spacing = Mathf.Min(80f, TerrainMeta.Size.x / 20f);
-            for (int x = -6; x <= 6; x++) for (int z = -6; z <= 6; z++)
+            // Low-discrepancy coverage of 90% of the map, including low coastal terrain.
+            for (int i = 1; i <= 1024; i++)
             {
-                Vector3 candidate = new Vector3(x * spacing, 0f, z * spacing);
+                Vector3 candidate = new Vector3((Halton(i, 2) - 0.5f) * TerrainMeta.Size.x * 0.9f,
+                    0f, (Halton(i, 3) - 0.5f) * TerrainMeta.Size.z * 0.9f);
                 candidate.y = TerrainMeta.HeightMap.GetHeight(candidate);
-                Vector3 sample;
-                if (!SampleInitial(settings, candidate, out sample) || !ClearGround(sample)) { rejectedSamples++; continue; }
-                spawn = sample; return true;
+                Vector3 sample, foot;
+                if (!SampleInitial(settings, candidate, out sample) || !ClearGround(sample, out foot)) continue;
+                if (!HasDeparture(settings, foot)) { Reject("NoCompleteDeparturePath", foot, null); continue; }
+                spawn = foot;
+                Puts("RUSTBOTS_SPAWN_ACCEPT " + JsonConvert.SerializeObject(new { Candidate = Point(candidate), NavPoint = Point(sample), Foot = Point(foot), Rejections = rejections }));
+                return true;
             }
             spawn = Vector3.zero; return false;
+        }
+
+        private static float Halton(int index, int radix)
+        {
+            float fraction = 1f, value = 0f;
+            while (index > 0) { fraction /= radix; value += fraction * (index % radix); index /= radix; }
+            return value;
+        }
+
+        private bool HasDeparture(RustNavMeshAgent settings, Vector3 from)
+        {
+            for (int i = 0; i < 12; i++)
+            {
+                float angle = i * Mathf.PI / 6f;
+                Vector3 candidate = from + new Vector3(Mathf.Cos(angle), 0f, Mathf.Sin(angle)) * 36f;
+                candidate.y = TerrainMeta.HeightMap.GetHeight(candidate);
+                Vector3 sample, foot;
+                if (!SampleInitial(settings, candidate, out sample) || !ClearGround(sample, out foot)) continue;
+                if (ConVar.AI.useUnityNavmesh)
+                {
+                    var path = new NavMeshPath();
+                    var filter = new NavMeshQueryFilter { agentTypeID = settings.agentTypeID, areaMask = settings.areaMask };
+                    if (NavMesh.CalculatePath(from, foot, filter, path) && path.status == NavMeshPathStatus.PathComplete) return true;
+                }
+                else
+                {
+                    var path = new RustNavMeshPath();
+                    if (RustNavigation.Instance.DefaultNavmesh.CalculatePath(new NavVector3(from), new NavVector3(foot), path, false) && path.status == NavMeshPathStatus.PathComplete) return true;
+                }
+            }
+            return false;
         }
 
         private bool SampleInitial(RustNavMeshAgent settings, Vector3 candidate, out Vector3 point)
@@ -148,13 +240,14 @@ namespace Oxide.Plugins
             {
                 NavMeshHit hit;
                 var filter = new NavMeshQueryFilter { agentTypeID = settings.agentTypeID, areaMask = settings.areaMask };
-                if (!NavMesh.SamplePosition(candidate, out hit, 1.5f, filter)) return false;
+                if (!NavMesh.SamplePosition(candidate, out hit, 2.5f, filter)) return Reject("UnityNavSampleMiss", candidate, new { Radius = 2.5f });
                 point = hit.position; return true;
             }
             var navigation = RustNavigation.Instance;
-            if (navigation == null || !navigation.IsDefaultNavmeshBuilt()) return false;
+            if (navigation == null || !navigation.IsDefaultNavmeshBuilt()) return Reject("RustNavNotFullyBuilt", candidate, null);
             NavHit navHit;
-            if (!navigation.DefaultNavmesh.SamplePosition(new NavVector3(candidate), out navHit, new Vector3(1.5f, 2f, 1.5f), false)) return false;
+            if (!navigation.DefaultNavmesh.SamplePosition(new NavVector3(candidate), out navHit, new Vector3(2.5f, 3f, 2.5f), false))
+                return Reject("RustNavSampleMiss", candidate, new { Extents = new[] { 2.5f, 3f, 2.5f }, BuiltTiles = navigation.DefaultNavmesh.NumBuiltTiles, TotalTiles = navigation.DefaultNavmesh.TotalTiles });
             point = navHit.position.Value; return true;
         }
 
@@ -168,12 +261,14 @@ namespace Oxide.Plugins
                 Vector3 candidate = from + new Vector3(Mathf.Cos(angle), 0, Mathf.Sin(angle)) * (32f + (i % 3) * 4f);
                 candidate.y = TerrainMeta.HeightMap.GetHeight(candidate);
                 NavMeshHit hit;
-                if (!agent.SamplePosition(candidate, out hit, 1.5f, false) || !ClearGround(hit.position)) { rejectedSamples++; continue; }
-                if (Vector3.Distance(from, hit.position) < 28f) { rejectedSamples++; continue; }
+                Vector3 foot;
+                if (!agent.SamplePosition(candidate, out hit, 2.5f, false)) { Reject("AgentNavSampleMiss", candidate, new { Radius = 2.5f, AgentType = agent.agentTypeID }); continue; }
+                if (!ClearGround(hit.position, out foot)) continue;
+                if (Vector3.Distance(from, foot) < 28f) { Reject("TargetTooNear", foot, null); continue; }
                 var path = new RustNavMeshPath();
-                if (!agent.CalculatePath(hit.position, path) || path.status != NavMeshPathStatus.PathComplete || path.GetPathLength() < 28f)
-                { rejectedSamples++; continue; }
-                chosen = hit.position; return true;
+                if (!agent.CalculatePath(foot, path) || path.status != NavMeshPathStatus.PathComplete || path.GetPathLength() < 28f)
+                { Reject("AgentIncompletePath", foot, new { Status = path.status.ToString(), Length = path.GetPathLength() }); continue; }
+                chosen = foot; return true;
             }
             chosen = Vector3.zero; return false;
         }
@@ -241,7 +336,8 @@ namespace Oxide.Plugins
                     End = Point(npc.transform.position), Elapsed = Time.realtimeSinceStartup - legStarted, Traveled = traveled,
                     Net = Vector3.Distance(start, npc.transform.position), Stuck = stuckCount, Repath = repaths });
             var result = new { RunId = token, Status = status, Reason = reason, Backend = backend, Prefab = prefab,
-                CompletedLegs = completed, TotalTraveled = total + (completed < 3 ? traveled : 0f), RejectedSamples = rejectedSamples, Legs = legs };
+                CompletedLegs = completed, TotalTraveled = total + (completed < 3 ? traveled : 0f), RejectedSamples = rejectedSamples,
+                Rejections = rejections, RejectionExamples = rejectionExamples, Legs = legs };
             if (!string.IsNullOrEmpty(root))
             {
                 string path = Path.Combine(root, "oxide", "data", "RustBotsNavigationProbe.result.json");

@@ -1,5 +1,91 @@
 # RUST-BOTS-001-BOOTSTRAP-NAVIGATION v2 — RESULT
 
+## Актуальный результат продолжения от 03.11.2026: GREEN
+
+Два настоящих E2E выполнены агентом самостоятельно: отдельный RustDedicated без повышения Windows-прав, подтверждённые block-правила через UAC-helper, live Oxide compilation, один Scientist2, три динамические complete-path цели и более 92 м фактического движения в каждом запуске. Оба сервера штатно завершены; финальные Rust/SteamCMD PID, TCP/UDP endpoints и собственные firewall rules — 0. Rust/Oxide/SteamCMD не обновлялись. Задача 002 не запускалась.
+
+| Запуск | Ready по result.json | NPC / legs | Фактический путь | Shutdown / cache |
+|---|---:|---:|---:|---|
+| Предоставленный владельцем `fc3ce0bee5e14e958e30289ad61929c8` | 342.65 s | 0 / 0 | 0 м | GRACEFUL, исходный BLOCKED сохранён |
+| Первый самостоятельный `88436ae68e38489dbc15252303353fc2`, PID 37284 | 268.51 s | 1 / 3 | 92.20833 м | GRACEFUL; внешний lease закрыт отдельным receipt |
+| Контрольный `b0bd803ae7854a309af9f8ed000731da`, PID 48800 | 264.44 s | 1 / 3 | 92.2068253 м | GRACEFUL, PortsReleased=true, FirewallRemoved=true, Cache.Promoted=true |
+
+Последний runner был Windows PowerShell 5.1, `RunnerElevated=false`; первый — PowerShell 7, также false. Параметр Codex sandbox escalation не использовался как доказательство Windows elevation. Только helper имел проверенный Administrator token и делал firewall-операции; CreateProcess игрового сервера выполнялся обычным runner с атомарным включением в собственный kill-on-close Job Object. Команды запуска/остановки владелец не выполнял.
+
+Runtime: Rust Steam app manifest buildid **26139947**, живой лог `Protocol: 2635.289.1`, Oxide.Rust **2.0.7839**, плагин **0.2.0**. SHA игровых DLL/EXE из исходной поставки ниже остались прежними; Unity FileVersion не выдаётся за Rust build number.
+
+### Причина прежнего отказа и исправление
+
+Установленная DLL показывает: `RustNavigation.IsDefaultNavmeshBuilt()` вызывает `RustNavmesh.IsBuilt()`, который сравнивает numBuiltTiles с полной длиной tiles; RustNavMeshAgent также не привязывается к default mesh до этого условия. Старый SampleInitial возвращал false до геометрических проверок, если вся сетка ещё не готова. В предоставленном запуске после готовности сервера сохранялось 14 837 pending tiles; это согласуется с ранним отказом всех 169 кандидатов. В самостоятельном запуске новая диагностика непосредственно зафиксировала **21461/35344** и затем **28720/35344** при `IsBuilt=false`. После полной готовности первая проверенная точка сразу принята.
+
+Проба теперь ограниченно ждёт сетку, выводит built/total и отличает этот блокер от sample miss, отсутствия ground ray hit, перепада nav/ground, поверхности над terrain, уклона, воды, capsule obstacle и неполного маршрута. Для каждой причины — счётчик и до трёх примеров с координатами, terrain/ground/nav height и collider type/name/layer. В двух успешных пробах RejectedSamples=0, поэтому примеров отвергнутых точек в этих запусках нет; они не выдуманы.
+
+Убран абсолютный `p.y < 3`; вода проверяется относительно WaterLevel. Поиск Halton покрывает 90% размера карты, вместо прежней центральной сетки. Высота и capsule проверяются относительно фактического ground hit; структуры/скалы над terrain и занятое пространство отвергаются. До рождения проверяется complete departure path. Предпочтён обычный Gen2 Scientist2 вместо Heavy; height=2.0, capsule radius=0.45, agentType=0, areaMask=25. Сам по себе переход на более мягкие геометрические допуски не объявляется доказанной причиной старого отказа.
+
+Фактический NPC: `Rust.Ai.Gen2.ScientistNPC2`, prefab `Assets/Rust.Ai/Agents/NPCPlayer/HumanNPC/Scientist/Gen2/Scientist2.prefab`, FSM `Rust.Ai.Gen2.Scientist2FSM`, brain=null, агент `Rust.Ai.Gen2.RustNavMeshAgent`, backend **RustNav**. Gen2 scientist не BasePlayer и не живое Steam-соединение. Плагин использует штатный агент, отключая конкурирующее поведение FSM только собственного NPC.
+
+### Живые метрики контрольного запуска
+
+| Leg | Start → target → end (x,y,z; округлено) | elapsed | traveled / net | status, stuck/repath |
+|---|---|---:|---:|---|
+| 1 | (0,5.449,-300) → (32,5.348,-300) → (30.468,5.592,-300) | 10.476 s | 30.50128 / 30.4685 м | ARRIVED / PathComplete, 0/0 |
+| 2 | (30.468,5.592,-300) → (40.886,8.605,-269.743) → (40.438,8.610,-271.046) | 10.501 s | 30.94933 / 30.77066 м | ARRIVED / PathComplete, 0/0 |
+| 3 | (40.438,8.610,-271.046) → (15.221,7.100,-251.345) → (16.324,7.092,-252.206) | 10.500 s | 30.75621 / 30.63828 м | ARRIVED / PathComplete, 0/0 |
+
+Итого 92.2068253 м; каждый net >20 м. Независимая реконструкция из 63 raw RUSTBOTS_SAMPLE дала 92.206827 м. Для первой пробы 64 samples дали 92.208317 м против plugin total 92.20833. Допуск расхождения менее 0.001 м связан с float/JSON. В каждом логе ровно один RUSTBOTS_NPC. Телепортаций/ручного изменения координат в исходнике нет; после рождения движение выполняется SetDestination штатного агента. Discontinuity/stuck watchdog не сработал. Это не доказывает длительные путешествия, обход домов, монументы, farming/crafting/PvP или масштаб 50–100.
+
+### Проверенный постоянный тестовый кеш
+
+Ключ контрольного кеша: `b37a93c03ae490a52662af2f167343eda017ce450d373f43abced8fb91b58b23`, identity `rustbots_probe_b37a93c03ae490a52662af2f`. Он связывает Rust/Oxide/compiler/native/Unity fingerprints, размер/seed/level/backend и инвентарь Bundles. Ключ использует ordinal primitives; найденное различие culture sorting PowerShell 5.1/7 воспроизведено focused regression test и устранено.
+
+Копия runtime создаётся в staging, полный инвентарь файлов проверяется SHA-256, затем выполняется promotion. При отсутствии/повреждении manifest/runtime установка карантинируется и пересоздаётся. Map/sav/navmesh/occlusion копируются физически только после проверки всех world hashes; configs/DB/Oxide/логи не входят в world snapshot. Повреждённый world manifest отвергается до копирования, и новый тестовый мир может быть безопасно создан. Ни hardlink/junction, ни owner world/cache/configs не используются. Для каждого запуска writable Oxide/cfg/data и временное состояние свежие; исторические тестовые архивы сохраняются локально.
+
+Оба agent run использовали WARM map cache, затем второй получил полный RustNav первого. В контрольном логе — загрузка **13027 data tiles**, default mesh **35344/35344**, 124.1978 ms загрузки, без холодных Terrain Erosion/Harbors/Cliffs generation phases. Processing World: **0.5 s**, против **75.5 s** в предоставленном холодном запуске (первая тёплая проба — 0.6 s). SHA-256 .map всех трёх запусков одинаков: `1F09D94EC8DA9DAC4E32908817A16BCC167D7B5A654E90DB19042E1501F17A47`. Одна общая строка «Generating procedural map» всё ещё печатается движком и не использовалась как признак регенерации.
+
+Второй quit сохранил RustNav с **0 pending tiles**. Cache.Promoted=true; итоговый snapshot затем отдельно восстановлен в ignored proof directory и все его хеши проверены. Полный cached install также повторно проверен по manifest. Третьего игрового запуска ради этой проверки не было. Оставшаяся задержка между полной загрузкой default mesh (~22.76 s от старта) и ready (~264.44 s) по этой телеметрии не разложена полностью; сетевые ошибки при изоляции ожидаемы, доступ наружу ради ускорения/чистоты лога не открывался.
+
+### Делегирование, shutdown, encoding и сохранность
+
+Короткий UAC broker ограничен `.local/probe-cache/<key>/install`, проверяет plain paths и ActiveStore, создаёт только Block Inbound/Outbound для EXE этого test root. Runner читает точные правила через firewall COM. Reservation удерживается от финальной проверки до окончания owned job; closing marker и exclusive lock запрещают новый старт и снятие правил в опасном окне. Ошибка ready/start запрашивает cleanup и не выдаёт недоказанный FirewallRemoved=true. Внешний lease допускает несколько попыток на одной установке до часа; завершение controller/expiry ведёт к безопасному закрытию, при живом процессе denial сохраняется.
+
+Установленный `ConVar.Global.quit` сначала вызывает ServerMgr.Shutdown, затем Process.Kill. Поэтому наблюдаемый exit **−1** при ACK/законченном save не был заменён на 0 и не принят за crash без исследования. Cache promotion требует ACK, completed native/world save, подтверждённый exit/absence и явный разрешённый 0/−1. В контрольном запуске это условие выполнено; никакого принудительного stop runner после timeout не потребовалось. Owned Job Object затем закрыт для всех дочерних процессов.
+
+Финальные проверки вне sandbox: RustDedicated/RustClient/Rust/SteamCMD **0**, endpoints 28965–28968 TCP **0**, UDP **0**, правила `RustBots001-*` **0**. Helper обоих запусков завершён. Контрольный closed.json: Removed=true, RemainingProcesses=0, `2026-11-03T11:31:50.0246527Z`. Первый result.json сохранил FirewallRemoved=false на момент окончания его внешнего lease; последующее удаление подтверждено отдельным `.local/probe-firewall/52e7d9bced32431f889e196f1e30a6bf/closed.json` и нулевым COM inventory. Автоматический reviewer отклонил попытку вручную обновить старое поле; safer alternative сохранила raw отчёт без изменений и использовала отдельный receipt. Сам E2E был разрешён и выполнен отдельной командой.
+
+Исходные server.log строго декодируются как **UTF-8 без BOM**. Во всех трёх логах replacement/box-drawing chars **0**; русские сообщения целы. Искажение консоли соответствует неверной OEM-интерпретации UTF-8. Теперь producer/consumer явно UTF-8: Console.InputEncoding/OutputEncoding, PowerShell OutputEncoding и строгий StreamReader с BOM detection. Source теста с кириллицей — UTF-8 BOM для Windows PowerShell 5.1. Отдельно проверены русско-украинский log round trip и реальные UTF-8 stdout bytes дочернего PowerShell. IO retries пишут warning; полный текст исключений и сетевых ошибок сохраняется, логирование не отключалось.
+
+397 исходных owner файлов по прежнему fingerprint байтово неизменны. BAT hashes прежние; реальные BAT и SteamCMD не вызывались. Рабочая копия нашего плагина 0.2 обновлена после проверки исходного hash и бэкапа: `Server/backups/RUST-BOTS-001/plugin-20261103-133234/RustBotsNavigationProbe.cs`, old SHA `53844F0E3636CDCBDEEDFB37AB6DFA828AD135D71A7E875B803585B348BF078D`. Source, реально испытанная копия и новая owner-копия имеют SHA `ED4918A5FBDD5EEC04E6813D7C1D7CEB6F3442CE7853D0F485C8300F540886DD`. Она инертна вне test environment. Owner configs, мир и сторонние плагины не менялись.
+
+### Tests, scope и публикация продолжения
+
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1` — **PASS**, включая BAT stubs, чужой процесс, owned job/abrupt controller exit, log sharing/UTF-8 console, junctions, native telemetry validator, key PS5/7 consistency, incomplete/corrupt cache, native quit −1/complete-save gate и firewall close reservation. Негативные fixtures намеренно печатают BLOCKED/corruption warnings; это ожидаемые отказы, а не ошибки live E2E. Offline C# 7.3 compilation также PASS; live Oxide compilation подтверждена отдельно двумя game logs. Сырые logs/results/tests/receipts остаются только в `.local/`.
+
+Exact allowlist продолжения — 12 публичных файлов:
+
+```text
+README.md
+docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/PLAN.md
+docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/RESULT.md
+scripts/Invoke-NavigationProbe.ps1
+scripts/ProbeSafety.ps1
+scripts/ProbeCache.ps1
+scripts/ProbeFirewall.ps1
+scripts/Test-All.ps1
+scripts/Test-ProbeSafety.ps1
+scripts/Test-ProbeCache.ps1
+scripts/Test-ProbeFirewall.ps1
+src/plugins/RustBotsNavigationProbe.cs
+```
+
+Git разрешён прямым запросом владельца. Base SHA продолжения: `0f27566a612213f4f7f094a9411fa5ac1f6875d0`. Использованы read-only `git status --short`, `git rev-parse HEAD`, `git diff --stat`; перед публикацией — `git diff --check`, `git check-ignore -v Server/Run_DS.bat Server/update.bat Server/rustds/oxide/plugins/RustBotsNavigationProbe.cs`, `git status --ignored --short`, `git add -n -- $paths`, `git add -- $paths` строго с allowlist выше, `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --no-ext-diff --`, `git ls-files -- Server/`, `git commit -m "fix: verify RustNav readiness and reuse isolated E2E cache"`, обычный `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master` и такой же HTTPS-mapped `ls-remote origin refs/heads/master`, затем rev-parse/status. Remote не меняется, force/history operations отсутствуют. Final SHA и remote/status receipt — в финальном ответе и новом ignored `.local/audit/resume-delivery.json`; versioned файл не может содержать SHA собственного коммита.
+
+- mojibake-маркеры в изменённых файлах проверены: 12 публичных файлов, совпадений нет; raw UTF-8 logs дополнительно проверены на OEM box-drawing/replacement chars.
+- escaped Cyrillic в изменённых файлах проверены: отдельная Unicode/XML escaped Cyrillic проверка 12 файлов, совпадений нет.
+
+Ограничение хранения: старые test evidence/state archives и поколения кеша сохраняются для диагностики и расходуют диск; broad cleanup намеренно не смешан с навигационной задачей. Фундаментального блокера навигации после исправлений нет. Остальные обещания/статусы ниже относятся к прежней поставке и сохранены как история.
+
+## Исторический отчёт предыдущей поставки (до предоставленного live E2E)
+
 Дата: 03.11.2026. Итог: **BLOCKED**. Безопасная статическая часть, локальные BAT и focused tests выполнены. Навигационный E2E **не состоялся**: текущий Windows token не Administrator; создание отключённого per-program firewall capability rule получило `Отказано в доступе`. Ограничение сети не ослаблялось, сервер не запускался.
 
 | Проверка | Фактический результат |

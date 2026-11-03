@@ -1,23 +1,32 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900)
+param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
+    [ValidateRange(60,1200)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
+    [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
+. (Join-Path $PSScriptRoot 'ProbeCache.ps1')
+. (Join-Path $PSScriptRoot 'ProbeFirewall.ps1')
+Initialize-ProbeUtf8
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $source = Join-Path $repo 'Server\rustds'
 $runId = [Guid]::NewGuid().ToString('N')
 $runtime = Join-Path $repo ('.local\runtime\' + $runId)
 $install = Join-Path $runtime 'install'
-$rules = New-Object 'Collections.Generic.List[string]'
 $owned = $null
+$cache = $null
+$ownsLease = $false
+$leaseReservation = $null
 $oldTestRoot = $env:RUST_BOTS_TEST_ROOT
 $oldToken = $env:RUST_BOTS_RUN_TOKEN
+$oldIdentity = $env:RUST_BOTS_TEST_IDENTITY
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $report = [ordered]@{
     Status = 'BLOCKED'; Reason = ''; RunId = $runId; ServerPid = $null
     StartedUtc = $null; ReadySeconds = $null; PluginSeconds = $null
     Timeline = @(); Navigation = 'NOT_VERIFIED'; Shutdown = 'NOT_STARTED'
     OwnedProcessAbsent = $true; PortsReleased = $null; FirewallRemoved = $true
+    Cache = $null; ServerExitCode = $null; RunnerElevated = $false
 }
 $ports = @(28965,28966,28967,28968)
 
@@ -44,19 +53,13 @@ try {
     New-Item -ItemType Directory -Path $runtime | Out-Null
     Assert-NoForeignRust
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'BLOCKED: administrator rights required for verified per-test firewall isolation; server not started'
-    }
-    $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
-    if ($profiles.Count -ne 3 -or @($profiles | Where-Object { -not $_.Enabled -or $_.AllowLocalFirewallRules -eq 'False' }).Count) {
-        throw 'BLOCKED: effective firewall profiles cannot enforce local block rules'
-    }
+    $report.RunnerElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Assert-PortsFree
     foreach ($required in @('RustDedicated.exe','RustDedicated_Data\Managed\Assembly-CSharp.dll','RustDedicated_Data\Managed\Oxide.Rust.dll','Oxide.Compiler.exe')) {
         if (-not (Test-Path -LiteralPath (Join-Path $source $required))) { throw "BLOCKED: installed runtime component missing: $required" }
     }
     Assert-ProbePlainPath $source
-    # Fresh real copies only. Never copy the owner's writable/configuration trees.
+    # Never copy the owner's writable/configuration trees.
     $copyDirs = @('RustDedicated_Data','Bundles','MonoBleedingEdge')
     foreach ($dir in $copyDirs) {
         $path = Join-Path $source $dir
@@ -65,46 +68,34 @@ try {
     $copyFiles = @(Get-ChildItem -LiteralPath $source -File | Where-Object { $_.Extension -in @('.exe','.dll') })
     foreach ($file in $copyFiles) { Assert-ProbePlainPath $file.FullName }
     if ($PreflightOnly) {
-        $report.Status = 'PARTIAL'; $report.Reason = 'Preflight passed; live install/start not requested'
+        $report.Status = 'PARTIAL'; $report.Reason = 'Preflight passed; live firewall delegation/cache/start not requested'
     } else {
-        New-Item -ItemType Directory -Path $install | Out-Null
-        foreach ($dir in $copyDirs) { Copy-Item -LiteralPath (Join-Path $source $dir) -Destination $install -Recurse }
-        $copyFiles | Copy-Item -Destination $install
-        foreach ($dir in @('oxide\plugins','oxide\config','oxide\data','oxide\logs','server','cfg','config','logs')) {
-            New-Item -ItemType Directory -Path (Join-Path $install $dir) -Force | Out-Null
-        }
-        if (@(Get-ChildItem -LiteralPath $install -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
-            throw 'BLOCKED: test install has linked entries'
-        }
+        $cache = Initialize-ProbeCache $repo $source $runtime
+        $install = $cache.Install
+        $report.Cache = @{ Key=$cache.Compatibility.Key; State=$cache.WorldStatus; InvalidReason=$cache.InvalidReason; Promoted=$false }
+        Assert-ProbePlainTree $install
         Copy-Item -LiteralPath (Join-Path $repo 'src\plugins\RustBotsNavigationProbe.cs') -Destination (Join-Path $install 'oxide\plugins')
         $env:RUST_BOTS_TEST_ROOT = $install
         $env:RUST_BOTS_RUN_TOKEN = $runId
+        $env:RUST_BOTS_TEST_IDENTITY = $cache.Identity
         [IO.File]::WriteAllText((Join-Path $install 'rustbots-test.marker'), $runId)
         $bytes = New-Object byte[] 32
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
         try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
         $password = [Convert]::ToBase64String($bytes)
         @{ RconPassword = $password } | ConvertTo-Json | Set-Content (Join-Path $runtime 'secrets.json') -Encoding UTF8
-        # Block every copied executable, including the compiler and crash helper.
-        # Loopback bindings are additional protection, not a substitute for egress denial.
-        foreach ($exe in @(Get-ChildItem -LiteralPath $install -Filter '*.exe' -Recurse)) {
-            foreach ($direction in @('Inbound','Outbound')) {
-                $name = 'RustBots001-' + $runId + '-' + $rules.Count
-                $rules.Add($name)
-                New-NetFirewallRule -Name $name -DisplayName $name -Program $exe.FullName -Direction $direction -Action Block -Enabled True -Profile Any | Out-Null
-                $active = Get-NetFirewallRule -PolicyStore ActiveStore -Name $name
-                $program = $active | Get-NetFirewallApplicationFilter
-                if ($active.Action -ne 'Block' -or $active.Enabled -ne 'True' -or $program.Program -ne $exe.FullName) {
-                    throw 'BLOCKED: effective test firewall rule mismatch'
-                }
-            }
-        }
+        $report.FirewallRemoved = $null
+        if (-not $FirewallLease) { $FirewallLease = Start-ProbeFirewallLease $repo $install; $ownsLease = $true }
+        $leaseReservation = Open-ProbeFirewallReservation $FirewallLease
+        $null = Assert-ProbeFirewallLease $FirewallLease $install
+        $report.FirewallRemoved = $false
+        $report['FirewallLease'] = $FirewallLease
         Assert-NoForeignRust
         Assert-PortsFree
         Add-Type -Path (Join-Path $PSScriptRoot 'OwnedServerProcess.cs')
         $log = Join-Path $runtime 'server.log'
         $arguments = '-batchmode -nographics -logfile "' + $log + '"' +
-            ' +server.identity rustbots_probe_' + $runId + ' +server.hostname "Local navigation probe"' +
+            ' +server.identity ' + $cache.Identity + ' +server.hostname "Local navigation probe"' +
             ' +server.ip 127.0.0.1 +server.port 28965 +server.queryport 28967' +
             ' +rcon.ip 127.0.0.1 +rcon.port 28966 +rcon.web 1 +rcon.password "' + $password + '"' +
             ' +app.listenip 127.0.0.1 +app.port 28968 +server.maxplayers 1' +
@@ -130,7 +121,7 @@ try {
             if ($seen.ContainsKey('Server startup complete') -and $null -eq $report.ReadySeconds) { $report.ReadySeconds = $clock.Elapsed.TotalSeconds }
             if ($seen.ContainsKey('RUSTBOTS_READY') -and $null -eq $report.PluginSeconds) { $report.PluginSeconds = $clock.Elapsed.TotalSeconds }
             if ($null -ne $report.ReadySeconds -and $null -ne $report.PluginSeconds -and $null -eq $navigationDeadline) {
-                $navigationDeadline = $clock.Elapsed.TotalSeconds + 300
+                $navigationDeadline = $clock.Elapsed.TotalSeconds + $NavigationTimeoutSeconds
             }
             $navFile = Join-Path $install 'oxide\data\RustBotsNavigationProbe.result.json'
             if ($navigationDeadline -and (Test-Path -LiteralPath $navFile)) {
@@ -140,6 +131,15 @@ try {
                 $report.Navigation = $nav
                 $report.Status = $nav.Status
                 $report.Reason = $nav.Reason
+                if ($nav.Status -ne 'GREEN' -and $DiagnosticHoldSeconds -gt 0) {
+                    Save-Report
+                    Write-Host ('Diagnostic hold for '+$DiagnosticHoldSeconds+' seconds; owned server will still stop automatically.')
+                    $holdUntil = [DateTime]::UtcNow.AddSeconds($DiagnosticHoldSeconds)
+                    while ([DateTime]::UtcNow -lt $holdUntil -and -not $owned.Process.HasExited) {
+                        if (Test-Path (Join-Path $runtime 'end-diagnostic-hold.request')) { break }
+                        Start-Sleep -Seconds 1
+                    }
+                }
                 break
             }
             if ((-not $navigationDeadline -and $clock.Elapsed.TotalSeconds -gt $StartupTimeoutSeconds) -or
@@ -152,6 +152,8 @@ try {
 } catch {
     $report.Status = 'BLOCKED'
     $report.Reason = $_.Exception.Message
+    $report['Exception'] = $_.Exception.ToString()
+    Write-Warning $_.Exception.ToString()
 } finally {
     try {
         if ($owned) {
@@ -165,23 +167,26 @@ try {
             } finally {
                 $owned.Dispose()
                 $report.OwnedProcessAbsent = $owned.Process.HasExited
+                $report.ServerExitCode = $owned.Process.ExitCode
             }
             try { Assert-PortsFree; $report.PortsReleased = $true } catch { $report.PortsReleased = $false }
+            if ($cache -and (Test-ProbeCompletedSave $report (Read-ProbeLog $log))) {
+                try { Save-ProbeWorldCache $cache $cache.World; $report.Cache.Promoted = $true }
+                catch { Write-Warning $_.Exception.ToString(); $report.Cache['PromotionError']=$_.Exception.Message; if ($report.Status -eq 'GREEN') { $report.Status='PARTIAL'; $report.Reason='Navigation passed; cache promotion failed' } }
+            }
         }
     } catch {
         $report.Status = 'FAILED'; $report.Reason = 'Owned-process cleanup failed: ' + $_.Exception.Message
     } finally {
-        # Keep network denial in place if process absence cannot be proven.
-        if ($report.OwnedProcessAbsent) {
-            foreach ($name in $rules) {
-                try {
-                    Remove-NetFirewallRule -Name $name -ErrorAction Stop
-                    if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) { throw 'Firewall rule remains' }
-                } catch { $report.FirewallRemoved = $false; $report.Status = 'FAILED'; $report.Reason = 'Test firewall cleanup failed' }
-            }
+        if ($leaseReservation) { $leaseReservation.Dispose() }
+        if ($report.OwnedProcessAbsent -and $ownsLease) {
+            try { Stop-ProbeFirewallLease $FirewallLease; $report.FirewallRemoved=$true }
+            catch { $report.Status='FAILED'; $report.Reason='Test firewall cleanup failed'; Write-Warning $_.Exception.ToString() }
         }
+        if ($cache) { $cache.Lock.Dispose() }
         $env:RUST_BOTS_TEST_ROOT = $oldTestRoot
         $env:RUST_BOTS_RUN_TOKEN = $oldToken
+        $env:RUST_BOTS_TEST_IDENTITY = $oldIdentity
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (Test-Path -LiteralPath $runtime) { Save-Report }
         Write-Output ($report.Status + ': ' + $report.Reason)
