@@ -1,7 +1,8 @@
 #Requires -Version 5.1
+param([ValidateSet('RustBotsNavigationProbe','RustBotsWorldRoam')][string]$PluginName='RustBotsNavigationProbe')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
-$plugin = Join-Path $repo 'src\plugins\RustBotsNavigationProbe.cs'
+$plugin = Join-Path $repo ('src\plugins\'+$PluginName+'.cs')
 if (-not (Test-Path $plugin)) { throw 'Missing navigation probe source' }
 $managed = Join-Path $repo 'Server\rustds\RustDedicated_Data\Managed'
 $out = Join-Path $repo '.local\compile'
@@ -9,7 +10,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $sdk = (& dotnet --list-sdks | Select-Object -Last 1)
 if ($sdk -notmatch '^(\S+) \[(.+)\]') { throw 'A .NET SDK is required for offline compile check' }
 $compiler = Join-Path $matches[2] ($matches[1] + '\Roslyn\bincore\csc.dll')
-$response = @('/nologo','/target:library','/nostdlib+','/langversion:7.3',('/out:"' + (Join-Path $out 'RustBotsNavigationProbe.dll') + '"'))
+$response = @('/nologo','/target:library','/nostdlib+','/langversion:7.3',('/out:"' + (Join-Path $out ($PluginName+'.dll')) + '"'))
 # Installed Oxide.CSharp CSharpPluginLoader.AssemblyBlacklist excludes these
 # standalone duplicates; their public types are merged into Oxide.References.
 $response += Get-ChildItem -LiteralPath $managed -Filter '*.dll' | Where-Object {

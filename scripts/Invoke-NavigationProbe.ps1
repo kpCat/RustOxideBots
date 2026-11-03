@@ -2,11 +2,13 @@
 [CmdletBinding()]
 param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
     [ValidateRange(60,1200)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
-    [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0)
+    [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0, [switch]$WorldRoam,
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
 . (Join-Path $PSScriptRoot 'ProbeCache.ps1')
 . (Join-Path $PSScriptRoot 'ProbeFirewall.ps1')
+. (Join-Path $PSScriptRoot 'WorldRoamValidation.ps1')
 Initialize-ProbeUtf8
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $source = Join-Path $repo 'Server\rustds'
@@ -20,6 +22,10 @@ $leaseReservation = $null
 $oldTestRoot = $env:RUST_BOTS_TEST_ROOT
 $oldToken = $env:RUST_BOTS_RUN_TOKEN
 $oldIdentity = $env:RUST_BOTS_TEST_IDENTITY
+$oldScenario = $env:RUST_BOTS_SCENARIO
+$oldRestore = $env:RUST_BOTS_RESTORE
+$oldResume = $env:RUST_BOTS_RESUME_JOURNEY
+$pluginName = if ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $report = [ordered]@{
     Status = 'BLOCKED'; Reason = ''; RunId = $runId; ServerPid = $null
@@ -45,6 +51,8 @@ function Save-Report {
 }
 
 try {
+    if ($RestoreFrom -and -not $WorldRoam) { throw 'RestoreFrom requires WorldRoam' }
+    if ($ResumeJourney -and -not $RestoreFrom) { throw 'ResumeJourney requires RestoreFrom' }
     # Check links before the first write, including the ignored parent directories.
     Assert-ProbePlainPath $repo
     foreach ($path in @((Join-Path $repo '.local'),(Join-Path $repo '.local\runtime'))) {
@@ -74,10 +82,32 @@ try {
         $install = $cache.Install
         $report.Cache = @{ Key=$cache.Compatibility.Key; State=$cache.WorldStatus; InvalidReason=$cache.InvalidReason; Promoted=$false }
         Assert-ProbePlainTree $install
-        Copy-Item -LiteralPath (Join-Path $repo 'src\plugins\RustBotsNavigationProbe.cs') -Destination (Join-Path $install 'oxide\plugins')
+        Copy-Item -LiteralPath (Join-Path $repo ('src\plugins\'+$pluginName+'.cs')) -Destination (Join-Path $install 'oxide\plugins')
         $env:RUST_BOTS_TEST_ROOT = $install
         $env:RUST_BOTS_RUN_TOKEN = $runId
         $env:RUST_BOTS_TEST_IDENTITY = $cache.Identity
+        $env:RUST_BOTS_SCENARIO = if ($WorldRoam) { 'WORLD_ROAM' } else { '' }
+        $env:RUST_BOTS_RESTORE = if ($RestoreFrom) { '1' } else { '' }
+        $env:RUST_BOTS_RESUME_JOURNEY = if ($ResumeJourney) { '1' } else { '' }
+        if ($RestoreFrom) {
+            $priorRoot = Join-Path $repo ('.local\runtime\'+$RestoreFrom)
+            Assert-ProbePlainTree $priorRoot
+            $prior = Get-Content (Join-Path $priorRoot 'result.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($prior.RunId -ne $RestoreFrom -or $prior.Shutdown -ne 'GRACEFUL' -or -not $prior.OwnedProcessAbsent -or
+                -not $prior.PortsReleased -or -not $prior.FirewallRemoved -or $prior.Cache.Key -ne $cache.Compatibility.Key -or
+                -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok) { throw 'Unsafe/incomplete restore provenance' }
+            Assert-WorldRoamResult $prior.Navigation
+            $snapshot = Join-Path $priorRoot 'inventory.bin'
+            if ((Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash -ne $prior.WorldInventorySHA256) { throw 'Native inventory snapshot hash mismatch' }
+            $proof=Get-Content (Join-Path $priorRoot 'world-proof.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            $manifest=Get-Content (Join-Path $cache.Root 'world-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            $sav=@(Get-ProbeWorldFiles $cache.World $cache.Compatibility | Where-Object Extension -eq '.sav')
+            if ($sav.Count -ne 1 -or $prior.RunId -ne $RestoreFrom) { throw 'Missing exact restored save' }
+            Assert-WorldRoamRestoreBinding $prior $proof $cache.Compatibility.Key $manifest.Generation $cache.WorldStatus (Get-FileHash -LiteralPath $sav[0].FullName -Algorithm SHA256).Hash (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash
+            Copy-Item -LiteralPath $snapshot -Destination (Join-Path $install 'oxide\data\RustBotsWorldRoam.inventory.bin')
+            ConvertTo-Json -InputObject @($prior.Navigation.Inventory) -Depth 8 | Set-Content (Join-Path $install 'oxide\data\RustBotsWorldRoam.expected.json') -Encoding UTF8
+            $report['RestoreFrom']=$RestoreFrom
+        }
         [IO.File]::WriteAllText((Join-Path $install 'rustbots-test.marker'), $runId)
         $bytes = New-Object byte[] 32
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -123,12 +153,25 @@ try {
             if ($null -ne $report.ReadySeconds -and $null -ne $report.PluginSeconds -and $null -eq $navigationDeadline) {
                 $navigationDeadline = $clock.Elapsed.TotalSeconds + $NavigationTimeoutSeconds
             }
-            $navFile = Join-Path $install 'oxide\data\RustBotsNavigationProbe.result.json'
+            $navFile = Join-Path $install ('oxide\data\'+$pluginName+'.result.json')
             if ($navigationDeadline -and (Test-Path -LiteralPath $navFile)) {
                 $nav = Get-Content -LiteralPath $navFile -Raw | ConvertFrom-Json
                 if ($nav.RunId -ne $runId) { throw 'BLOCKED: navigation result run token mismatch' }
-                Assert-ProbeNavigationResult $nav
                 $report.Navigation = $nav
+                Copy-Item -LiteralPath $navFile -Destination (Join-Path $runtime 'plugin-result.json')
+                try {
+                    if ($WorldRoam) {
+                        $expectedMode=if ($RestoreFrom -and -not $ResumeJourney) { 'RESTORE' } else { 'JOURNEY' }
+                        if ($nav.Mode -ne $expectedMode) { throw 'Unexpected world mode for runner request' }
+                        Assert-WorldRoamResult $nav
+                        if ($RestoreFrom -and (-not $nav.Persistence.Restored -or (Get-WorldInventoryKey $nav.Persistence.RestoreActual) -ne (Get-WorldInventoryKey $prior.Navigation.Inventory))) { throw 'Restart did not restore the prior native inventory' }
+                    } else { Assert-ProbeNavigationResult $nav }
+                } catch { $report['ValidationError']=$_.Exception.Message; throw }
+                if ($WorldRoam -and $nav.Persistence.Saved) {
+                    $snapshot = Join-Path $install 'oxide\data\RustBotsWorldRoam.inventory.bin'
+                    Copy-Item -LiteralPath $snapshot -Destination (Join-Path $runtime 'inventory.bin')
+                    $report['WorldInventorySHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'inventory.bin') -Algorithm SHA256).Hash
+                }
                 $report.Status = $nav.Status
                 $report.Reason = $nav.Reason
                 if ($nav.Status -ne 'GREEN' -and $DiagnosticHoldSeconds -gt 0) {
@@ -150,7 +193,7 @@ try {
         }
     }
 } catch {
-    $report.Status = 'BLOCKED'
+    $report.Status = if ($report.Contains('ValidationError')) { 'FAILED' } else { 'BLOCKED' }
     $report.Reason = $_.Exception.Message
     $report['Exception'] = $_.Exception.ToString()
     Write-Warning $_.Exception.ToString()
@@ -170,7 +213,7 @@ try {
                 $report.ServerExitCode = $owned.Process.ExitCode
             }
             try { Assert-PortsFree; $report.PortsReleased = $true } catch { $report.PortsReleased = $false }
-            if ($cache -and (Test-ProbeCompletedSave $report (Read-ProbeLog $log))) {
+            if ($cache -and $report.Status -ne 'FAILED' -and (Test-ProbeCompletedSave $report (Read-ProbeLog $log))) {
                 try { Save-ProbeWorldCache $cache $cache.World; $report.Cache.Promoted = $true }
                 catch { Write-Warning $_.Exception.ToString(); $report.Cache['PromotionError']=$_.Exception.Message; if ($report.Status -eq 'GREEN') { $report.Status='PARTIAL'; $report.Reason='Navigation passed; cache promotion failed' } }
             }
@@ -183,12 +226,20 @@ try {
             try { Stop-ProbeFirewallLease $FirewallLease; $report.FirewallRemoved=$true }
             catch { $report.Status='FAILED'; $report.Reason='Test firewall cleanup failed'; Write-Warning $_.Exception.ToString() }
         }
-        if ($cache) { $cache.Lock.Dispose() }
         $env:RUST_BOTS_TEST_ROOT = $oldTestRoot
         $env:RUST_BOTS_RUN_TOKEN = $oldToken
         $env:RUST_BOTS_TEST_IDENTITY = $oldIdentity
+        $env:RUST_BOTS_SCENARIO = $oldScenario
+        $env:RUST_BOTS_RESTORE = $oldRestore
+        $env:RUST_BOTS_RESUME_JOURNEY = $oldResume
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (Test-Path -LiteralPath $runtime) { Save-Report }
+        try {
+            if ($WorldRoam -and (-not $RestoreFrom -or $ResumeJourney) -and $cache -and $report.Cache.Promoted -and $report.Navigation.Persistence.Saved -and $report.Status -in @('GREEN','PARTIAL')) {
+                Write-WorldRoamSaveProof $runtime $cache.Root -LockHeld
+            }
+        } catch { $report.Status='PARTIAL'; $report.Reason='Journey ended; exact saved-world proof failed: '+$_.Exception.Message; Save-Report }
+        finally { if ($cache) { $cache.Lock.Dispose() } }
         Write-Output ($report.Status + ': ' + $report.Reason)
         Write-Output ('Local evidence: .local/runtime/' + $runId + '/result.json')
     }

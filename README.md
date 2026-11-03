@@ -6,6 +6,18 @@
 
 `Server/` целиком локален и исключён из Git. Сборку Rust/Oxide нужно установить отдельно; эти скрипты её не скачивают и не обновляют. Пользовательские миры, конфиги и сторонние плагины не копируются в тест.
 
+Сценарий 003 добавляет отдельный test-only `RustBotsWorldRoam`: один Gen2 NPC идёт к геометрии настоящей дороги, подходит к native crate/barrel и переносит реальные Item UID в принадлежащий боту ItemContainer. Фактические результаты и ограничения — в [RESULT 003](docs/agent-tasks/RUST-BOTS-003-WORLD-ROAM-LOOT/RESULT.md), подтверждённые API — в [API_FEASIBILITY](docs/agent-tasks/RUST-BOTS-003-WORLD-ROAM-LOOT/API_FEASIBILITY.md). Это диагностический сценарий; видимая экипировка, PlayerInventory и production AI не реализованы.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -WorldRoam
+# После clean run: native inventory restore в точном сохранённом test world.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -WorldRoam -RestoreFrom <run-id>
+# Дополнительно повторить journey, сохраняя ранее добытые предметы:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -WorldRoam -RestoreFrom <run-id> -ResumeJourney
+```
+
+`RestoreFrom` принимает 32-символьный ID завершённого isolated run с per-run snapshot/hash и world-proof.json. Cache key, точный .sav hash, generation, успешный shutdown и UID/amount должны совпасть; несовместимый или старый мир не допускается. Без `-WorldRoam` runner выполняет прежнюю пробу 001. Все команды самостоятельно останавливают только собственный Job Object и убирают свой firewall lease.
+
 На Windows 10+/Server 2016+ с PowerShell 5.1 запустите из корня репозитория:
 
 ```powershell
