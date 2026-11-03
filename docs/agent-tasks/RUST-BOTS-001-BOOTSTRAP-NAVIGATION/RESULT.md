@@ -14,8 +14,8 @@
 | Game graceful shutdown | NOT_VERIFIED, игровой процесс не был создан |
 | Финальные Rust/SteamCMD процессы | 0 по Win32_Process вне sandbox |
 | Тестовые TCP / UDP endpoints | 0 / 0, порты 28965–28968 |
-| Owner preservation | 397 исходных файлов проверены SHA-256; изменений 0 |
-| Commit / push | Ожидают финальной проверки; см. раздел Git ниже |
+| Owner preservation | 397 исходных файлов проверены SHA-256; изменений 0; добавлена только явно запрошенная инертная рабочая копия собственного плагина |
+| Commit / push | Реализация `01b325e95c5cb216e25917259efd8559d2d445a4` опубликована обычным push; final docs receipt — в финальном ответе |
 
 ## Baseline и установленный runtime
 
@@ -78,7 +78,7 @@ Tests исполняют только копии обезличенных шаб
 
 Фактический последний самостоятельный preflight: `.local/runtime/0269e88ebc7c49fab38bffcdabad059a/result.json`. Status BLOCKED, ServerPid null, Shutdown NOT_STARTED, OwnedProcessAbsent true, Navigation NOT_VERIFIED. До копирования runtime и создания игровых процессов gate требует работающее per-executable firewall isolation. Windows token не Administrator; отдельная попытка создать отключённое правило для несуществующего тестового EXE получила AccessDenied. Независимое перечисление firewall rules также запрещено Windows; inventory правил **NOT_VERIFIED**, успешного создания правил этой задачей не было. Небезопасный обход отсутствует.
 
-Предусмотренная установка — новая физическая копия `.local/runtime/<id>/install`; owner cfg/config/oxide/server не копируются. Выбранные roots и файлы проверяются на reparse points до обхода; writable Oxide-каталоги создаются заново, root/ancestors проверяются. E2E-копия в owner `oxide/plugins` намеренно не развёртывалась: критическое уточнение C2 требует отдельного writable install root. Источник — `src/plugins/RustBotsNavigationProbe.cs`; deployment выполняется runner только после gate.
+Предусмотренная E2E-установка — новая физическая копия `.local/runtime/<id>/install`; owner cfg/config/oxide/server не копируются. Выбранные roots и файлы проверяются на reparse points до обхода; writable Oxide-каталоги создаются заново, root/ancestors проверяются. Источник — `src/plugins/RustBotsNavigationProbe.cs`; test deployment выполняется runner только после gate. По последующему прямому указанию владельца добавлена также рабочая копия в `Server/rustds/oxide/plugins/RustBotsNavigationProbe.cs` через CreateNew без overwrite. SHA-256 source/copy совпал: `53844F0E3636CDCBDEEDFB37AB6DFA828AD135D71A7E875B803585B348BF078D`. Без marker/environment/identity runner она инертна. Для E2E эта owner-копия не используется; отдельный writable root остаётся обязательным. Игровой сервер после установки копии не запускался.
 
 Метаданные текущих DLL прочитаны без загрузки/исполнения игрового кода. Сопоставлены старые NPCPlayer→BasePlayer и ScientistNPC→HumanNPC с Gen2 ScientistNPC2→BaseNPC2→BaseCombatEntity. Подтверждены RustNavMeshAgent.SamplePosition/CalculatePath/SetDestination, RustNavMeshPath.status/GetPathLength, FSMComponent.SetFsmActive и RustNavigation.DefaultNavmesh. Методы sample/path выбираются по фактическому `ConVar.AI.useUnityNavmesh`; один Unity SamplePosition не считается доказательством RustNav. Compile references учитывают blacklist установленного CSharpPluginLoader: standalone Newtonsoft/protobuf/websocket исключены в пользу Oxide.References.
 
@@ -98,8 +98,10 @@ OwnedServerProcess использует Windows 10+ PROC_THREAD_ATTRIBUTE_JOB_LI
 
 Owner fingerprint включает server worlds/maps/saves, все oxide files, cfg/config/HarmonyMods, ключевые game/Oxide binaries и неизменяемые BAT/runscript: 397 файлов, 0 изменённых. Разрешённые два BAT исключены из fingerprint и проверены отдельно по аргументам/backup hashes. Все raw отчёты остаются в `.local/audit/` и `.local/runtime/`, а бэкапы — в игнорируемом Server/.
 
-- mojibake-маркеры в изменённых файлах проверены: 26 файлов, совпадений нет.
-- escaped Cyrillic в изменённых файлах проверены: отдельная проверка Unicode/XML escaped Cyrillic, 26 файлов, совпадений нет.
+- mojibake-маркеры в изменённых файлах проверены: 27 файлов, совпадений нет.
+- escaped Cyrillic в изменённых файлах проверены: отдельная проверка Unicode/XML escaped Cyrillic, 27 файлов, совпадений нет.
+
+Дополнение владельца об автоматическом Rust+Oxide update сохранено в `docs/agent-tasks/RUST-BOTS-002-SAFE-RUST-OXIDE-UPDATE/TASK.md` как **DESIGN ONLY / NOT STARTED**. Это разрешённое владельцем выделение существенного дополнительного объёма: official latest API, Windows Oxide.Rust.zip, source/hash/compatibility gates до SteamCMD public, backup/restore, сохранность mods/config/data и отказ от autostart при ошибке. Там же сохранён выборочный export очищенных configs через exact files + field allowlist. Updater/export не реализованы и не выданы за работающую автоматизацию. Реальные downloads/updates не запускались; текущий fail-closed BAT остаётся на месте.
 
 ## Git и публикация
 
@@ -125,13 +127,19 @@ git diff --check
 git config --get-all credential.helper
 git config --get user.name
 git config --get user.email
+git config --get commit.gpgsign
+git config --get core.hooksPath
+git config --get core.fsmonitor
+git config --get core.untrackedCache
+git config --get maintenance.auto
+git config --get gc.auto
 git credential-manager github list
 git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push --dry-run origin master
 ```
 
 Secret scan проверил high-confidence credential/Steam ID patterns, а также значения hostname/identity/seed и найденные непустые secret-поля локальных Oxide configs, не выводя сами значения: совпадений нет. UTF-8/binary guard пройден. До первого add: check-ignore, status --ignored и exact-path add dry-run прошли; sandbox index.lock denial устранён разрешённым запуском той же операции вне sandbox.
 
-Exact final artifact allowlist (26 файлов, включая неизменённый поставленный task package):
+Exact final artifact allowlist (27 файлов, включая неизменённый поставленный task package и явно запрошенный design следующей задачи):
 
 ```text
 .gitignore
@@ -147,6 +155,7 @@ docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/PLAN.md
 docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/README.md
 docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/RESULT.md
 docs/agent-tasks/RUST-BOTS-001-BOOTSTRAP-NAVIGATION/TASK.md
+docs/agent-tasks/RUST-BOTS-002-SAFE-RUST-OXIDE-UPDATE/TASK.md
 scripts/Inspect-RustApi.cs
 scripts/Invoke-NavigationProbe.ps1
 scripts/OwnedServerProcess.cs
@@ -162,8 +171,10 @@ scripts/templates/update.bat
 src/plugins/RustBotsNavigationProbe.cs
 ```
 
-Далее выполняются только `git add -n -- $paths`, `git add -- $paths` с этой exact allowlist, `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --numstat`, `git diff --cached --no-ext-diff --`, `git commit -m "feat: bootstrap isolated Rust navigation probe with safety gates"`, `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master`, затем rev-parse/ls-remote/status. После push исходного результата допускается отдельный exact-path docs commit RESULT/PLAN с publication receipt; его SHA сообщается в финальном ответе, поскольку файл не может содержать hash собственного коммита.
+Выполнены `git add -n -- $paths`, `git add -- $paths` с первоначальной exact allowlist 26 файлов, `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --numstat`, `git diff --cached --no-ext-diff --`, `git commit -m "feat: bootstrap isolated Rust navigation probe with safety gates"`, `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master`, затем rev-parse/ls-remote/status. После дополнения используется та же процедура exact-path add/diff для пяти documentation paths: AGENTS.md, README.md, PLAN.md, RESULT.md и TASK 002; команда commit — `git commit -m "docs: record bootstrap evidence and safe updater follow-up"`. Никаких иных изменений в индексе нет.
 
-Final staged scan, commit SHA, push и remote/status receipt будут добавлены после заключительных проверок. Реальные Server/, конфиги, saves, DLL/EXE, логи и secrets не публикуются.
+Staged scope реализации совпал с exact allowlist: 26 paths, 1625 added lines, без binaries/Server; diff --check прошёл. Публичные файлы повторно проверены на owner secret values, credential patterns и обе группы encoding markers после дополнения (27 файлов). `git ls-files -- Server/` пустой; actual paths в Server/ игнорируются. Реализация: `01b325e95c5cb216e25917259efd8559d2d445a4`. Push receipt: `daa38db..01b325e master -> master`; ls-remote origin/master равен этому SHA. Автоматическая maintenance, запущенная самим Git после commit, завершилась; ручная очистка/изменение истории не выполнялись. Статус после первого push содержит только пять ещё не закоммиченных документационных путей дополнения, перечисленных выше; чужие изменения отсутствовали.
+
+Этот RESULT хранит проверенный SHA реализации и receipt первого push. Финальный документационный commit со всеми дополнениями имеет собственный SHA; он не может быть вписан в собственное содержимое. Его точный SHA, совпадение с origin/master и конечный status сообщаются в финальном ответе и сохраняются в игнорируемом `.local/audit/delivery.json`. Реальные Server/, конфиги, saves, DLL/EXE, логи и secrets не публикуются.
 
 Следующий шаг для E2E: владелец может запустить ту же команду из повышенного PowerShell при отсутствии своего игрового сервера. Runner по-прежнему обязан отказать при невозможности доказать firewall/isolation. Этот следующий запуск и GREEN не заявлены выполненными.
