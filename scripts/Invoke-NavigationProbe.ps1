@@ -3,13 +3,14 @@
 param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
     [ValidateRange(60,1200)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
     [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0, [switch]$WorldRoam,
-    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather)
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
 . (Join-Path $PSScriptRoot 'ProbeCache.ps1')
 . (Join-Path $PSScriptRoot 'ProbeFirewall.ps1')
 . (Join-Path $PSScriptRoot 'WorldRoamValidation.ps1')
 . (Join-Path $PSScriptRoot 'SurvivalValidation.ps1')
+. (Join-Path $PSScriptRoot 'CraftValidation.ps1')
 Initialize-ProbeUtf8
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
 $source = Join-Path $repo 'Server\rustds'
@@ -26,7 +27,9 @@ $oldIdentity = $env:RUST_BOTS_TEST_IDENTITY
 $oldScenario = $env:RUST_BOTS_SCENARIO
 $oldRestore = $env:RUST_BOTS_RESTORE
 $oldResume = $env:RUST_BOTS_RESUME_JOURNEY
-$pluginName = if ($SurvivalGather) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
+$isSurvival = $SurvivalGather -or $SurvivalCraft
+$scenario = if ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
+$pluginName = if ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $report = [ordered]@{
     Status = 'BLOCKED'; Reason = ''; RunId = $runId; ServerPid = $null
@@ -52,8 +55,8 @@ function Save-Report {
 }
 
 try {
-    if ($SurvivalGather -and ($WorldRoam -or $ResumeJourney)) { throw 'SurvivalGather is exclusive with WorldRoam/ResumeJourney' }
-    if ($RestoreFrom -and -not ($WorldRoam -or $SurvivalGather)) { throw 'RestoreFrom requires WorldRoam or SurvivalGather' }
+    if (([int][bool]$SurvivalGather+[int][bool]$SurvivalCraft+[int][bool]$WorldRoam) -gt 1 -or ($isSurvival -and $ResumeJourney)) { throw 'Survival modes are exclusive with each other and WorldRoam/ResumeJourney' }
+    if ($RestoreFrom -and -not ($WorldRoam -or $isSurvival)) { throw 'RestoreFrom requires WorldRoam or Survival mode' }
     if ($ResumeJourney -and -not $RestoreFrom) { throw 'ResumeJourney requires RestoreFrom' }
     # Check links before the first write, including the ignored parent directories.
     Assert-ProbePlainPath $repo
@@ -83,7 +86,7 @@ try {
         $cache = Initialize-ProbeCache $repo $source $runtime
         $install = $cache.Install
         $report.Cache = @{ Key=$cache.Compatibility.Key; State=$cache.WorldStatus; InvalidReason=$cache.InvalidReason; Promoted=$false }
-        if ($SurvivalGather -and $cache.WorldStatus -eq 'WARM') {
+        if ($isSurvival -and $cache.WorldStatus -eq 'WARM') {
             $loadedManifest=Get-Content (Join-Path $cache.Root 'world-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
             $report.Cache['LoadedGeneration']=$loadedManifest.Generation
             $report.Cache['LoadedSaveSHA256']=@($loadedManifest.Files | Where-Object { $_.Name -match '\.sav$' })[0].SHA256
@@ -92,11 +95,11 @@ try {
         Copy-Item -LiteralPath (Join-Path $repo ('src\plugins\'+$pluginName+'.cs')) -Destination (Join-Path $install 'oxide\plugins')
         Copy-Item -LiteralPath (Join-Path $repo ('src\plugins\'+$pluginName+'.cs')) -Destination (Join-Path $runtime ($pluginName+'.cs'))
         $report['PluginSHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime ($pluginName+'.cs')) -Algorithm SHA256).Hash
-        $report['Scenario']=if ($SurvivalGather) { 'SURVIVAL_GATHER' } elseif ($WorldRoam) { 'WORLD_ROAM' } else { 'NAVIGATION' }
+        $report['Scenario']=$scenario
         $env:RUST_BOTS_TEST_ROOT = $install
         $env:RUST_BOTS_RUN_TOKEN = $runId
         $env:RUST_BOTS_TEST_IDENTITY = $cache.Identity
-        $env:RUST_BOTS_SCENARIO = if ($SurvivalGather) { 'SURVIVAL_GATHER' } elseif ($WorldRoam) { 'WORLD_ROAM' } else { '' }
+        $env:RUST_BOTS_SCENARIO = $scenario
         $env:RUST_BOTS_RESTORE = if ($RestoreFrom) { '1' } else { '' }
         $env:RUST_BOTS_RESUME_JOURNEY = if ($ResumeJourney) { '1' } else { '' }
         if ($RestoreFrom) {
@@ -106,9 +109,10 @@ try {
             if ($prior.RunId -ne $RestoreFrom -or $prior.Shutdown -ne 'GRACEFUL' -or -not $prior.OwnedProcessAbsent -or
                 -not $prior.PortsReleased -or -not $prior.FirewallRemoved -or $prior.Cache.Key -ne $cache.Compatibility.Key -or
                 -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok) { throw 'Unsafe/incomplete restore provenance' }
-            if ($SurvivalGather) {
-                if ($prior.Scenario -ne 'SURVIVAL_GATHER') { throw 'Restore scenario mismatch' }
-                Assert-SurvivalResult $prior.Navigation
+            if ($isSurvival) {
+                if ($prior.Scenario -ne $scenario) { throw 'Restore scenario mismatch' }
+                if($SurvivalCraft -and $prior.Navigation.Mode -ne 'CRAFT'){throw 'Craft restore requires completed CRAFT source'}
+                Assert-SurvivalScenarioResult $prior.Navigation $scenario
             } else { Assert-WorldRoamResult $prior.Navigation }
             $snapshot = Join-Path $priorRoot 'inventory.bin'
             if ((Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash -ne $prior.WorldInventorySHA256) { throw 'Native inventory snapshot hash mismatch' }
@@ -118,7 +122,7 @@ try {
             if ($sav.Count -ne 1 -or $prior.RunId -ne $RestoreFrom) { throw 'Missing exact restored save' }
             $savHash=(Get-FileHash -LiteralPath $sav[0].FullName -Algorithm SHA256).Hash
             $snapshotHash=(Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash
-            if ($SurvivalGather) {
+            if ($isSurvival) {
                 $actorSnapshot=Join-Path $priorRoot 'actor-state.json'
                 $actorHash=(Get-FileHash -LiteralPath $actorSnapshot -Algorithm SHA256).Hash
                 Assert-SurvivalRestoreBinding $prior $proof $cache.Compatibility.Key $manifest.Generation $cache.WorldStatus $savHash $snapshotHash $actorHash
@@ -183,10 +187,11 @@ try {
                 $report.Navigation = $nav
                 Copy-Item -LiteralPath $navFile -Destination (Join-Path $runtime 'plugin-result.json')
                 try {
-                    if ($SurvivalGather) {
-                        $expectedMode=if ($RestoreFrom) { 'RESTORE' } else { 'GATHER' }
+                    if ($isSurvival) {
+                        $expectedMode=if ($RestoreFrom) { 'RESTORE' } elseif ($SurvivalCraft) { 'CRAFT' } else { 'GATHER' }
                         if ($nav.Mode -ne $expectedMode) { throw 'Unexpected survival mode' }
-                        Assert-SurvivalResult $nav
+                        Assert-SurvivalScenarioResult $nav $scenario
+                        if($SurvivalCraft -and $RestoreFrom -and (Get-CraftRecipeKey $nav.Crafting.Recipe) -ne (Get-CraftRecipeKey $prior.Navigation.Crafting.Recipe)){throw 'Loaded restore recipe changed'}
                         if ($RestoreFrom -and (-not $nav.Persistence.Restored -or (Get-SurvivalInventoryKey $nav.Inventory) -ne (Get-SurvivalInventoryKey $prior.Navigation.Inventory) -or
                             (Get-SurvivalStateKey $nav.ActorState) -ne (Get-SurvivalStateKey $prior.Navigation.ActorState))) { throw 'Survivor inventory/state restart mismatch' }
                     } elseif ($WorldRoam) {
@@ -196,11 +201,11 @@ try {
                         if ($RestoreFrom -and (-not $nav.Persistence.Restored -or (Get-WorldInventoryKey $nav.Persistence.RestoreActual) -ne (Get-WorldInventoryKey $prior.Navigation.Inventory))) { throw 'Restart did not restore the prior native inventory' }
                     } else { Assert-ProbeNavigationResult $nav }
                 } catch { $report['ValidationError']=$_.Exception.Message; throw }
-                if (($WorldRoam -or $SurvivalGather) -and $nav.Persistence.Saved) {
+                if (($WorldRoam -or $isSurvival) -and $nav.Persistence.Saved) {
                     $snapshot = Join-Path $install ('oxide\data\'+$pluginName+'.inventory.bin')
                     Copy-Item -LiteralPath $snapshot -Destination (Join-Path $runtime 'inventory.bin')
                     $report['WorldInventorySHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'inventory.bin') -Algorithm SHA256).Hash
-                    if ($SurvivalGather) {
+                    if ($isSurvival) {
                         Copy-Item -LiteralPath (Join-Path $install 'oxide\data\RustBotsSurvival.state.json') -Destination (Join-Path $runtime 'actor-state.json')
                         $report['ActorStateSHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'actor-state.json') -Algorithm SHA256).Hash
                     }
@@ -268,7 +273,7 @@ try {
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (Test-Path -LiteralPath $runtime) { Save-Report }
         try {
-            if ($SurvivalGather -and -not $RestoreFrom -and $cache -and $report.Cache.Promoted -and $report.Navigation.Persistence.Saved -and $report.Status -in @('GREEN','PARTIAL')) {
+            if ($isSurvival -and -not $RestoreFrom -and $cache -and $report.Cache.Promoted -and $report.Navigation.Persistence.Saved -and $report.Status -in @('GREEN','PARTIAL')) {
                 Write-SurvivalSaveProof $runtime $cache.Root
             }
             if ($WorldRoam -and (-not $RestoreFrom -or $ResumeJourney) -and $cache -and $report.Cache.Promoted -and $report.Navigation.Persistence.Saved -and $report.Status -in @('GREEN','PARTIAL')) {

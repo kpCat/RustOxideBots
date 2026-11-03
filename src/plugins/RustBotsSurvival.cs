@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsSurvival", "RustOxideBots", "0.1.0")]
+    [Info("RustBotsSurvival", "RustOxideBots", "0.2.0")]
     [Description("Isolated natural harvesting with an explicitly accounted rock adapter.")]
     public class RustBotsSurvival : RustPlugin
     {
@@ -18,6 +18,7 @@ namespace Oxide.Plugins
         private sealed class SurvivorState
         {
             public string ActorId, Goal = "NEED_RESOURCE", ToolUid;
+            public string CraftIntent, CraftStatus, ProductUid, Product;
             public List<string> Completed = new List<string>(), Rejected = new List<string>();
         }
         private sealed class SurvivorActor
@@ -37,6 +38,27 @@ namespace Oxide.Plugins
             public SurvivorState Actor;
             public List<ItemRow> StarterKit;
         }
+        private sealed class IngredientRow
+        {
+            public string Shortname;
+            public int ItemId, Amount;
+        }
+        private sealed class RecipeRow
+        {
+            public string Shortname;
+            public int ItemId, AmountToCreate, Workbench;
+            public bool DefaultBlueprint, Known, UserCraftable, Allowed, NeedsSteamItem, NeedsSteamDLC, RequireUnlockedItem;
+            public float Time;
+            public List<IngredientRow> Ingredients;
+        }
+        private sealed class DebitRow
+        {
+            public string Uid, Shortname;
+            public int ItemId, Before, Consumed, After;
+        }
+        private bool crafting;
+        private RecipeRow recipe;
+        private readonly List<object> craftAttempts = new List<object>();
         private readonly SurvivorActor actor = new SurvivorActor();
         private RustNavMeshAgent agent;
         private BaseMelee rockProfile;
@@ -75,14 +97,16 @@ namespace Oxide.Plugins
             string marker=Path.Combine(root,"rustbots-test.marker");
             return string.Equals(cwd,Path.GetFullPath(root).TrimEnd('\\','/'),StringComparison.OrdinalIgnoreCase) &&
                 identity != null && identity.StartsWith("rustbots_probe_",StringComparison.Ordinal) && ConVar.Server.identity == identity &&
-                File.Exists(marker) && File.ReadAllText(marker) == token && Environment.GetEnvironmentVariable("RUST_BOTS_SCENARIO") == "SURVIVAL_GATHER";
+                File.Exists(marker) && File.ReadAllText(marker) == token &&
+                (Environment.GetEnvironmentVariable("RUST_BOTS_SCENARIO") == "SURVIVAL_GATHER" || Environment.GetEnvironmentVariable("RUST_BOTS_SCENARIO") == "SURVIVAL_CRAFT");
         }
         private void OnServerInitialized()
         {
             if (!IsTestRoot()) { Puts("Survival inert: isolated runner marker/identity missing."); return; }
-            mode=Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE") == "1" ? "RESTORE" : "GATHER";
+            crafting=Environment.GetEnvironmentVariable("RUST_BOTS_SCENARIO") == "SURVIVAL_CRAFT";
+            mode=Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE") == "1" ? "RESTORE" : crafting ? "CRAFT" : "GATHER";
             navWait=Time.realtimeSinceStartup;
-            Puts("RUSTBOTS_READY RustNavMeshAgent/RustNav SURVIVAL_GATHER");
+            Puts("RUSTBOTS_READY RustNavMeshAgent/RustNav "+(crafting?"SURVIVAL_CRAFT":"SURVIVAL_GATHER"));
             timer.Every(0.5f,()=> {
                 try {
                     string stop=Path.Combine(root,"rustbots-stop.request");
@@ -114,7 +138,7 @@ namespace Oxide.Plugins
                 restored=Key(expected)==Key(Contents()) && JsonConvert.SerializeObject(expectedState)==JsonConvert.SerializeObject(actor.State);
                 if (!restored) { Finish("PARTIAL","Native inventory or actor state mismatch"); return; }
             } else {
-                actor.State=new SurvivorState { ActorId="survivor-004-"+Guid.NewGuid().ToString("N") };
+                actor.State=new SurvivorState { ActorId=(crafting?"survivor-005-":"survivor-004-")+Guid.NewGuid().ToString("N") };
                 actor.Inventory=new ItemContainer(); actor.Inventory.ServerInitialize(null,48); actor.Inventory.GiveUID();
             }
             foreach(string path in GameManifest.Current.entities.Where(p=>p.EndsWith(".prefab",StringComparison.OrdinalIgnoreCase) && p.IndexOf("scientist",StringComparison.OrdinalIgnoreCase)>=0)
@@ -147,7 +171,25 @@ namespace Oxide.Plugins
             if(rockProfile == null) { Finish("BLOCKED","Installed rock BaseMelee profile unavailable"); return; }
             Log("ACTOR",new { ActorId=actor.State.ActorId, Type=actor.Entity.GetType().FullName, Prefab=prefab, Position=Point(spawn), IsBasePlayer=actor.Entity is BasePlayer,
                 PlayerInventoryComponent=actor.Entity.GetComponent<PlayerInventory>() != null, Fsm=fsm==null?null:fsm.GetType().FullName, FsmControl="SetFsmActive(false)", NativeEquipment="NOT_NATIVE_EQUIPPED", ToolMode="SERVER_ACCOUNTED_TOOL", Tool=Row(rock), ToolPrefab=mod.entityPrefab.resourcePath, MaxDistance=rockProfile.maxDistance });
-            if(mode == "RESTORE") { Log("RESTORE",new { Expected=expected,Actual=Contents(),State=actor.State,Restored=restored }); Finish(restored?"GREEN":"PARTIAL","Independent native inventory and survivor identity/goal/tool restore");return; }
+            if(mode == "RESTORE") {
+                if(crafting) {
+                    recipe=ReadRecipe(actor.State.Product);
+                    restored=restored && recipe!=null && actor.State.CraftStatus=="CRAFTED" && !string.IsNullOrEmpty(actor.State.CraftIntent) &&
+                        Contents().Any(i=>i.Uid==actor.State.ProductUid && i.Shortname==actor.State.Product && i.Amount==recipe.AmountToCreate);
+                }
+                Log("RESTORE",new { Expected=expected,Actual=Contents(),State=actor.State,Restored=restored }); Finish(restored?"GREEN":"PARTIAL","Independent native inventory and survivor identity/goal/tool restore");return;
+            }
+            if(crafting) {
+                actor.State.Goal="SELECT_BLUEPRINT";
+                recipe=ReadRecipe("stonehatchet");
+                if(recipe==null || !recipe.Known || recipe.Workbench!=0 || recipe.Ingredients.Count!=2 ||
+                    !recipe.Ingredients.Any(i=>i.Shortname=="wood") || !recipe.Ingredients.Any(i=>i.Shortname=="stones")) { Finish("BLOCKED","Installed useful natural-ingredient recipe unavailable");return; }
+                actor.State.Product=recipe.Shortname;
+                Log("SELECT_BLUEPRINT",recipe);
+                // The same real recipe is unavailable before any natural ingredients exist.
+                AttemptCraft(recipe.Shortname,"negative-missing-"+token);
+                if(finished)return;
+            }
             previous=actor.Entity.transform.position;previousTime=Time.realtimeSinceStartup;
             samples.Add(new { Time=previousTime,Position=Point(previous),Stage="NEED_RESOURCE" });
             deadline=previousTime+600f;active=true;
@@ -226,7 +268,7 @@ namespace Oxide.Plugins
         }
         private void DiscoverNeed()
         {
-            kind=actor.Inventory.itemList.Where(i=>i.info.shortname=="wood").Sum(i=>i.amount)<20?"WOOD":actor.Inventory.itemList.Where(i=>i.info.shortname=="stones").Sum(i=>i.amount)<20?"ORE":null;
+            kind=Quantity("wood")<Required("wood")?"WOOD":Quantity("stones")<Required("stones")?"ORE":null;
             if(kind==null){Complete();return;}
             actor.State.Goal="DISCOVER_"+kind;
             if(attempts++>=6){Complete();return;}
@@ -314,7 +356,7 @@ namespace Oxide.Plugins
             float quantity=gather.gatherDamage,cost=gather.conditionLost;
             if(float.IsNaN(quantity)||float.IsInfinity(quantity)||quantity<=0||float.IsNaN(cost)||float.IsInfinity(cost)||cost<0){Finish("BLOCKED","Invalid installed rock gathering profile");return;}
             int amount=(int)Mathf.Min(10f,Mathf.Floor(quantity),Mathf.Floor(pool.amount)-1);
-            if(amount<=0||sourceHits>=10){RejectSource("Source exhausted/bounded strikes");return;}
+            if(amount<=0||sourceHits>=(crafting?40:10)){RejectSource("Source exhausted/bounded strikes");return;}
             float beforePool=pool.amount,beforeFraction=dispenser.fractionRemaining,beforeHealth=source.Health(),beforeCondition=rock.condition;
             if(rock.hasCondition && (cost<=0 || beforeCondition<=cost)){Finish("PARTIAL","Tool cannot pay verified wear");return;}
             // No native gather runs inside this adapter hit; only bounded health damage.
@@ -334,13 +376,115 @@ namespace Oxide.Plugins
                 GatherDamage=quantity,DestroyFraction=gather.destroyFraction,MaxDistance=rockProfile.maxDistance,Mechanism="SERVER_ACCOUNTED_TOOL/ResourceDispenser.DestroyFraction(amount)",CanGather=false,
                 Distance=distance,LineOfSight=true,Grounded=true,PathStatus="PathComplete",Actor=Point(actor.Entity.transform.position),SourcePosition=Point(source.transform.position)};
             harvests.Add(receipt);Log("DEBIT_YIELD",receipt);sourceHits++;parts["TOOLS"]="GREEN";nextHit=Time.realtimeSinceStartup+1f;
-            if(actor.Inventory.itemList.Where(i=>i.info.shortname==pool.itemDef.shortname).Sum(i=>i.amount)>=20){
+            if(Quantity(pool.itemDef.shortname)>=Required(pool.itemDef.shortname)){
                 parts[kind]="GREEN";actor.State.Completed.Add(kind);actor.State.Rejected.Add(sourceId);DiscoverNeed();
             }
+        }
+        private int Quantity(string name) { return actor.Inventory.itemList.Where(i=>i.info.shortname==name).Sum(i=>i.amount); }
+        private int Required(string name) { return crafting ? recipe.Ingredients.Single(i=>i.Shortname==name).Amount : 20; }
+        private RecipeRow ReadRecipe(string name)
+        {
+            var def=ItemManager.FindItemDefinition(name);
+            var bp=def==null?null:def.Blueprint;
+            if(bp==null || bp.targetItem!=def || bp.amountToCreate<=0 || bp.amountToCreate>def.stackable)return null;
+            var costs=bp.GetIngredients();
+            if(costs==null || costs.Count==0 || costs.Any(i=>i==null || i.itemDef==null || float.IsNaN(i.amount) || float.IsInfinity(i.amount) ||
+                i.amount<=0 || i.amount>10000 || i.amount!=Mathf.Floor(i.amount)) || costs.Select(i=>i.itemDef.itemid).Distinct().Count()!=costs.Count)return null;
+            return new RecipeRow { Shortname=def.shortname,ItemId=def.itemid,AmountToCreate=bp.amountToCreate,
+                DefaultBlueprint=bp.defaultBlueprint,Known=bp.defaultBlueprint && ItemManager.defaultBlueprints!=null && ItemManager.defaultBlueprints.Contains(def.itemid) &&
+                    !bp.NeedsSteamItem && !bp.NeedsSteamDLC && bp.RequireUnlockedItem==null,
+                Workbench=bp.GetWorkbenchLevel(),UserCraftable=bp.userCraftable,Allowed=def.IsAllowed((Rust.EraRestriction)4),
+                NeedsSteamItem=bp.NeedsSteamItem,NeedsSteamDLC=bp.NeedsSteamDLC,RequireUnlockedItem=bp.RequireUnlockedItem!=null,Time=bp.GetCraftTime(),
+                Ingredients=costs.Select(i=>new IngredientRow{Shortname=i.itemDef.shortname,ItemId=i.itemDef.itemid,Amount=(int)i.amount}).ToList() };
+        }
+        private string PoolKey()
+        {
+            var rows=BaseNetworkable.serverEntities.OfType<ResourceEntity>().Where(e=>!e.IsDestroyed).Select(e=> {
+                var d=e.GetComponent<ResourceDispenser>();
+                return e.net.ID+":"+(d==null?"none":d.fractionRemaining.ToString("R",System.Globalization.CultureInfo.InvariantCulture)+":"+
+                    (d.containedItems==null?"null-list":string.Join(",",d.containedItems.Select(i=>i==null?"null-entry":
+                        (i.itemDef==null?"null-definition":i.itemid.ToString())+"="+i.amount.ToString("R",System.Globalization.CultureInfo.InvariantCulture)).ToArray())));
+            }).OrderBy(s=>s,StringComparer.Ordinal);
+            using(var sha=System.Security.Cryptography.SHA256.Create())return BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(string.Join(";",rows.ToArray())))).Replace("-","");
+        }
+        private bool AttemptCraft(string name,string intent)
+        {
+            var before=Contents();string pools=PoolKey();var actual=ReadRecipe(name);
+            bool owned=actor.Entity!=null && !actor.Entity.IsDestroyed && actor.Inventory.entityOwner==actor.Entity;
+            bool grounded=owned && agent.isOnNavMesh && Mathf.Abs(actor.Entity.transform.position.y-TerrainMeta.HeightMap.GetHeight(actor.Entity.transform.position))<1f &&
+                WaterLevel.GetWaterSurface(actor.Entity.transform.position,true,true,null)-actor.Entity.transform.position.y<=0.15f;
+            var context=new{ActorOwned=owned,Grounded=grounded,BenchLevel=0,Policy="GEN2_DEFAULT_UNRESTRICTED_BENCH0_ONLY"};
+            var reasons=new List<string>();
+            if(mode=="RESTORE")reasons.Add("RESTORE_READ_ONLY");
+            if(!string.IsNullOrEmpty(actor.State.CraftIntent))reasons.Add("INTENT_ALREADY_USED");
+            if(actual==null)reasons.Add("RECIPE_UNAVAILABLE");
+            else {
+                if(!actual.UserCraftable || !actual.Allowed || actual.NeedsSteamItem || actual.NeedsSteamDLC || actual.RequireUnlockedItem)reasons.Add("UNSUPPORTED_RECIPE_POLICY");
+                if(!actual.Known)reasons.Add("BLUEPRINT_UNKNOWN");
+                if(actual.Workbench!=0)reasons.Add("WORKBENCH_REQUIRED");
+                if(actual.Ingredients.Any(i=>Quantity(i.Shortname)<i.Amount))reasons.Add("MISSING_INGREDIENTS");
+            }
+            if(!owned || !grounded)reasons.Add("INVALID_ACTOR_CONTEXT");
+            if(reasons.Count>0) {
+                var denied=new{Intent=intent,Status="DENIED",Reason=reasons[0],Reasons=reasons,Recipe=actual,Context=context,Before=before,After=Contents(),PoolBefore=pools,PoolAfter=PoolKey(),Debits=new DebitRow[0],Output=(ItemRow)null};
+                craftAttempts.Add(denied);Log("CRAFT_ATTEMPT",denied);
+                if(Key(before)!=Key(Contents()) || pools!=denied.PoolAfter){anomalies.Add("Denied craft mutated inventory/pool");Finish("FAILED","Denied craft mutation");}
+                return false;
+            }
+            // Limited adapter: no learned knowledge, DLC, workbench proximity or player queue simulation.
+            if(actual.Ingredients.Any(i=>i.Shortname!="wood" && i.Shortname!="stones")) { Finish("BLOCKED","Unsupported ingredient adapter");return false; }
+            var debits=new List<DebitRow>();Item output=null;string failure=null;
+            actor.State.CraftIntent=intent;actor.State.CraftStatus="DEBITTING";
+            try {
+                foreach(var cost in actual.Ingredients) {
+                    int remaining=cost.Amount;
+                    foreach(var item in actor.Inventory.itemList.Where(i=>i.info.itemid==cost.ItemId && i.info.shortname==cost.Shortname).ToArray()) {
+                        int take=Math.Min(item.amount,remaining);if(take==0)break;
+                        var debit=new DebitRow{Uid=item.uid.Value.ToString(),Shortname=cost.Shortname,ItemId=cost.ItemId,Before=item.amount,Consumed=take};
+                        item.UseItem(take);debit.After=item.amount;debits.Add(debit);
+                        if(debit.Before-debit.After!=take)throw new InvalidOperationException("Native Item.UseItem debit mismatch");
+                        // Native Remove queues destruction; detach zero stacks synchronously before output/save.
+                        if(item.amount==0)item.RemoveFromContainer();
+                        remaining-=take;
+                    }
+                    if(remaining!=0)throw new InvalidOperationException("Ingredient changed during synchronous debit");
+                }
+                var expectedAfter=before.Select(i=>new ItemRow{Uid=i.Uid,Shortname=i.Shortname,Amount=i.Amount,Condition=i.Condition,MaxCondition=i.MaxCondition}).ToList();
+                foreach(var debit in debits)expectedAfter.Single(i=>i.Uid==debit.Uid).Amount-=debit.Consumed;
+                expectedAfter.RemoveAll(i=>i.Amount==0);
+                if(Key(expectedAfter)!=Key(Contents()))throw new InvalidOperationException("Inventory differs from exact ingredient debit");
+                output=ItemManager.Create(ItemManager.FindItemDefinition(actual.ItemId),actual.AmountToCreate,0UL);
+                if(output==null || !output.MoveToContainer(actor.Inventory,-1,false))throw new InvalidOperationException("Paid output creation/transfer failed");
+                var row=Row(output);
+                if(before.Any(i=>i.Uid==row.Uid) || row.Shortname!=actual.Shortname || row.Amount!=actual.AmountToCreate ||
+                    float.IsNaN(row.Condition) || float.IsInfinity(row.Condition) || row.Condition<0 || row.Condition>row.MaxCondition || (output.hasCondition && row.Condition<=0))throw new InvalidOperationException("Invalid output UID/amount/condition");
+                expectedAfter.Add(row);
+                if(Key(expectedAfter)!=Key(Contents()) || pools!=PoolKey())throw new InvalidOperationException("Craft conservation mismatch");
+                actor.State.CraftStatus="CRAFTED";actor.State.ProductUid=row.Uid;
+            } catch(Exception ex) {
+                failure=ex.Message;actor.State.CraftStatus="IRREVERSIBLE_PARTIAL";
+                if(output!=null){output.RemoveFromContainer();output.Remove();output=null;}
+            }
+            var receipt=new{Intent=intent,Status=failure==null?"CRAFTED":"IRREVERSIBLE_PARTIAL",Reason=failure??"PAID",Recipe=actual,Context=context,
+                Before=before,After=Contents(),PoolBefore=pools,PoolAfter=PoolKey(),Debits=debits,Output=output==null?null:Row(output)};
+            craftAttempts.Add(receipt);Log("CRAFT_ATTEMPT",receipt);
+            if(failure!=null){Finish("PARTIAL","Paid craft failed, no rollback/recredit: "+failure);return false;}
+            return true;
         }
         private void Complete()
         {
             if(finished)return;
+            if(crafting) {
+                if(Quantity("wood")<Required("wood") || Quantity("stones")<Required("stones")) { Finish("PARTIAL","Bounded ingredient discovery incomplete");return; }
+                // Also inspect a genuinely advanced installed recipe without granting knowledge/bench.
+                AttemptCraft("rifle.ak","negative-gates-"+token);
+                if(finished)return;
+                actor.State.Goal="CRAFT";
+                string intent="craft-"+actor.State.ActorId;
+                if(!AttemptCraft(recipe.Shortname,intent)) { if(!finished)Finish("PARTIAL","Craft denied; no retry");return; }
+                AttemptCraft(recipe.Shortname,intent);
+                if(finished)return;
+            }
             actor.State.Goal="CARRY_SAVE";
             parts["NAVIGATION"]=total>=3f&&completedLegs>0&&!navigating?"GREEN":"PARTIAL";
             if(actor.Inventory!=null&&Contents().Count>0&&anomalies.Count==0){
@@ -356,6 +500,7 @@ namespace Oxide.Plugins
             var result=new{RunId=token,Status=status,Reason=reason,Mode=mode,ActorType=actor.Entity==null?null:actor.Entity.GetType().FullName,Prefab=prefab,Backend="RustNavMeshAgent/RustNav",
                 ToolMode="SERVER_ACCOUNTED_TOOL",NativeEquipment="NOT_NATIVE_EQUIPPED",ActorState=actor.State,StarterKit=starterKit,Inventory=Contents(),Parts=parts,
                 Samples=samples,Legs=legs,TotalTraveled=total,Harvests=harvests,Sources=sources,Rejected=rejected,
+                Crafting=crafting?new{Mechanism="SERVER_ACCOUNTED_CRAFT",Recipe=recipe,Attempts=craftAttempts}:null,
                 Conservation=new{Ok=anomalies.Count==0,Anomalies=anomalies},Persistence=new{Saved=saved,Restored=restored,Expected=expected,ExpectedState=expectedState}};
             if(root!=null){string path=Data("result.json");File.WriteAllText(path+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(path+".tmp",path);}
             Log("RESULT",result);Cleanup();

@@ -45,6 +45,15 @@ Runner хранит физическую тестовую установку и 
 
 Readiness ограничен 900 секундами, ожидание RustNav и навигации — ещё 900 (внутри плагина ожидание сетки до 600). Код выхода: 0 GREEN, 1 PARTIAL, 2 BLOCKED/FAILED. Timeline, координаты, cache и shutdown находятся в `.local/runtime/<run-id>/result.json`; полные сообщения остаются в server.log. UTF-8 декодируется явно, консоль и дочерний PowerShell выводят UTF-8; ошибки не скрываются. Недоступные Steam/MapCache/Unity-сервисы при изоляции ожидаемы и не получают разрешения в интернет. Длительный переход через карту/монументы/дома и масштабирование этим тестом не доказываются. Исторические raw test archives сохраняются локально; автоматическая очистка старых evidence не входит в 001.
 
+Сценарий 005 расширяет тот же `RustBotsSurvival` режимом `-SurvivalCraft`: выбор loaded ItemBlueprint для stonehatchet, добыча wood/stones по фактическому дефициту, проверки default blueprint и нулевого верстака, exact Item UID debit и native output. Это **SERVER_ACCOUNTED_CRAFT**, синхронная серверная транзакция; native player queue, изучение чертежей и видимая экипировка не реализованы. Время рецепта читается как metadata. Результаты live, стоимости, отказы и restart — в [RESULT 005](docs/agent-tasks/RUST-BOTS-005-CRAFTING-RECIPES/RESULT.md), установленный API — в [API_DECISION 005](docs/agent-tasks/RUST-BOTS-005-CRAFTING-RECIPES/API_DECISION.md).
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -SurvivalCraft
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-NavigationProbe.ps1 -SurvivalCraft -RestoreFrom <completed-craft-run-id>
+```
+
+Режимы SurvivalCraft, SurvivalGather и WorldRoam взаимоисключающие. Craft RESTORE проверяет exact inventory, actor goals и завершённый intent в точном сохранённом test world и не запускает добычу/крафт/повторный starter kit. Source pools между рестартами пока не имеют durable depletion ledger; сохранение crafted Item не доказывает сохранение depleted nodes. При ошибке после оплаты адаптер возвращает IRREVERSIBLE_PARTIAL, без ложного rollback и повторной выдачи.
+
 Проверки без SteamCMD и настоящего сервера:
 
 ```powershell

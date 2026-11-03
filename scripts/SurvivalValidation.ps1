@@ -2,13 +2,20 @@
 # Independent accounting/physical evidence checks; fixtures are never live proof.
 function Get-SurvivalStateKey($state) {
     if (-not $state.ActorId -or -not $state.ToolUid -or -not $state.Goal) {throw 'Incomplete survivor state'}
-    @($state.ActorId,$state.Goal,$state.ToolUid,(@($state.Completed)-join ','),(@($state.Rejected)-join ',')) -join '|'
+    @($state.ActorId,$state.Goal,$state.ToolUid,(@($state.Completed)-join ','),(@($state.Rejected)-join ','),$state.CraftIntent,$state.CraftStatus,$state.ProductUid,$state.Product) -join '|'
 }
 function Get-SurvivalInventoryKey($items) {
     $null=Get-WorldInventoryKey $items
+    foreach($i in @($items)) {
+        foreach($v in @($i.Condition,$i.MaxCondition)) {
+            if($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v)){throw 'Invalid native item condition'}
+        }
+        if($i.Condition -lt 0 -or $i.MaxCondition -lt 0 -or $i.Condition -gt $i.MaxCondition){throw 'Native item condition outside bounds'}
+    }
     (@($items | ForEach-Object { $_.Uid+'|'+$_.Shortname+'|'+$_.Amount+'|'+([double]$_.Condition).ToString('R',[Globalization.CultureInfo]::InvariantCulture)+'|'+([double]$_.MaxCondition).ToString('R',[Globalization.CultureInfo]::InvariantCulture) }) | Sort-Object) -join "`n"
 }
 function Assert-SurvivalResult($n) {
+    if($n.Crafting){Assert-CraftResult $n;return}
     if ($n.Status -notin @('GREEN','PARTIAL','BLOCKED','FAILED')) {throw 'Invalid survival status'}
     $key=Get-SurvivalInventoryKey $n.Inventory
     # An early honest blocker may have no actor or kit yet.
@@ -90,8 +97,11 @@ function Assert-SurvivalRestoreBinding($prior,$proof,[string]$cacheKey,[string]$
         $prior.Cache.Key -ne $cacheKey -or $proof.CacheKey -ne $cacheKey -or $proof.Generation -ne $generation -or $state -ne 'WARM' -or
         $proof.SavSHA256 -ne $savHash -or $proof.SnapshotSHA256 -ne $snapshotHash -or $prior.WorldInventorySHA256 -ne $snapshotHash -or
         $proof.ActorStateSHA256 -ne $actorHash -or $prior.ActorStateSHA256 -ne $actorHash -or
-        $prior.Navigation.Mode -ne 'GATHER' -or -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok){throw 'Unsafe/stale survival restore timeline'}
-    Assert-SurvivalResult $prior.Navigation
+        $prior.Navigation.Mode -notin @('GATHER','CRAFT') -or -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok){throw 'Unsafe/stale survival restore timeline'}
+    if($prior.Scenario -eq 'SURVIVAL_CRAFT') {
+        if($prior.Navigation.Mode -ne 'CRAFT'){throw 'Craft snapshot must originate from CRAFT'}
+        Assert-CraftResult $prior.Navigation
+    } else {Assert-SurvivalResult $prior.Navigation}
 }
 function Write-SurvivalSaveProof([string]$runtime,[string]$cacheRoot) {
     Assert-ProbePlainTree $runtime;Assert-ProbePlainPath $cacheRoot
