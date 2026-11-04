@@ -258,3 +258,100 @@ foreach($mutation in @({param($x)$x.OverlapCount=1},{param($x)$x.NativeCapsules=
     $x=Copy-HomeFixture $physics;& $mutation $x;Deny-HomeFixture {Assert-FirstHomePhysics $x -RequireClear}
 }
 Write-Output 'PASS OFFLINE_ONLY 14: full overlap evidence, native body dimensions and fail-closed collider/path claims'
+
+# 016: observation is evidence of unsafe native motion, never a clearance exception.
+$lip=Copy-HomeFixture $contact;$lip.Category='DOORWAY';$lip.Collider.Type='MeshCollider'
+$lip.Collider.Name='synthetic threshold';$lip.Penetrations[0].Distance=0.011;$lip.Penetrations[0].Direction=@(0,1,0)
+$frames=@(for($i=0;$i -lt 2;$i++){
+    $p=Copy-HomeFixture $physics;$p.Time=10+$i*0.05;$p.Position=@((-1+$i*0.1),0,0);$p.CapsuleA=@($p.Position[0],0.5,0);$p.CapsuleB=@($p.Position[0],1.3,0)
+    $p.NativeCapsules[0].A=$p.CapsuleA;$p.NativeCapsules[0].B=$p.CapsuleB
+    $p|Add-Member NoteProperty Previous @(-1,0,0) -Force
+    $p|Add-Member NoteProperty PosePreviousTime 10 -Force
+    $p|Add-Member NoteProperty Rotation @(0,0,0,1) -Force
+    $p|Add-Member NoteProperty Rigidbody @{Kinematic=$true;Gravity=$false;CollisionMode='Discrete'} -Force
+    $p|Add-Member NoteProperty FoundationNetId '100' -Force
+    $p|Add-Member NoteProperty FloorRays @(@{Collider=@{Self=$false;Role='FOUNDATION';Entity='100';Own=$true;OwnerFlag='OWN'};Position=@($p.Position[0],0,0);Normal=@(0,1,0);FootDelta=0;distance=0.3}) -Force
+    $p|Add-Member NoteProperty Sweep @{From=@(-1,0,0);To=$p.Position;Distance=$i*0.1;Hits=@()} -Force
+    $p|Add-Member NoteProperty Velocity @(2,0,0) -Force
+    $p|Add-Member NoteProperty NavSampled $true -Force
+    $p|Add-Member NoteProperty NavPosition $p.Position -Force
+    $p|Add-Member NoteProperty Portal $nav.FirstHome.Portal -Force
+    $p.LegacyClear=$false;$p.Clear=$false;$p.OverlapCount=1;$p.Overlaps=@((Copy-HomeFixture $lip));$p.Overlaps[0].Penetrations[0].Distance=0.011+$i*0.01
+    @{Sequence=$i;Physics=$p;Accepted=$false;Classification=$(if($i){'KINEMATIC_CLIP'}else{'OBSERVE_CONTACT_ONLY'});Reason=$(if($i){'CONTACT_DEEPENED_WITHOUT_STEP'}else{'FIRST_CONTACT'})}
+})
+$observation=Copy-HomeFixture @{Mode='OBSERVE_CONTACT_ONLY';DiagnosticOnly=$true;Outcome='KINEMATIC_CLIP';Reason='CONTACT_DEEPENED_WITHOUT_STEP';MaxSeconds=0.35;MaxDistance=0.3;MaxDepth=0.04;GrowthLimit=0.001;PersistenceSeconds=0.15;Frames=$frames}
+Assert-FirstHomeObservation $observation
+foreach($mutation in @(
+    {param($x)$x.Outcome='RESOLVED_NATIVE'}, {param($x)$x.Frames[1].Accepted=$true},
+    {param($x)$x.Frames[1].Physics.Clear=$true}, {param($x)$x.Frames[1].Physics.Overlaps[0].Category='FOREIGN'},
+    {param($x)$x.Frames[1].Physics.FloorRays=@()}, {param($x)$x.Frames[1].Physics.CalculatedPath='PathPartial'},
+    {param($x)$x.Frames[1].Physics.Position[0]=9}, {param($x)$x.Frames[1].Physics.Sweep.From=@(9,0,0)},
+    {param($x)$x.Frames[1].Physics.Overlaps[0].Penetrations[0].Distance=0.005},
+    {param($x)$x.Frames[1].Physics.Time=9}, {param($x)$x.Frames[1].Physics.DoorOpen=$false}
+)){$x=Copy-HomeFixture $observation;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeObservation $x}}
+Write-Output 'PASS OFFLINE_ONLY 16: bounded diagnostic trajectory, real support and penetration classify clip; fabricated resolution denied'
+$stuck=Copy-HomeFixture $observation;$stuck.Outcome='NATIVE_STUCK';$stuck.Reason='CONTACT_PERSISTS'
+$stuck.Frames=@(for($i=0;$i -lt 4;$i++){
+    $f=Copy-HomeFixture $frames[0];$f.Sequence=$i;$f.Physics.Time=10+$i*0.06;$f.Physics.PosePreviousTime=if($i){10+($i-1)*0.06}else{10}
+    $f.Classification=if($i -eq 3){'NATIVE_STUCK'}else{'OBSERVE_CONTACT_ONLY'};$f.Reason=if($i -eq 3){'CONTACT_PERSISTS'}elseif($i){'CONTACT_OBSERVED'}else{'FIRST_CONTACT'};$f
+})
+Assert-FirstHomeObservation $stuck
+$x=Copy-HomeFixture $stuck;$x.Outcome='RESOLVED_NATIVE';Deny-HomeFixture {Assert-FirstHomeObservation $x}
+foreach($category in @('WALL_N','FOREIGN','ENVIRONMENT','DOOR_OPEN','DOOR_CLOSED')){
+    $x=Copy-HomeFixture $observation;$x.Frames=@($x.Frames[0]);$x.Outcome=$x.Frames[0].Classification='UNSAFE';$x.Reason=$x.Frames[0].Reason='NON_THRESHOLD_CONTACT';$x.Frames[0].Physics.Overlaps[0].Category=$category
+    Assert-FirstHomeObservation $x
+    $x.Outcome='RESOLVED_NATIVE';Deny-HomeFixture {Assert-FirstHomeObservation $x}
+}
+$x=Copy-HomeFixture $observation;$x.Frames=@($x.Frames[0]);$x.Outcome=$x.Frames[0].Classification='UNSAFE';$x.Reason=$x.Frames[0].Reason='SWEPT_OBSTACLE'
+$x.Frames[0].Physics.Sweep.Hits=@(@{Collider=@{Self=$false;Role='WALL_N'}});Assert-FirstHomeObservation $x
+$x.Outcome='RESOLVED_NATIVE';Deny-HomeFixture {Assert-FirstHomeObservation $x}
+Write-Output 'PASS OFFLINE_ONLY 17: persistent contact stops, wall/foreign/hinge/closed door and swept obstacle never resolve safely'
+# Reviewer regression: an unrelated ray at the same height cannot support this actor.
+$x=Copy-HomeFixture $observation;$x.Frames[1].Physics.FloorRays[0].Position[0]=1000
+Deny-HomeFixture {Assert-FirstHomeObservation $x}
+$x=Copy-HomeFixture $observation;$x.Frames[1].Physics.FloorRays[0].Normal=@(0,100,0)
+Deny-HomeFixture {Assert-FirstHomeObservation $x}
+Write-Output 'PASS OFFLINE_ONLY 18: native support rays are spatially bound to this pose and unit normal'
+$supportObservation=Copy-HomeFixture $observation;$supportObservation.Outcome='UNSAFE';$supportObservation.Reason='SUPPORT_CONTACT_DEEPENED'
+foreach($f in $supportObservation.Frames){
+    $f.Physics.LegacyClear=$true;$c=$f.Physics.Overlaps[0];$c.Category='FOUNDATION';$c.LegacyBlocking=$false;$c.Decision='LEGACY_FOUNDATION_EXCLUSION'
+}
+$supportObservation.Frames[1].Classification='UNSAFE';$supportObservation.Frames[1].Reason='SUPPORT_CONTACT_DEEPENED'
+Assert-FirstHomeObservation $supportObservation
+$old=Copy-HomeFixture $supportObservation.Frames[0].Physics;$old.PSObject.Properties.Remove('Sweep');$old.Clear=$true
+Assert-FirstHomePhysics $old
+$new=Copy-HomeFixture $supportObservation.Frames[0].Physics;Assert-FirstHomePhysics $new
+$new.Clear=$true;Deny-HomeFixture {Assert-FirstHomePhysics $new}
+Write-Output 'PASS OFFLINE_ONLY 19: old legacy receipts retained; new actual foundation contact never Clear and increasing support penetration stops'
+$gone=Copy-HomeFixture $supportObservation;$gone.Outcome='UNKNOWN';$gone.Reason='CLEARANCE_REQUIRES_REVIEW'
+$gone.Frames[1].Classification='UNKNOWN';$gone.Frames[1].Reason='CLEARANCE_REQUIRES_REVIEW';$gone.Frames[1].Physics.Overlaps=@();$gone.Frames[1].Physics.OverlapCount=0;$gone.Frames[1].Physics.Clear=$true
+Assert-FirstHomeObservation $gone
+# OFFLINE_ONLY scaled/translated geometry for the measured early lip candidate.
+# This is not a saved live pose and cannot prove a native step.
+$low=Copy-HomeFixture $observation;$low|Add-Member NoteProperty PolicyRevision 2
+for($i=0;$i -lt 2;$i++){
+    $p=$low.Frames[$i].Physics;$p.Position=@((-0.538+$i*0.03),(-$i*0.0049),0.1235)
+    $p.Previous=if($i){$low.Frames[0].Physics.Position}else{@(-0.574,0.0049,0.1235)};$p.PosePreviousTime=if($i){10}else{9.975}
+    $p.CapsuleA=@($p.Position[0],($p.Position[1]+0.5),$p.Position[2]);$p.CapsuleB=@($p.Position[0],($p.Position[1]+1.3),$p.Position[2]);$p.NativeCapsules[0].A=$p.CapsuleA;$p.NativeCapsules[0].B=$p.CapsuleB
+    $p.FloorRays=@(@{Collider=@{Type='UnityEngine.TerrainCollider';Self=$false};Position=$p.Position;Normal=@(0,1,0);FootDelta=0;distance=0.3})
+    $p.Portal.Center=@(0,1.024,0);$p.Portal.HalfWidth=0.6;$p.Portal.HalfHeight=1.36
+    $p.Sweep.From=$p.Previous;$p.Sweep.To=$p.Position;$p.Sweep.Distance=Get-WorldDistance $p.Previous $p.Position
+    $p.Overlaps[0].Penetrations[0].Distance=0.0167+$i*0.011;$p.Overlaps[0].Penetrations[0].Direction=@(-0.8660254,0.5,0)
+    $entryOrigin=@(($p.Position[0]+0.6),($p.Position[1]+0.6),$p.Position[2])
+    $p|Add-Member NoteProperty EntryFloor @{Origin=$entryOrigin;Length=1.2;Rays=@(@{Collider=@{Self=$false;Role='FOUNDATION';Entity='100';Own=$true;OwnerFlag='OWN'};Position=@($entryOrigin[0],0.2535,$entryOrigin[2]);Normal=@(0,1,0);FootDelta=($p.Position[1]-0.2535);distance=($entryOrigin[1]-0.2535)})}
+    $p|Add-Member NoteProperty DoorwayColliders @(@{Role='DOORWAY';Own=$true;OwnerFlag='OWN';Position=@(0,0.1535,0);Rotation=@(0,0,0,1);Scale=@(1,1,1);Mesh=@{Center=@(0,1.5,0);Extents=@(0.134,1.5,1.5)}})
+}
+$low.Frames[0].Physics.Sweep.Hits=@(@{Collider=@{Self=$false;Role='DOORWAY';Instance=20};Position=@(-0.12,0.2535,0.1235);Normal=@(-0.8660254,0.5,0)})
+Assert-FirstHomeObservation $low
+$deep=Copy-HomeFixture $low;$deep.Frames[1].Physics.Overlaps[0].Penetrations[0].Distance=0.05
+Assert-FirstHomeObservation $deep
+$lowCase=0
+foreach($mutation in @({param($x)$x.Frames[0].Physics.EntryFloor.Rays=@()},
+    {param($x)$x.Frames[0].Physics.Overlaps[0].Penetrations[0].Direction=@(0,0.5,0.8660254)},
+    {param($x)$x.Frames[0].Physics.DoorwayColliders=@()},
+    {param($x)$x.Frames[0].Physics.EntryFloor.Rays[0].Position[1]=1},
+    {param($x)$x.Frames[0].Physics.Portal.HalfWidth=0.3})){
+    $lowCase++;$x=Copy-HomeFixture $low;& $mutation $x
+    try{Deny-HomeFixture {Assert-FirstHomeObservation $x}}catch{throw ('Early lip negative '+$lowCase+': '+$_.Exception.Message)}
+}
+Write-Output 'PASS OFFLINE_ONLY 20: early lip diagnostic uses actual mesh thickness, own forward floor and near-zero lateral MTD; never physical clearance'

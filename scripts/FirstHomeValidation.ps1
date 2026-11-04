@@ -249,13 +249,152 @@ function Assert-FirstHomePhysics($p,[switch]$RequireClear) {
         }
         if($RequireClear -and ($blocking -or $o.Category -eq 'FOUNDATION')){throw 'Body overlap is not proven benign support'}
     }
-    if($p.LegacyClear -ne ($legacy -eq 0) -or $p.Clear -ne $p.LegacyClear){throw 'Clear contradicts actual overlapping colliders'}
+    $expectedClear=if($null -ne $p.Sweep){@($p.Overlaps|Where-Object Category -ne NPC_SELF).Count -eq 0 -and @($p.Sweep.Hits|Where-Object {$_.Collider.Self -ne $true}).Count -eq 0}else{$p.LegacyClear}
+    if($p.LegacyClear -ne ($legacy -eq 0) -or $p.Clear -ne $expectedClear){throw 'Clear contradicts actual overlapping/swept colliders'}
     if($RequireClear -and ($p.Clear -ne $true -or $p.Pending -ne $false -or $p.OnNavmesh -ne $true -or $p.Path -ne 'PathComplete' -or
         $p.Calculated -ne $true -or $p.CalculatedPath -ne 'PathComplete' -or
         ($p.Inside -and $p.OwnedFloor -ne $true))){throw 'Physical support/path not proven'}
+    if($RequireClear -and $null -ne $p.Sweep -and @($p.Sweep.Hits|Where-Object {$_.Collider.Self -ne $true}).Count){throw 'Swept body crossed a solid obstacle'}
+}
+function Test-FirstHomePhysicalSupport($p) {
+    $supported=@($p.FloorRays|Where-Object {$_.Collider.Self -ne $true -and
+        ($_.Collider.Role -eq 'FOUNDATION' -and $_.Collider.Entity -eq $p.FoundationNetId -and $_.Collider.Own -eq $true -and $_.Collider.OwnerFlag -eq 'OWN' -or $_.Collider.Type -eq 'UnityEngine.TerrainCollider') -and
+        $_.Normal[1] -ge 0.85 -and [Math]::Abs($_.FootDelta) -le 0.15}).Count -gt 0
+    foreach($ray in $p.FloorRays){
+        if(@($ray.Position).Count -ne 3 -or @($ray.Normal).Count -ne 3){throw 'Missing support ray geometry'}
+        foreach($v in @($ray.Position)+@($ray.Normal)){$null=Get-AvatarNumber $v 'support ray'}
+        $rayDistance=Get-AvatarNumber $ray.distance 'support ray distance'
+        if([Math]::Abs(($p.Position[1]-$ray.Position[1])-(Get-AvatarNumber $ray.FootDelta 'actual foot delta')) -gt 0.0001 -or
+            [Math]::Abs($ray.Position[0]-$p.Position[0]) -gt 0.0001 -or [Math]::Abs($ray.Position[2]-$p.Position[2]) -gt 0.0001 -or
+            [Math]::Abs((Get-HomeDot $ray.Normal $ray.Normal)-1) -gt 0.001 -or $rayDistance -lt 0 -or $rayDistance -gt 0.6 -or
+            [Math]::Abs($rayDistance-0.3-$ray.FootDelta) -gt 0.0001){throw 'Fabricated support ray pose/normal/distance'}
+    }
+    return $supported
+}
+function Assert-FirstHomeObservation($o) {
+    $revision=if($null -eq $o.PolicyRevision){1}else{[int]$o.PolicyRevision}
+    if($revision -notin @(1,2)){throw 'Unknown observation revision'}
+    if($o.Mode -ne 'OBSERVE_CONTACT_ONLY' -or $o.DiagnosticOnly -ne $true -or
+        [Math]::Abs($o.MaxSeconds-0.35) -gt 0.00001 -or [Math]::Abs($o.MaxDistance-0.3) -gt 0.00001 -or
+        [Math]::Abs($o.MaxDepth-0.04) -gt 0.00001 -or [Math]::Abs($o.GrowthLimit-0.001) -gt 0.00001 -or
+        [Math]::Abs($o.PersistenceSeconds-0.15) -gt 0.00001){throw 'Unknown diagnostic-only stop policy'}
+    $frames=@($o.Frames);if(-not $frames.Count -or $frames.Count -gt 100){throw 'Unbounded/empty observation'}
+    $travel=0.0;$priorDepth=0.0;$hadLip=$false;$start=$frames[0].Physics;$supportDepths=@{}
+    for($i=0;$i -lt $frames.Count;$i++) {
+        $f=$frames[$i];$p=$f.Physics;Assert-FirstHomePhysics $p
+        if($f.Sequence -ne $i -or $f.Accepted -ne $false -or $p.ActorNetId -ne $start.ActorNetId){throw 'Diagnostic frame accepted or actor changed'}
+        foreach($shape in @(@('Previous',3),@('Rotation',4),@('Velocity',3))){
+            if(@($p.($shape[0])).Count -ne $shape[1]){throw 'Missing diagnostic pose/velocity/nav evidence'}
+            foreach($v in $p.($shape[0])){$null=Get-AvatarNumber $v 'observation vector'}
+        }
+        if($p.NavSampled -eq $true){if(@($p.NavPosition).Count -ne 3){throw 'Missing actual nav position'};foreach($v in $p.NavPosition){$null=Get-AvatarNumber $v 'native sample'}}
+        $prior=if($i){$frames[$i-1].Physics}else{$p}
+        $dt=(Get-AvatarNumber $p.Time 'observation time')-(Get-AvatarNumber $prior.Time 'prior observation time')
+        $elapsed=$p.Time-$start.Time;$step=Get-WorldDistance $prior.Position $p.Position;$travel+=$step
+        if($i -and ($dt -le 0 -or (Get-WorldDistance $prior.Position $p.Previous) -gt 0.0001 -or [Math]::Abs($prior.Time-$p.PosePreviousTime) -gt 0.0001)){throw 'Broken observation continuity'}
+        if((Get-WorldDistance $p.Sweep.From $p.Previous) -gt 0.0001 -or (Get-WorldDistance $p.Sweep.To $p.Position) -gt 0.0001 -or
+            [Math]::Abs((Get-WorldDistance $p.Previous $p.Position)-(Get-AvatarNumber $p.Sweep.Distance 'native sweep distance')) -gt 0.0001){throw 'False/missing swept trajectory'}
+        $depth=0.0;$lip=$false;$bad=$false;$supportGrowth=$false;$depthBound=$false;$entryHeight=$null
+        if($revision -eq 2){
+            $expectedOrigin=@(for($j=0;$j -lt 3;$j++){$p.Position[$j]+0.6*$p.Portal.Normal[$j]+$(if($j -eq 1){0.6}else{0})})
+            if(@($p.EntryFloor.Origin).Count -ne 3 -or (Get-WorldDistance $expectedOrigin $p.EntryFloor.Origin) -gt 0.0001 -or [Math]::Abs($p.EntryFloor.Length-1.2) -gt 0.0001){throw 'Missing/unbound forward floor probe'}
+            foreach($ray in @($p.EntryFloor.Rays)){
+                if(@($ray.Position).Count -ne 3 -or @($ray.Normal).Count -ne 3){throw 'Missing forward ray geometry'}
+                foreach($v in @($ray.Position)+@($ray.Normal)){$null=Get-AvatarNumber $v 'forward floor ray'}
+                $distance=Get-AvatarNumber $ray.distance 'forward floor distance'
+                if($distance -lt 0 -or $distance -gt 1.2 -or [Math]::Abs($distance-$expectedOrigin[1]+$ray.Position[1]) -gt 0.0001 -or
+                    [Math]::Abs($ray.Position[0]-$expectedOrigin[0]) -gt 0.0001 -or [Math]::Abs($ray.Position[2]-$expectedOrigin[2]) -gt 0.0001 -or
+                    [Math]::Abs((Get-HomeDot $ray.Normal $ray.Normal)-1) -gt 0.001 -or [Math]::Abs($ray.FootDelta-$p.Position[1]+$ray.Position[1]) -gt 0.0001){throw 'Fabricated forward floor geometry'}
+                if($null -eq $entryHeight -and $ray.Collider.Entity -eq $p.FoundationNetId -and $ray.Collider.Own -eq $true -and $ray.Collider.Role -eq 'FOUNDATION' -and $ray.Collider.OwnerFlag -eq 'OWN' -and $ray.Normal[1] -ge 0.85){$entryHeight=$ray.Position[1]}
+            }
+        }
+        foreach($contact in @($p.Overlaps|Where-Object Category -ne NPC_SELF)) {
+            if($contact.Category -notin @('FOUNDATION','DOORWAY')){$bad=$true;continue}
+            if($contact.Collider.OwnerFlag -ne 'OWN'){$bad=$true}
+            foreach($m in $contact.Penetrations) {
+                foreach($v in $m.Direction){$null=Get-AvatarNumber $v 'penetration direction'}
+                $low=$revision -eq 2 -and $contact.Category -eq 'DOORWAY' -and $null -ne $entryHeight -and $m.Direction[1] -ge 0.1 -and
+                    [Math]::Abs((Get-HomeDot $m.Direction $p.Portal.Right)) -le 0.05 -and [Math]::Abs($p.Position[1]+0.5-$m.Direction[1]*(0.5-$m.Distance)-$entryHeight) -le 0.06
+                $directionOk=if($revision -eq 2 -and $contact.Category -eq 'DOORWAY'){$low}else{$m.Direction[1] -ge 0.85}
+                if($m.Intersects -ne $true -or $m.Error -or -not $directionOk -or ($revision -eq 1 -and $m.Distance -gt $o.MaxDepth)){$bad=$true}
+                if($m.Distance -gt $o.MaxDepth){$depthBound=$true}
+                if($contact.Category -eq 'DOORWAY'){$lip=$true;$depth=[Math]::Max($depth,$m.Distance)}
+                if($contact.Category -eq 'FOUNDATION'){
+                    $key=[string]$contact.Collider.Instance
+                    if($supportDepths.ContainsKey($key) -and $m.Distance -gt $supportDepths[$key]+$o.GrowthLimit){$supportGrowth=$true}
+                    $supportDepths[$key]=if($supportDepths.ContainsKey($key)){[Math]::Min($supportDepths[$key],$m.Distance)}else{$m.Distance}
+                }
+            }
+        }
+        $supported=Test-FirstHomePhysicalSupport $p
+        $swept=@($p.Sweep.Hits|Where-Object {$_.Collider.Self -ne $true -and -not
+            ($_.Collider.Role -in @('DOORWAY','FOUNDATION') -and $_.Collider.Instance -in @($p.Overlaps.Collider.Instance) -and
+                (@($_.InitialPenetrations|Where-Object Intersects -eq $true).Count -or
+                    ($revision -eq 2 -and $_.Collider.Role -eq 'DOORWAY' -and $null -ne $entryHeight -and $_.Normal[1] -ge 0.1 -and [Math]::Abs((Get-HomeDot $_.Normal $p.Portal.Right)) -le 0.05 -and [Math]::Abs($_.Position[1]-$entryHeight) -le 0.06) -or
+                    (($revision -eq 1 -or $_.Collider.Role -eq 'FOUNDATION') -and $_.Normal[1] -ge 0.85 -and $_.Position[1] -le $p.Position[1]+0.05 -and $_.Position[1] -ge $p.Position[1]-0.05)))}).Count -gt 0
+        foreach($hit in @($p.Sweep.Hits|Where-Object {$_.Collider.Role -in @('DOORWAY','FOUNDATION') -and @($_.InitialPenetrations).Count})) {
+            if(@($hit.InitialPenetrations).Count -ne @($p.NativeCapsules).Count){throw 'Missing swept initial-pose native body queries'}
+            foreach($m in $hit.InitialPenetrations) {
+                $body=@($p.NativeCapsules|Where-Object Instance -eq $m.ActorCollider)
+                if($body.Count -ne 1 -or $m.Error -or $m.Intersects -notin @($true,$false) -or @($m.Direction).Count -ne 3 -or
+                    @($m.QueryPosition).Count -ne 3 -or @($m.QueryRotation).Count -ne 4 -or @($body[0].Collider.Position).Count -ne 3 -or @($body[0].Collider.Rotation).Count -ne 4 -or
+                    (Get-AvatarNumber $m.Distance 'initial native penetration') -lt 0){throw 'Fabricated initial-overlap exception'}
+                foreach($v in @($m.Direction)+@($m.QueryPosition)+@($m.QueryRotation)){$null=Get-AvatarNumber $v 'initial-pose query'}
+                $expected=@(for($j=0;$j -lt 3;$j++){$body[0].Collider.Position[$j]+$p.Previous[$j]-$p.Position[$j]})
+                if((Get-WorldDistance $expected $m.QueryPosition) -gt 0.0001 -or
+                    @((0..3)|Where-Object {[Math]::Abs($m.QueryRotation[$_]-$body[0].Collider.Rotation[$_]) -gt 0.0001}).Count -or
+                    $m.Intersects -and [Math]::Abs((Get-HomeDot $m.Direction $m.Direction)-1) -gt 0.001){throw 'Initial-overlap query not bound to measured prior capsule pose'}
+            }
+        }
+        $portal=$p.Portal;$bodyCenter=@($p.Position[0],($p.Position[1]+0.9),$p.Position[2]);$relative=Get-HomeRelative $bodyCenter $portal.Center
+        $fits=[Math]::Abs((Get-HomeDot $relative $portal.Right))+0.5 -le $portal.HalfWidth -and [Math]::Abs((Get-HomeDot $relative $portal.Up))+0.9 -le $portal.HalfHeight
+        if($revision -eq 2){
+            $slabs=@($p.DoorwayColliders);$fits=$slabs.Count -gt 0
+            foreach($c in $slabs){
+                if($c.Role -ne 'DOORWAY' -or $c.Own -ne $true -or $c.OwnerFlag -ne 'OWN' -or @($c.Mesh.Center).Count -ne 3 -or @($c.Mesh.Extents).Count -ne 3 -or
+                    @($c.Position).Count -ne 3 -or @($c.Rotation).Count -ne 4 -or @($c.Scale).Count -ne 3){throw 'Missing actual native doorway mesh slab'}
+                foreach($v in @($c.Mesh.Center)+@($c.Mesh.Extents)+@($c.Position)+@($c.Rotation)+@($c.Scale)){$null=Get-AvatarNumber $v 'native slab vector'}
+                $offset=Get-HomeRotated $c.Rotation @(for($j=0;$j -lt 3;$j++){$c.Mesh.Center[$j]*$c.Scale[$j]})
+                $center=@(for($j=0;$j -lt 3;$j++){$c.Position[$j]+$offset[$j]});$half=0.0
+                for($j=0;$j -lt 3;$j++){
+                    if($c.Mesh.Extents[$j] -le 0 -or [Math]::Abs($c.Scale[$j]-1) -gt 0.001){throw 'Invalid/rescaled doorway slab'}
+                    $axis=@(0,0,0);$axis[$j]=$c.Mesh.Extents[$j]*$c.Scale[$j];$half+=[Math]::Abs((Get-HomeDot (Get-HomeRotated $c.Rotation $axis) $portal.Normal))
+                }
+                $distance=[Math]::Max(0.0,[Math]::Abs((Get-HomeDot (Get-HomeRelative $p.Position $center) $portal.Normal))-$half)
+                if($distance -gt 0.5){continue}
+                $reach=[Math]::Sqrt([Math]::Max(0.0,0.25-$distance*$distance))
+                if([Math]::Abs((Get-HomeDot $relative $portal.Right))+$reach -gt $portal.HalfWidth -or [Math]::Abs((Get-HomeDot $relative $portal.Up))+0.4+$reach -gt $portal.HalfHeight){$fits=$false}
+            }
+        }
+        $class='OBSERVE_CONTACT_ONLY';$reason=if($i){'CONTACT_OBSERVED'}else{'FIRST_CONTACT'}
+        if($p.NavSampled -ne $true -or $p.Pending -ne $false -or $p.OnNavmesh -ne $true -or $p.pathPending -eq $true -or $p.Path -ne 'PathComplete' -or $p.Calculated -ne $true -or $p.CalculatedPath -ne 'PathComplete'){$class='UNSAFE';$reason='NATIVE_PATH'}
+        elseif($p.DoorOpen -ne $true -or -not $fits){$class='UNSAFE';$reason='DOOR_OR_APERTURE'}
+        elseif(-not $supported){$class='UNSAFE';$reason='NO_SUPPORT'}
+        elseif($bad -or $swept){$class='UNSAFE';$reason=if($swept){'SWEPT_OBSTACLE'}else{'NON_THRESHOLD_CONTACT'}}
+        elseif($supportGrowth){$class='UNSAFE';$reason='SUPPORT_CONTACT_DEEPENED'}
+        elseif([Math]::Sqrt((Get-HomeDot $p.Velocity $p.Velocity)) -gt 6){$class='UNSAFE';$reason='NONPHYSICAL_VELOCITY'}
+        elseif(($p.Time-$p.PosePreviousTime) -gt 0.1 -or ($p.Time-$p.PosePreviousTime) -lt 0 -or
+            (Get-WorldDistance $p.Previous $p.Position) -gt 6*($p.Time-$p.PosePreviousTime)+0.01 -or $i -and ($dt -gt 0.1 -or $step -gt 6*$dt+0.01)){$class='UNKNOWN';$reason='SAMPLING_GAP'}
+        elseif($elapsed -gt $o.MaxSeconds -or $travel -gt $o.MaxDistance){$class='UNSAFE';$reason='OBSERVATION_BOUND'}
+        elseif(-not $i -and -not $lip -and @($p.Overlaps|Where-Object Category -eq FOUNDATION).Count -eq 0){$class='UNKNOWN';$reason='NO_MEASURED_THRESHOLD'}
+        elseif($i -and $lip -and $hadLip -and $depth -gt $priorDepth+$o.GrowthLimit){
+            $clip=$p.Rigidbody.Kinematic -eq $true -and $step -gt 0.001 -and ($p.Position[1]-$prior.Position[1]) -le $o.GrowthLimit
+            $class=if($clip){'KINEMATIC_CLIP'}else{'UNSAFE'};$reason=if($clip){'CONTACT_DEEPENED_WITHOUT_STEP'}else{'CONTACT_DEEPENED'}
+        }
+        elseif($revision -eq 2 -and $depthBound){$class='UNSAFE';$reason='DEPTH_BOUND'}
+        elseif($i -and -not $lip -and ($hadLip -or @($p.Overlaps|Where-Object Category -eq FOUNDATION).Count -eq 0)){
+            $class='UNKNOWN';$reason='CLEARANCE_REQUIRES_REVIEW'
+        }
+        elseif($i -and $elapsed -ge $o.PersistenceSeconds){$class=if($travel -le 0.01){'NATIVE_STUCK'}else{'UNSAFE'};$reason='CONTACT_PERSISTS'}
+        if($f.Classification -ne $class -or $f.Reason -ne $reason){throw 'Classification contradicts measured native contact evolution'}
+        if($i -lt $frames.Count-1 -and $class -ne 'OBSERVE_CONTACT_ONLY'){throw 'Movement continued after diagnostic stop'}
+        if($lip){$priorDepth=if($hadLip){[Math]::Min($priorDepth,$depth)}else{$depth};$hadLip=$true}
+    }
+    if($o.Outcome -ne $class -or $o.Reason -ne $reason -or $class -eq 'OBSERVE_CONTACT_ONLY'){throw 'False/incomplete diagnostic outcome'}
 }
 function Assert-FirstHomeNavigation($n) {
     $h=$n.FirstHome;$p=$h.Portal;$door=@($h.Home.Entities|Where-Object Role -eq 'DOOR')
+    if($null -ne $h.Observation){throw 'Observe-only contact cannot prove physical home navigation'}
     if($door.Count -ne 1 -or $p.DoorNetId -ne $door[0].NetId -or $p.Radius -ne 0.5 -or $p.Height -ne 1.8){throw 'Missing native doorway/capsule dimensions'}
     foreach($field in @('LocalCenter','LocalExtents','Scale','Center','Normal','Right','Up','Outside','Inside')){
         if(@($p.$field).Count -ne 3){throw 'Missing portal vector'};foreach($v in $p.$field){$null=Get-AvatarNumber $v 'portal vector'}
@@ -292,7 +431,7 @@ function Assert-FirstHomeNavigation($n) {
         $eventName=if($stage -eq 'INSIDE_TC'){'CROSSED_IN'}else{'CROSSED_OUT'};$events=@($h.Navigation|Where-Object Event -eq $eventName)
         if($crossings.Count -ne 1 -or $events.Count -ne 1 -or [Math]::Abs($events[0].Time-$crossings[0].Time) -gt 0.1 -or (Get-WorldDistance $events[0].Position $crossings[0].Position) -gt 0.1){throw 'Portal event is not a measured physical crossing'}
         foreach($sample in $segment|Select-Object -Skip 1){
-            $physics=@($h.Navigation|Where-Object {$_.Event -eq 'PHYSICS' -and [Math]::Abs($_.Time-$sample.Time) -lt 0.01})
+            $physics=@($h.Navigation|Where-Object {$_.Event -eq 'PHYSICS' -and [Math]::Abs($_.Time-$sample.Time) -lt 0.000001})
             if($physics.Count -ne 1 -or $physics[0].Clear -ne $true -or $physics[0].DoorOpen -ne $true -or (Get-WorldDistance $physics[0].Position $sample.Position) -gt 0.01 -or ($physics[0].Inside -and $physics[0].OwnedFloor -ne $true)){throw 'Home sample lacks actual collider/floor clearance'}
             Assert-FirstHomePhysics $physics[0] -RequireClear
             if($physics[0].ActorNetId -ne $sample.ActorNetId){throw 'Physics belongs to a different actor'}
@@ -348,6 +487,39 @@ function Assert-FirstHomeHeldRestore($n) {
 function Assert-FirstHomeSmokeResult($n) {
     Assert-FirstHomeApproaches $n.FirstHome $n.Actor.NetId
     $h=$n.FirstHome
+    if($null -ne $h.Observation){
+        Assert-FirstHomeObservation $h.Observation
+        $contactTime=$h.Observation.Frames[0].Physics.Time
+        if($h.NavigationComplete -or @($h.Navigation|Where-Object {$_.Event -in @('CROSSED_IN','CROSSED_OUT','TC_REACHED') -and $_.Time -ge $contactTime}).Count){throw 'Contact observation leaked into accepted navigation'}
+        foreach($frame in $h.Observation.Frames){
+            $actual=@($h.Navigation|Where-Object {$_.Event -eq 'PHYSICS' -and $_.Time -eq $frame.Physics.Time})
+            if($actual.Count -ne 1 -or ($actual[0]|ConvertTo-Json -Depth 30 -Compress) -cne ($frame.Physics|ConvertTo-Json -Depth 30 -Compress)){throw 'Observation is not bound to actual physics receipts'}
+        }
+    }
+    $watch=@($h.Navigation|Where-Object {$_.Event -eq 'PHYSICS' -and $_.Watch -eq $true})
+    for($i=0;$i -lt $watch.Count;$i++) {
+        $p=$watch[$i];$dt=$p.Time-$p.PosePreviousTime
+        $terminal=$null -ne $h.Observation -and $p.Time -ge $h.Observation.Frames[0].Physics.Time
+        if($i -and ($p.PosePreviousTime -ne $watch[$i-1].Time -or (Get-WorldDistance $p.Previous $watch[$i-1].Position) -gt 0.0001)){throw 'Broken high-frequency physical trajectory'}
+        if(-not $terminal){
+            Assert-FirstHomePhysics $p -RequireClear:$h.NavigationComplete
+            if(-not (Test-FirstHomePhysicalSupport $p) -or $p.ActorNetId -ne $n.Actor.NetId -or $p.CalculatedPath -ne 'PathComplete' -or $p.NavSampled -ne $true -or $p.Pending -ne $false -or
+                $dt -le 0 -or $dt -gt 0.1 -or (Get-WorldDistance $p.Previous $p.Position) -gt 6*$dt+0.01 -or
+                (Get-WorldDistance $p.Sweep.From $p.Previous) -gt 0.0001 -or (Get-WorldDistance $p.Sweep.To $p.Position) -gt 0.0001 -or
+                [Math]::Abs((Get-WorldDistance $p.Previous $p.Position)-$p.Sweep.Distance) -gt 0.0001){throw 'Unobserved/unsafe native movement before contact'}
+        }
+    }
+    if($h.NavigationComplete){
+        foreach($stage in @('INSIDE_TC','OUTSIDE')){
+            $issued=@($h.Navigation|Where-Object {$_.Event -eq 'ISSUED' -and $_.Stage -eq $stage})
+            if($issued.Count -ne 1){throw 'Missing physical leg start'}
+            $arrived=@($h.Navigation|Where-Object {$_.Event -eq 'ARRIVED' -and $_.Time -gt $issued[0].Time}|Select-Object -First 1)
+            $covered=@($watch|Where-Object {$_.Time -gt $issued[0].Time -and $_.Time -le $arrived[0].Time})
+            if($arrived.Count -ne 1 -or $covered.Count -lt 2 -or $covered[0].Time-$issued[0].Time -gt 0.1 -or
+                $arrived[0].Time-$covered[-1].Time -gt 0.1 -or (Get-WorldDistance $covered[0].Previous $issued[0].Start) -gt 0.01 -or
+                (Get-WorldDistance $covered[-1].Position $arrived[0].Position) -gt 0.01){throw 'Incomplete high-frequency physical route coverage'}
+        }
+    }
     foreach($p in @($h.Navigation|Where-Object Event -eq PHYSICS)){Assert-FirstHomePhysics $p}
     if($n.Mode -ne 'BUILD_SMOKE' -or $h.DiagnosticOnly -ne $true -or $n.Status -notin @('PARTIAL','BLOCKED','FAILED') -or
         $n.Persistence.Saved -or $n.Persistence.Restored -or $h.SaveReady -or @($n.Harvests).Count -or $n.ManualPositionWrites -ne 0){throw 'Diagnostic smoke crossed natural/save boundary'}

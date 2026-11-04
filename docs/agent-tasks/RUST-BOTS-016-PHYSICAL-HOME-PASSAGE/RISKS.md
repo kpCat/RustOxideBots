@@ -1,0 +1,10 @@
+# Risks, tradeoffs and next roadmap
+
+1. **Kinematic movement can clip**. RustNav corridor path and transform sync don't imply solid-collider response. A previewed 11.279mm threshold contact could be real unacceptable penetration. Do not make `Clear=true` from motion alone, shadow-only observations cannot justify production support.
+2. **Design not necessarily fixed 1x1 forever**. If native fixed 1x1 doorway and movement do not combine, use real paid native steps/ramp/alternative construction geometry with actual support, or honestly defer architectural choice. Must not destroy/modify terrain or collision. A versioned extra building role requires full payment, native save/restore and adjusted validators.
+3. **Unknown historical outbound**. 013 did not record collider ID on outbound. 014 measured inbound, 015 was offline only. Do not assert they are identical; observe full new path if safely possible.
+4. **One smoke can consume useful time**. Real Rust server startup ~265-310s. Debugging should be bounded and evidence-rich; if no supportable fix, stop, not 10 repeated smoke loops. Only 3 own PID maximum per task.
+5. **Preserve real gameplay economics**. Smoke TEST_FIXTURE permitted, natural must earn. 009 world depletion after graceful restart not crash-atomic; incomplete journal remains IN_DOUBT. Full production 50-100 bots still needs controlled crash testing and performance scaling.
+6. **Map independence**. No seed/coords hardcode; actual current WorldKey+WipeId distinct from changing save. Custom/multi-map native game proof still missing; don't bind map-specific doorway coordinates.
+7. **Native bot ownership**. Engine temporary ID after restart may differ; TC auth rebind only with protected exact own home and no foreign owner, no Steam user identity spoof.
+8. **Long-term gameplay**: beach start, road roaming, loot/gather, paid workbenches/blueprints, real TC/upkeep/storage/door/garage, sleeping bags/death/rebuild, factions/PvP/raids, Giant Excavator diesel events, 50-100 bots, optional rig/cargo. Semantic Pack last. Keep these goals, don't expand 016 into all of them.
