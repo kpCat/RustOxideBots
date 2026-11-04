@@ -67,3 +67,38 @@ New-Item -ItemType Directory $restore2 | Out-Null
 if (Restore-ProbeWorldCache $context $restore2) { throw 'Corrupted cache was accepted' }
 if (@(Get-ChildItem $restore2 -File).Count) { throw 'Corrupted cache was partially applied' }
 Write-Output 'PASS: verified world files restored physically; configs excluded; corruption rejected before copy'
+
+# 011 diagnostic smoke must fork real files and cannot promote fixture economy.
+$isolatedRepo=Join-Path $fixture 'smoke-repo'
+$runtime=Join-Path $isolatedRepo '.local/runtime/smoke'
+$compat=Get-ProbeCompatibility $source
+$trusted=Join-Path $isolatedRepo ('.local/probe-cache/'+$compat.Key)
+$template=Join-Path $trusted 'install'
+New-Item -ItemType Directory -Force -Path $runtime,$trusted,(Join-Path $source 'MonoBleedingEdge') | Out-Null
+Copy-Item -LiteralPath $source -Destination $template -Recurse
+Save-ProbeInstallManifest $template (Join-Path $trusted 'install-manifest.json')
+$trustedContext=[pscustomobject]@{Root=$trusted;Compatibility=$compat;WorldStatus='';InvalidReason=''}
+Save-ProbeWorldCache $trustedContext $world
+$manifestBefore=(Get-FileHash (Join-Path $trusted 'world-manifest.json')).Hash
+$smoke=$null
+try {
+    $smoke=Initialize-ProbeCache $isolatedRepo $source $runtime -DiagnosticOnly
+    if(-not $smoke.DiagnosticOnly -or $smoke.Root -eq $trusted -or -not $smoke.Install.StartsWith($runtime+'\') -or $smoke.WorldStatus -ne 'WARM'){throw 'Smoke reused trusted writable root'}
+    $copy=Join-Path $smoke.World 'proceduralmap.2000.424242.289.sav'
+    [IO.File]::AppendAllText($copy,' test fixture mutation')
+    $denied=$false;try {Save-ProbeWorldCache $smoke $smoke.World}catch{$denied=$true}
+    if(-not $denied){throw 'Fixture cache promotion accepted'}
+    if((Get-FileHash (Join-Path $trusted 'world-manifest.json')).Hash -ne $manifestBefore){throw 'Smoke changed trusted manifest'}
+    $check=Join-Path $fixture 'trusted-after-smoke';New-Item -ItemType Directory $check | Out-Null
+    if(-not (Restore-ProbeWorldCache $trustedContext $check) -or (Get-FileHash (Join-Path $check 'proceduralmap.2000.424242.289.sav')).Hash -eq (Get-FileHash $copy).Hash){throw 'Smoke writable world aliases trusted files'}
+} finally {if($smoke){$smoke.Lock.Dispose()}}
+Write-Output 'PASS: diagnostic physical world/runtime fork, unchanged trusted cache and fail-closed fixture promotion'
+$naturalRuntime=Join-Path $isolatedRepo '.local/runtime/natural'
+New-Item -ItemType Directory -Path $naturalRuntime | Out-Null
+$natural=$null
+try {
+    $natural=Initialize-ProbeCache $isolatedRepo $source $naturalRuntime -PhysicalRun
+    if($natural.DiagnosticOnly -or $natural.Root -ne $trusted -or -not $natural.Install.StartsWith($naturalRuntime+'\') -or
+        (Get-FileHash (Join-Path $natural.World 'proceduralmap.2000.424242.289.sav')).Hash -ne (Get-FileHash (Join-Path $world 'proceduralmap.2000.424242.289.sav')).Hash){throw 'Natural physical fork inherited fixture world'}
+} finally {if($natural){$natural.Lock.Dispose()}}
+Write-Output 'PASS: natural FirstHome uses a fresh physical install and pristine trusted save'

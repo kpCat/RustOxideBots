@@ -33,7 +33,19 @@ function Assert-ProbeFirewallLease([string]$lease, [string]$install) {
     }
     return $state
 }
+function Assert-ProbeFirewallInstallRoot([string]$repo,[string]$install) {
+    $cacheBase=Join-Path $repo '.local\probe-cache'
+    $runtimeBase=Join-Path $repo '.local\runtime'
+    if($install -match ('^'+[regex]::Escape($cacheBase)+'\\[0-9a-f]{64}\\install$')){return}
+    if($install -notmatch ('^'+[regex]::Escape($runtimeBase)+'\\([0-9a-f]{32})\\install$')){throw 'Unsafe firewall install root'}
+    $runId=$matches[1]
+    Assert-ProbePlainPath $install
+    $marker=Join-Path $install 'rustbots-test.marker'
+    Assert-ProbePlainPath $marker
+    if([IO.File]::ReadAllText($marker) -cne $runId){throw 'Runtime firewall root requires matching isolated run marker'}
+}
 function Start-ProbeFirewallLease([string]$repo, [string]$install, [int]$ownerPid=$PID) {
+    Assert-ProbeFirewallInstallRoot $repo $install
     $base = Join-Path $repo '.local\probe-firewall'
     if (Test-Path $base) { Assert-ProbePlainPath $base }
     $lease = Join-Path $base ([Guid]::NewGuid().ToString('N'))
@@ -91,8 +103,7 @@ if ($LeaseDirectory) {
     try {
         $expectedBase = Join-Path $repo '.local\probe-firewall'
         if ((Split-Path $LeaseDirectory -Parent) -ne $expectedBase -or (Split-Path $LeaseDirectory -Leaf) -notmatch '^[0-9a-f]{32}$') { throw 'Unsafe firewall lease path' }
-        $cacheBase = Join-Path $repo '.local\probe-cache'
-        if ($InstallRoot -notmatch ('^'+[regex]::Escape($cacheBase)+'\\[0-9a-f]{64}\\install$')) { throw 'Unsafe firewall install root' }
+        Assert-ProbeFirewallInstallRoot $repo $InstallRoot
         Assert-ProbePlainPath $LeaseDirectory
         $safeReportDirectory = $true
         Assert-ProbePlainTree $InstallRoot

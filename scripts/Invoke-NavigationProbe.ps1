@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
-    [ValidateRange(60,1200)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
+    [ValidateRange(60,2400)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
     [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0, [switch]$WorldRoam,
-    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft, [switch]$PlayerAvatar, [switch]$AvatarSurvival, [switch]$WorldEconomy, [switch]$FirstHome)
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft, [switch]$PlayerAvatar, [switch]$AvatarSurvival, [switch]$WorldEconomy, [switch]$FirstHome, [switch]$FirstHomeSmoke)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
 . (Join-Path $PSScriptRoot 'ProbeCache.ps1')
@@ -15,7 +15,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'AvatarSurvivalValidation.ps1')
 . (Join-Path $PSScriptRoot 'EconomyValidation.ps1')
 . (Join-Path $PSScriptRoot 'FirstHomeValidation.ps1')
-if($FirstHome){if($WorldEconomy -or $AvatarSurvival){throw 'FirstHome already selects world-bound AvatarSurvival'};$WorldEconomy=$true}
+if($FirstHomeSmoke){if($RestoreFrom -or $FirstHome){throw 'Diagnostic build smoke cannot restore or combine FirstHome modes'};$FirstHome=$true}
+if($FirstHome){
+    if($WorldEconomy -or $AvatarSurvival){throw 'FirstHome already selects world-bound AvatarSurvival'};$WorldEconomy=$true
+    if(-not $PSBoundParameters.ContainsKey('NavigationTimeoutSeconds')){$NavigationTimeoutSeconds=if($FirstHomeSmoke){1200}else{2400}}
+    $minimum=if($FirstHomeSmoke){960}else{2160}
+    if($NavigationTimeoutSeconds -lt $minimum){throw 'FirstHome runner deadline must exceed its bounded plugin deadline'}
+}elseif($NavigationTimeoutSeconds -gt 1200){throw 'Legacy navigation deadline remains bounded to 1200 seconds'}
 if($WorldEconomy){if($AvatarSurvival){throw 'WorldEconomy already selects AvatarSurvival'};$AvatarSurvival=$true}
 Initialize-ProbeUtf8
 $repo = [IO.Path]::GetFullPath((Split-Path $PSScriptRoot -Parent))
@@ -35,6 +41,7 @@ $oldRestore = $env:RUST_BOTS_RESTORE
 $oldResume = $env:RUST_BOTS_RESUME_JOURNEY
 $oldEconomy=$env:RUST_BOTS_WORLD_ECONOMY
 $oldHome=$env:RUST_BOTS_FIRST_HOME
+$oldHomeSmoke=$env:RUST_BOTS_FIRST_HOME_SMOKE
 $isSurvival = $SurvivalGather -or $SurvivalCraft
 $scenario = if ($AvatarSurvival) {'AVATAR_SURVIVAL'} elseif ($PlayerAvatar) {'PLAYER_AVATAR'} elseif ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
 $pluginName = if ($AvatarSurvival) {'RustBotsAvatarSurvival'} elseif ($PlayerAvatar) {'RustBotsAvatarProbe'} elseif ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
@@ -92,9 +99,11 @@ try {
     if ($PreflightOnly) {
         $report.Status = 'PARTIAL'; $report.Reason = 'Preflight passed; live firewall delegation/cache/start not requested'
     } else {
-        $cache = Initialize-ProbeCache $repo $source $runtime
+        $cache = Initialize-ProbeCache $repo $source $runtime -DiagnosticOnly:$FirstHomeSmoke -PhysicalRun:$FirstHome
         $install = $cache.Install
         $report.Cache = @{ Key=$cache.Compatibility.Key; State=$cache.WorldStatus; InvalidReason=$cache.InvalidReason; Promoted=$false }
+        $report.Cache['DiagnosticOnly']=[bool]$FirstHomeSmoke
+        $report['NavigationTimeoutSeconds']=$NavigationTimeoutSeconds
         if($WorldEconomy -and $cache.WorldStatus -ne 'WARM'){throw 'WorldEconomy requires an exact verified warm world; no speculative live start'}
         if (($isSurvival -or $AvatarSurvival) -and $cache.WorldStatus -eq 'WARM') {
             $loadedManifest=Get-Content (Join-Path $cache.Root 'world-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -120,7 +129,10 @@ try {
         $env:RUST_BOTS_RESUME_JOURNEY = if ($ResumeJourney) { '1' } else { '' }
         $env:RUST_BOTS_WORLD_ECONOMY=if($WorldEconomy){'1'}else{''}
         $env:RUST_BOTS_FIRST_HOME=if($FirstHome){'1'}else{''}
+        $env:RUST_BOTS_FIRST_HOME_SMOKE=if($FirstHomeSmoke){'1'}else{''}
         $report['FirstHome']=[bool]$FirstHome
+        $report['FirstHomeSmoke']=[bool]$FirstHomeSmoke
+        if($FirstHomeSmoke){[IO.File]::WriteAllText((Join-Path $install 'rustbots-build-smoke.marker'),$runId)}
         if($WorldEconomy){
             $map=@($loadedManifest.Files|Where-Object Name -match '\.map$')
             if($map.Count -ne 1){throw 'Missing exact economy map identity'}
@@ -137,7 +149,7 @@ try {
                 -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok) { throw 'Unsafe/incomplete restore provenance' }
             if ($AvatarSurvival) {
                 if($prior.Scenario -ne $scenario -or ($prior.Navigation.Mode -ne 'JOURNEY' -and -not ($WorldEconomy -and $prior.Navigation.Mode -eq 'RESTORE'))){throw 'Avatar restore requires completed journey/checkpoint'}
-                if($FirstHome){Assert-FirstHomeResult $prior.Navigation;if($prior.FirstHome -ne $true){throw 'Source is not FirstHome'}}
+                if($FirstHome){Assert-FirstHomeResult $prior.Navigation;if($prior.FirstHome -ne $true -or $prior.FirstHomeSmoke -or $prior.Navigation.Status -ne 'GREEN' -or -not $prior.Navigation.FirstHome.NavigationComplete){throw 'Source is not completed natural FirstHome'}}
                 else{Assert-AvatarSurvivalResult $prior.Navigation;if($prior.FirstHome){throw 'FirstHome requires FirstHome restore'}}
                 if($WorldEconomy){if(-not $FirstHome){Assert-EconomyResult $prior.Navigation};if(-not $prior.WorldEconomy){throw 'Source is not WorldEconomy'}}
                 elseif($prior.WorldEconomy){throw 'WorldEconomy snapshot requires WorldEconomy restore'}
@@ -240,7 +252,8 @@ try {
                 Copy-Item -LiteralPath $navFile -Destination (Join-Path $runtime 'plugin-result.json')
                 try {
                     if ($AvatarSurvival) {
-                        if($FirstHome){Assert-FirstHomeResult $nav}
+                        if($FirstHomeSmoke){Assert-FirstHomeSmokeResult $nav}
+                        elseif($FirstHome){Assert-FirstHomeResult $nav}
                         else{Assert-AvatarSurvivalResult $nav;if($RestoreFrom){Assert-AvatarSurvivalRestart $prior.Navigation $nav}}
                         if($WorldEconomy){if(-not $FirstHome){Assert-EconomyResult $nav};if($nav.Status -eq 'GREEN' -or ($FirstHome -and $nav.FirstHome.SaveReady)){Assert-EconomyMapMatch $nav.Economy.World $report.EconomyMap}}
                     } elseif ($PlayerAvatar) {
@@ -282,6 +295,7 @@ try {
                 }
                 $report.Status = $nav.Status
                 $report.Reason = $nav.Reason
+                if($FirstHomeSmoke){$report['BuildSmokeStatus']=if($nav.FirstHome.NavigationComplete){'BUILD_SMOKE_GREEN'}else{'PARTIAL'};$report['EvidenceClass']='DIAGNOSTIC_BUILD_ONLY'}
                 if ($nav.Status -ne 'GREEN' -and $DiagnosticHoldSeconds -gt 0) {
                     Save-Report
                     Write-Host ('Diagnostic hold for '+$DiagnosticHoldSeconds+' seconds; owned server will still stop automatically.')
@@ -321,7 +335,7 @@ try {
                 $report.ServerExitCode = $owned.Process.ExitCode
             }
             try { Assert-PortsFree; $report.PortsReleased = $true } catch { $report.PortsReleased = $false }
-            if ($cache -and $report.Status -ne 'FAILED' -and (Test-ProbeCompletedSave $report (Read-ProbeLog $log))) {
+            if ($cache -and -not $FirstHomeSmoke -and -not $cache.DiagnosticOnly -and $report.Status -ne 'FAILED' -and (Test-ProbeCompletedSave $report (Read-ProbeLog $log))) {
                 try { Save-ProbeWorldCache $cache $cache.World; $report.Cache.Promoted = $true }
                 catch { Write-Warning $_.Exception.ToString(); $report.Cache['PromotionError']=$_.Exception.Message; if ($report.Status -eq 'GREEN') { $report.Status='PARTIAL'; $report.Reason='Navigation passed; cache promotion failed' } }
             }
@@ -342,6 +356,7 @@ try {
         $env:RUST_BOTS_RESUME_JOURNEY = $oldResume
         $env:RUST_BOTS_WORLD_ECONOMY=$oldEconomy
         $env:RUST_BOTS_FIRST_HOME=$oldHome
+        $env:RUST_BOTS_FIRST_HOME_SMOKE=$oldHomeSmoke
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (($PlayerAvatar -or $AvatarSurvival) -and $report.Status -eq 'GREEN') {
             $report['AvatarCompletedSave']=Test-ProbeCompletedSave $report (Read-ProbeLog $log)

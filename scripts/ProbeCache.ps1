@@ -73,6 +73,7 @@ function Get-ProbeWorldFiles([string]$world, $compatibility) {
     @(Get-ChildItem -LiteralPath $world -File | Where-Object { $_.Name -match $pattern })
 }
 function Save-ProbeWorldCache($context, [string]$world) {
+    if($context.DiagnosticOnly){throw 'TEST_FIXTURE cache promotion is forbidden'}
     Assert-ProbePlainTree $world
     $files = @(Get-ProbeWorldFiles $world $context.Compatibility)
     foreach ($extension in @('.map','.sav','.navmesh')) {
@@ -124,7 +125,7 @@ function Restore-ProbeWorldCache($context, [string]$destination) {
     $context.WorldStatus='WARM'
     return $true
 }
-function Initialize-ProbeCache([string]$repo, [string]$source, [string]$runtime) {
+function Initialize-ProbeCache([string]$repo, [string]$source, [string]$runtime, [switch]$DiagnosticOnly, [switch]$PhysicalRun) {
     $compat = Get-ProbeCompatibility $source
     $cacheBase = Join-Path $repo '.local\probe-cache'
     if (Test-Path $cacheBase) { Assert-ProbePlainPath $cacheBase }
@@ -133,6 +134,36 @@ function Initialize-ProbeCache([string]$repo, [string]$source, [string]$runtime)
     $lock = [IO.File]::Open((Join-Path $cacheBase ('locks\'+$compat.Key+'.lock')), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
         $root = Join-Path $cacheBase $compat.Key
+        if($DiagnosticOnly -or $PhysicalRun) {
+            # Read the trusted template under its lock. All writable files are new physical copies.
+            Assert-ProbePlainTree $root
+            $template=Join-Path $root 'install'
+            Assert-ProbeInstallManifest $template (Join-Path $root 'install-manifest.json')
+            $manifest=Get-Content (Join-Path $root 'world-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            if($manifest.Key -ne $compat.Key -or $manifest.Generation -notmatch '^world-[0-9a-f]{32}$'){throw 'Unknown trusted smoke generation'}
+            $private=Join-Path $runtime 'smoke-cache'
+            $install=Join-Path $runtime 'install'
+            New-Item -ItemType Directory -Path $private,$install | Out-Null
+            foreach($dir in @('RustDedicated_Data','Bundles','MonoBleedingEdge')) {
+                Copy-Item -LiteralPath (Join-Path $template $dir) -Destination $install -Recurse
+            }
+            foreach($file in @(Get-ChildItem -LiteralPath $template -File | Where-Object {$_.Extension -in @('.exe','.dll')})) {
+                Copy-Item -LiteralPath $file.FullName -Destination $install
+            }
+            Assert-ProbeInstallManifest $install (Join-Path $root 'install-manifest.json')
+            Copy-Item -LiteralPath (Join-Path $root 'world-manifest.json') -Destination $private
+            Copy-Item -LiteralPath (Join-Path $root $manifest.Generation) -Destination $private -Recurse
+            foreach($dir in @('oxide/plugins','oxide/config','oxide/data','oxide/logs','cfg','config','logs')) {
+                New-Item -ItemType Directory -Force -Path (Join-Path $install $dir) | Out-Null
+            }
+            $identity='rustbots_probe_'+$(if($DiagnosticOnly){'smoke_'}else{'home_'})+[Guid]::NewGuid().ToString('N')
+            $world=Join-Path $install ('server/'+$identity)
+            New-Item -ItemType Directory -Path $world -Force | Out-Null
+            $context=[pscustomobject]@{Root=$private;Install=$install;Identity=$identity;World=$world;Compatibility=$compat;Lock=$lock;WorldStatus='COLD';InvalidReason='';DiagnosticOnly=[bool]$DiagnosticOnly}
+            if(-not (Restore-ProbeWorldCache $context $world)){throw 'Smoke requires verified private warm world copy'}
+            if(-not $DiagnosticOnly){$context.Root=$root}
+            return $context
+        }
         New-Item -ItemType Directory $root -Force | Out-Null
         Assert-ProbePlainPath $root
         $install = Join-Path $root 'install'

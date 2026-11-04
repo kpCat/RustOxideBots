@@ -1,0 +1,11 @@
+# RISKS — не потерять большой замысел
+
+1. **Неиспытанный native Planner.** 010 потратил четыре запуска на site/farm без вызова строительства. Smoke должен выявить реальные placement/grade/TC/door blockers до нового long farm. Но fixture smoke запрещён как доказательство полноценной экономики.
+2. **Time budget.** 010 full material collection ~989.5с, выбранный site ~153м route; 1100с gameplay мало. Нужно связать bounded plugin timeout с runner timeout и увеличить только FirstHome. Не изменять общие safety gates/зависимость от Job Object.
+3. **Слишком консервативный бюджет wood.** 010 резервировал сутки по полной Wood-grade стоимости. Можно точнее определить native paid protection>=60м, не отключая upkeep, не уменьшать реальные building/grade recipes. Новое число обязано быть обосновано API и receipt.
+4. **Native actor ownership/TC.** Engine-issued bot ID может измениться при restart; не подделывать Steam ID. Authorization только на свою подтверждённую базу и не при чужом auth/raid/wipe. Динамическая home geometry сложна для RustNav.
+5. **Инструменты и ресурсы.** 010 run3 broke paid axe, run4 прошёл честный one-time switch на rock. Не допускать broken hit/replay и не использовать из старых PARTIAL saved resource UID.
+6. **Crash durability.** 009 GREEN только для штатного restart; partial payment/journal interruption остаётся IN_DOUBT, production crash-safe не доказана. Не переводить систему в массовый production на основании одного дома.
+7. **Мир и вайп.** MapKey/WorldKey/wipe отделены от transient entity UID. Изолированный fixture smoke не должен попасть в cache, live 011 нельзя hardcode coords.
+8. **Долгосрочная цель:** 50–100 постоянных NPC, пляжный спавн, роуминг, натуральный лут/инструменты/крафт, технологическое развитие, native TC/поддержка/door/garage/box/room navigation, спальники/смерть/respawn/переезд после рейда, кланы/PvP/оборона, Giant Excavator (diesel, запускают/защищают/собирают; rival attacks только выборочных групп). Карго/нефтянки optional; Semantic Pack самый конец. Ничего из этого не терять, но не включать всё в 011.
+9. **Лимиты**: один smoke + один настоящий JOURNEY + один conditional RESTORE. Не запрашивать подтверждение на каждый подэтап. После исчерпания бюджета — честный отчёт и новая задача, не бесконечный чат. Пользователь предпочитает новый Codex chat для каждой задачи.

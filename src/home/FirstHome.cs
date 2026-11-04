@@ -33,7 +33,10 @@ namespace Oxide.Plugins
             public List<ItemRow> TcInventory;
             public ulong[] Authorized;
         }
-        private bool firstHome,homeGather,homeRestored,homeNavComplete;
+        private const int HomeJourneySeconds=2100,HomeSmokeSeconds=900,HomeBuildReserve=360,HomeGatherReserve=1350;
+        private bool firstHome,homeGather,homeRestored,homeNavComplete,homeSmoke;
+        private string homeAdmissionReason,homeObservedPhase;
+        private readonly List<object> homeFixture=new List<object>(),homePlacements=new List<object>(),homePhases=new List<object>();
         private string homePhase,homeIntent,homeForeign;
         private float homeWait,homeLegTime,homeTravelSeconds;
         private int homeStep,homeNavStage,homeSearchIndex;
@@ -54,6 +57,20 @@ namespace Oxide.Plugins
         private object homeSiteReceipt,homeUpkeep,homeRebind,homePortal,homeDoorClosed;
         private readonly Dictionary<string,Item> homeTools=new Dictionary<string,Item>();
         private string HomeData { get { return Data("economy.home.json"); } }
+        private void HomeIssueFixture() {
+            if(!homeSmoke || mode!="BUILD_SMOKE" || homeFixture.Count!=0 || Contents().Any(x=>x.Shortname!="rock"))throw new InvalidOperationException("Fixture issuance outside diagnostic-only empty inventory");
+            var budget=new Dictionary<string,int>(homeBudget);
+            foreach(var cost in recipe.Ingredients){if(!budget.ContainsKey(cost.Shortname))budget[cost.Shortname]=0;budget[cost.Shortname]+=cost.Amount;}
+            foreach(var cost in budget) {
+                int left=cost.Value;
+                while(left>0) {
+                    int amount=Math.Min(left,1000);var item=ItemManager.CreateByName(cost.Key,amount);
+                    if(item==null || !item.MoveToContainer(npc.inventory.containerMain,-1,false))throw new InvalidOperationException("Diagnostic fixture native transfer failed");
+                    var receipt=new {Source=cost.Key=="wood"?"TEST_FIXTURE_WOOD":"TEST_FIXTURE_STONES",DiagnosticOnly=true,Item=Row(item),Amount=amount};
+                    homeFixture.Add(receipt);Log("TEST_FIXTURE",receipt);left-=amount;
+                }
+            }
+        }
         private static bool HomeHoldable(string name) { return name=="rock" || name=="stonehatchet" || name=="building.planner" || name=="hammer"; }
         private void HomeLoaded(BaseNetworkable value,BaseNetworkable.LoadInfo info) {
             var e=value as DecayEntity;
@@ -113,6 +130,7 @@ namespace Oxide.Plugins
             homePhase="SITE_SEARCH";state.Goal="HOME_SITE";
         }
         private void HomeGatherAtSelectedSite() {
+            if(homeSmoke){HomeMaterialsReady();return;}
             homeGather=true;homePhase="GATHER";state.Goal="NEED_RESOURCE";discoveries=0;rejected.Clear();
             homeGatherTool=product;
             if(!Activate(product.uid))throw new InvalidOperationException("Home earned axe missing");melee=npc.GetHeldEntity() as BaseMelee;
@@ -177,7 +195,7 @@ namespace Oxide.Plugins
             if(homeBudget.Any(x=>Quantity(x.Key)<x.Value))throw new InvalidOperationException("Incomplete full home/upkeep budget");
             homeForeignStructures=BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(HomeStructural).ToArray();
             // Revalidate the selected footprint BEFORE any home craft payment. Never buy tools then choose a different site.
-            if(!HomeCheckSite(homeSite,homeRotation))throw new InvalidOperationException("Selected home site changed before paid home craft");
+            if(!HomeCheckSite(homeSite,homeRotation))throw new InvalidOperationException("Home admission rejected before paid home craft: "+homeAdmissionReason);
             homeTools["building.planner"]=HomeCraft("building.planner",2);
             homeTools["hammer"]=HomeCraft("hammer",3);
             homeTools["door.hinged.wood"]=HomeCraft("door.hinged.wood",4);
@@ -252,13 +270,18 @@ namespace Oxide.Plugins
                 if(collisions!=0)reasons.Add("COLLISION");
                 var privilege=npc.GetBuildingPrivilege(siteObb,false,1f,null,false);bool permission=npc.CanBuild(siteObb,false);
                 if(privilege!=null || !permission)reasons.Add("BUILD_PERMISSION_OR_FOREIGN_TC");
-                var path=new RustNavMeshPath();bool complete=false;float pathLength=0,travelSeconds=0,remaining=deadline-Time.realtimeSinceStartup,reserve=homePhase=="SITE_SEARCH"?650:120;
+                var path=new RustNavMeshPath();bool complete=false;float pathLength=0,travelSeconds=0,remaining=deadline-Time.realtimeSinceStartup,reserve=homePhase=="SITE_SEARCH" && !homeSmoke?HomeGatherReserve:HomeBuildReserve;
                 if(reasons.Count==0) {
                     complete=agent.CalculatePath(foot,path) && path.status==NavMeshPathStatus.PathComplete;
-                    if(complete){pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/3+30);complete=pathLength<=800 && travelSeconds<=300 && remaining>=travelSeconds+reserve;}
-                    if(!complete)reasons.Add("RUSTNAV_OR_TRAVEL_BOUND");
+                    if(!complete)reasons.Add("NAV_PATH");
+                    else {
+                        pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/3+30);
+                        if(pathLength>800 || travelSeconds>300)reasons.Add("TRAVEL_BUDGET");
+                        if(remaining<travelSeconds+reserve)reasons.Add("TIME_BUDGET");
+                    }
                 }
-                if(reasons.Count!=0){homeSites.Add(new {Candidate=Point(p),Reasons=reasons,HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,Water=water,Topology=topology,NativePreview=nativePreview,Sampled=sampled,Path=path.status.ToString(),Complete=complete,Collisions=collisions,
+                homeAdmissionReason=string.Join(",",reasons.ToArray());
+                if(reasons.Count!=0){homeSites.Add(new {Phase=homePhase,Candidate=Point(p),Reasons=reasons,PathLength=pathLength,TravelSeconds=travelSeconds,DeadlineRemaining=remaining,PhaseReserve=reserve,HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,Water=water,Topology=topology,NativePreview=nativePreview,Sampled=sampled,Path=path.status.ToString(),Complete=complete,Collisions=collisions,
                     MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,ForeignId=Id(nearest),ForeignType=nearest==null?null:nearest.GetType().Name,PrivilegeId=Id(privilege),RoadDistance=roadDistance});return false;}
                 homeSite=p;homeRotation=rot;homeOutside=foot;
                 homeSiteReceipt=new {Position=Point(p),Rotation=new[] {rot.x,rot.y,rot.z,rot.w},HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,NativePreview=nativePreview,
@@ -351,7 +374,10 @@ namespace Oxide.Plugins
             if(Oxide.Core.Interface.CallHook("CanBuild",planner,c,t)!=null)throw new InvalidOperationException("Native CanBuild hook denied home");
             var costs=definition=="DOOR" || definition=="TC"?new List<Cost>{new Cost {Shortname=tool,Amount=1}}:HomeCosts(c.defaultGrade.CostToBuild((BuildingGrade.Enum)(-1)));
             var before=Contents();HomeStartPayment("BUILD_"+role,new {Target=Point(position),Socket=socket==null?null:socket.socketName,Costs=costs});
+            Log("HOME_NATIVE_ATTEMPT",new {Role=role,Definition=definition,Target=Point(t.position),RayOrigin=Point(t.ray.origin),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Owner=npc.userID.ToString(),Time=Time.realtimeSinceStartup});
             var created=planner.DoBuild(t,c) as DecayEntity;
+            var placement=new {Role=role,NativeCall="Planner.DoBuild(Construction.Target,Construction)",Target=Point(t.position),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Entity=Id(created),Error=Construction.lastPlacementErrorDebug,Time=Time.realtimeSinceStartup};
+            homePlacements.Add(placement);Log("HOME_NATIVE_RESULT",placement);
             if(created==null)throw new InvalidOperationException("Native placement rejected "+role+": "+Construction.lastPlacementErrorDebug+"; no retry");
             homeEntities.Add(role,created);HomeEndPayment("BUILD_"+role,before,costs,null,Id(created));
             if(created.OwnerID!=npc.userID || !created.enableSaving || !BaseEntity.saveList.Contains(created))throw new InvalidOperationException("Native home ownership/save registration failed");
@@ -383,7 +409,8 @@ namespace Oxide.Plugins
             if(homeStep==7){var wall=homeEntities["DOORWAY"];var socket=HomeSocket(wall,"/doorway-female/1");HomePlace("DOOR","DOOR","door.hinged.wood",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;homeWait=Time.realtimeSinceStartup+8;homePhase="VERIFY";return;}
         }
         private Vector3 HomeBuildStand() {
-            Vector3 offset=homeStep==1 || homeStep==5?new Vector3(0,0,3):homeStep==2?new Vector3(3,0,0):homeStep==3?new Vector3(-3,0,0):new Vector3(0,0,-3);
+            // TC is inside the footprint: approach the open doorway physically within its native 4m reach.
+            Vector3 offset=homeStep==1 || homeStep==5?new Vector3(0,0,3):homeStep==2?new Vector3(3,0,0):homeStep==3?new Vector3(-3,0,0):homeStep==6?new Vector3(0,0,-2.25f):new Vector3(0,0,-3);
             var p=homeSite+homeRotation*offset;p.y=TerrainMeta.HeightMap.GetHeight(p);Vector3 foot;
             if(!NavSample(p,out foot))throw new InvalidOperationException("No physical building approach");return foot;
         }
@@ -545,6 +572,7 @@ namespace Oxide.Plugins
         private bool HomeTick() {
             if(!firstHome || homePhase==null || homePhase=="TOOL" || homePhase=="GATHER")return false;
             float now=Time.realtimeSinceStartup;var position=npc.transform.position;float dt=now-previousTime,step=Vector3.Distance(previous,position);
+            if(homeObservedPhase!=homePhase){var phase=new {Phase=homePhase,Time=now,Remaining=deadline-now};homePhases.Add(phase);Log("HOME_PHASE",phase);homeObservedPhase=homePhase;}
             if(EquipmentValid()) {
                 equipmentChecks++;
                 if(mode=="RESTORE") {
@@ -588,13 +616,15 @@ namespace Oxide.Plugins
                     homeNav.Add(new {Event="TC_REACHED",Range=range,LineOfSight=los,Time=now,Position=Point(position)});HomeMove(homeOutside,"OUTSIDE");homeNavStage=1;
                 }else {
                     if(!homeCrossedOut)throw new InvalidOperationException("Physical exit portal crossing missing");HomeOpenDoor(false);homeNavComplete=true;
-                    if(!Activate(product.uid) || !EquipmentValid())throw new InvalidOperationException("Home paid held axe lost");Save();Finish("GREEN","Native paid home/TC/upkeep and physical RustNav "+mode);
+                    if(!Activate(product.uid) || !EquipmentValid())throw new InvalidOperationException("Home paid held axe lost");
+                    if(homeSmoke)Finish("PARTIAL","BUILD_SMOKE_GREEN / DIAGNOSTIC_BUILD_ONLY; fixture is not natural survival or restore proof");
+                    else{Save();Finish("GREEN","Native paid home/TC/upkeep and physical RustNav "+mode);}
                 }
             }
             return true;
         }
         private object HomeResult() {
-            return !firstHome?null:new {Schema=1,Stage=homePhase,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
+            return !firstHome?null:new {Schema=1,Stage=homePhase,DiagnosticOnly=homeSmoke,Fixture=homeFixture,NativePlacements=homePlacements,Phases=homePhases,Schedule=new {JourneySeconds=HomeJourneySeconds,SmokeSeconds=HomeSmokeSeconds,BuildReserve=HomeBuildReserve,GatherReserve=HomeGatherReserve},AdmissionReason=homeAdmissionReason,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
                 Operations=homeOperations,ToolSwitches=homeToolSwitches,Home=homeEntities.Count==8?DescribeHome():null,PartialEntities=homeEntities.Select(x=>HomeRow(x.Key,x.Value)).ToArray(),
                 Decay=new {Enabled=ConVar.Decay.upkeep,Scale=ConVar.Decay.scale,WoodDuration=ConVar.Decay.duration_wood},
                 Upkeep=homeUpkeep,Portal=homePortal,Navigation=homeNav,NavigationComplete=homeNavComplete,CrossedIn=homeCrossedIn,CrossedOut=homeCrossedOut,Restored=homeRestored,Rebind=homeRebind,

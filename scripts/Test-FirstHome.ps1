@@ -113,3 +113,18 @@ foreach($mutation in @(
  {param($x)$x.RestoreAudit.SourceContainers[0].Capacity=0}, {param($x)$x.EquipmentSamples[2].Equipment.HeldNetId='99'}
 )){$x=Copy-HomeFixture $heldFixture;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeHeldRestore $x}}
 Write-Output 'PASS OFFLINE_ONLY 6: all four paid/native held items restore with strict original UID and alias/foreign guards'
+
+$repo=Split-Path $PSScriptRoot -Parent
+$homeSource=Get-Content (Join-Path $repo 'src/home/FirstHome.cs') -Raw
+$avatarSource=Get-Content (Join-Path $repo 'src/plugins/RustBotsAvatarSurvival.cs') -Raw
+$runnerSource=Get-Content (Join-Path $PSScriptRoot 'Invoke-NavigationProbe.ps1') -Raw
+if($homeSource -notmatch 'HomeJourneySeconds=2100' -or $homeSource -notmatch 'HomeBuildReserve=360' -or
+    $avatarSource -match 'firstHome\?1100' -or $avatarSource -notmatch 'HomeJourneySeconds' -or
+    $runnerSource -notmatch 'FirstHomeSmoke' -or $runnerSource -notmatch '2400' -or
+    $homeSource -match 'RUSTNAV_OR_TRAVEL_BOUND' -or $homeSource -notmatch 'reasons.Add\("TIME_BUDGET"\)' -or
+    $homeSource -notmatch 'reasons.Add\("NAV_PATH"\)' -or $homeSource -notmatch 'DeadlineRemaining=remaining,PhaseReserve=reserve'){
+    throw '011 phase schedule still conflates path/time or runner/plugin deadlines'
+}
+$fake=Copy-HomeFixture @{Status='PARTIAL';FirstHome=@{Schema=1;DiagnosticOnly=$true;Fixture=@{Source='TEST_FIXTURE_WOOD'}}}
+Deny-HomeFixture {Assert-FirstHomeResult $fake}
+Write-Output 'PASS OFFLINE_ONLY 7: measured FirstHome schedule, independent runner deadline and no fixture promotion to natural receipt'

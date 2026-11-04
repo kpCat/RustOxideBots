@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.2.3")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.3.0")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public partial class RustBotsAvatarSurvival : RustPlugin
     {
@@ -206,9 +206,14 @@ namespace Oxide.Plugins
         private void OnServerInitialized() {
             if(!TestRoot()){Puts("Avatar survival inert: isolated marker/identity missing.");return;}
             firstHome=Environment.GetEnvironmentVariable("RUST_BOTS_FIRST_HOME")=="1";
+            homeSmoke=Environment.GetEnvironmentVariable("RUST_BOTS_FIRST_HOME_SMOKE")=="1";
+            if(homeSmoke && (!firstHome || Directory.GetParent(root).Name!=token || !File.Exists(Path.Combine(root,"rustbots-build-smoke.marker")) ||
+                File.ReadAllText(Path.Combine(root,"rustbots-build-smoke.marker"))!=token || Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1")){
+                Finish("BLOCKED","Diagnostic fixture requires its own run-root marker and no restore");return;
+            }
             economy=Environment.GetEnvironmentVariable("RUST_BOTS_WORLD_ECONOMY")=="1";
             if(firstHome && !economy){Finish("BLOCKED","FirstHome requires world-bound native economy");return;}
-            mode=Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1"?"RESTORE":"JOURNEY";wait=Time.realtimeSinceStartup;
+            mode=homeSmoke?"BUILD_SMOKE":Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1"?"RESTORE":"JOURNEY";wait=Time.realtimeSinceStartup;
             Puts("RUSTBOTS_READY RustNavMeshAgent/RustNav");
             timer.Every(0.5f,()=> { try {
                 string stop=Path.Combine(root,"rustbots-stop.request");
@@ -225,7 +230,7 @@ namespace Oxide.Plugins
         private void Begin() {
             if(economy) {
                 currentWorld=ReadCurrentWorld();
-                if(mode=="JOURNEY")Directory.CreateDirectory(currentWorld.JournalDirectory(Path.Combine(root,"oxide","data")));
+                if(mode!="RESTORE")Directory.CreateDirectory(currentWorld.JournalDirectory(Path.Combine(root,"oxide","data")));
             }
             prefab=GameManifest.Current.entities.Where(p=>p.EndsWith("/scientistnpc_roam.prefab",StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
             var obj=prefab==null?null:GameManager.server.FindPrefab(prefab);
@@ -264,7 +269,8 @@ namespace Oxide.Plugins
             if(!Activate(rock.uid))throw new InvalidOperationException("Starter rock native activation failed");melee=npc.GetHeldEntity() as BaseMelee;
             if(melee==null)throw new InvalidOperationException("Starter rock BaseMelee missing");
             CraftGuard("stonehatchet","MISSING_INGREDIENTS");CraftGuard("rustbots.invalid.recipe","RECIPE_UNAVAILABLE");CraftGuard("rifle.ak","WORKBENCH_REQUIRED");
-            previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+(firstHome?1100:900);Sample(previousTime);active=true;Discover();
+            previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+(firstHome?(homeSmoke?HomeSmokeSeconds:HomeJourneySeconds):900);Sample(previousTime);active=true;
+            if(homeSmoke){HomeIssueFixture();StartCraft();}else Discover();
         }
         private bool Ground(Vector3 p,out Vector3 foot,bool clear=true) {
             foot=p;RaycastHit hit;
@@ -661,7 +667,7 @@ namespace Oxide.Plugins
             if(economy)RestoreEconomy();
             restored=true;ActivationNegatives();holdTime=Time.realtimeSinceStartup+2;active=true;
             restoreAudit.Stage="COMPLETE";
-            if(firstHome){previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+1100;Sample(previousTime);HomeRestoreRebind();}
+            if(firstHome){previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+HomeJourneySeconds;Sample(previousTime);HomeRestoreRebind();}
             Log("RESTORE",new {State=state,Expected=snapshot.Inventory,Actual=Contents(),Equipment=Equipment(),Restored=restored});
         }
         private void Save() {
@@ -681,7 +687,7 @@ namespace Oxide.Plugins
         }
         private void Finish(string status,string reason) {
             if(finished)return;finished=true;active=false;
-            if(firstHome && status=="PARTIAL" && homeUpkeep!=null && homeIntent==null && !saved && equipmentChecks>=3) {
+            if(firstHome && !homeSmoke && status=="PARTIAL" && homeUpkeep!=null && homeIntent==null && !saved && equipmentChecks>=3) {
                 try{if(Activate(product.uid))Save();}catch(Exception ex){Log("HOME_CHECKPOINT_REFUSED",ex.Message);}
             }
             // Terminal result: release the exclusive writer before Windows evidence readers open it.

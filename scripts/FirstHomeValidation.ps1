@@ -208,10 +208,52 @@ function Assert-FirstHomeHeldRestore($n) {
         if(($samples[$j].Equipment|ConvertTo-Json -Compress) -cne ($n.Equipment|ConvertTo-Json -Compress) -or ($j -gt 0 -and $samples[$j].Time -le $samples[$j-1].Time)){throw 'Restored native equipment changed'}
     }
 }
+function Assert-FirstHomeSmokeResult($n) {
+    $h=$n.FirstHome
+    if($n.Mode -ne 'BUILD_SMOKE' -or $h.DiagnosticOnly -ne $true -or $n.Status -notin @('PARTIAL','BLOCKED','FAILED') -or
+        $n.Persistence.Saved -or $n.Persistence.Restored -or $h.SaveReady -or @($n.Harvests).Count -or $n.ManualPositionWrites -ne 0){throw 'Diagnostic smoke crossed natural/save boundary'}
+    if($n.Conservation.EconomicFailure -and $n.Status -ne 'FAILED'){throw 'Smoke conservation failure cannot pass'}
+    if(-not $n.Actor){if($h.NavigationComplete){throw 'Smoke home without actor'};return}
+    Assert-AvatarActor $n
+    if(-not @($h.Fixture).Count){if($h.NavigationComplete){throw 'Smoke home without fixture ledger'};return}
+    $issued=@();$expected=@{}
+    foreach($name in $h.Budget.PSObject.Properties.Name){$expected[$name]=[int]$h.Budget.$name}
+    foreach($cost in $n.Recipe.Ingredients){$expected[$cost.Shortname]+=[int]$cost.Amount}
+    foreach($row in $h.Fixture){
+        if($row.DiagnosticOnly -ne $true -or $row.Item.Shortname -notin @('wood','stones') -or
+            $row.Source -cne ('TEST_FIXTURE_'+$row.Item.Shortname.ToUpperInvariant()) -or $row.Amount -ne $row.Item.Amount -or
+            $row.Item.OwnerNetId -ne $n.Actor.NetId){throw 'Unknown diagnostic fixture provenance'}
+        $issued+=@($row.Item)
+    }
+    $null=Get-FirstHomeEconomicKey $issued
+    foreach($name in $expected.Keys){if([int](($issued|Where-Object Shortname -eq $name|Measure-Object Amount -Sum).Sum) -ne $expected[$name]){throw 'Diagnostic fixture budget differs from native loaded cost'}}
+    $last=@(@($n.StarterKit)+$issued);$paid=@{}
+    foreach($op in $h.Operations){
+        if($op.Kind -eq 'GATHER' -or $paid.ContainsKey([string]$op.Kind) -or
+            (Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $op.Before)){throw 'Smoke duplicate/gather/broken payment chain'}
+        Assert-FirstHomePayment $op
+        if($op.Kind -eq 'CRAFT_TOOL'){$cost=$n.Recipe.Ingredients}
+        elseif($op.Kind -like 'CRAFT_*'){$cost=$h.Recipes.($op.Kind.Substring(6)).Ingredients}
+        elseif($op.Kind -in @('BUILD_DOOR','BUILD_TC')){$cost=@([pscustomobject]@{Shortname=$(if($op.Kind -eq 'BUILD_TC'){'cupboard.tool'}else{'door.hinged.wood'});Amount=1})}
+        else{$cost=$h.GradeCosts.($op.Kind)}
+        if(-not $cost -or (Get-FirstHomeCostKey $cost) -cne (Get-FirstHomeCostKey $op.Costs)){throw 'Smoke payment differs from loaded recipe/grade'}
+        $paid[[string]$op.Kind]=$true;$last=$op.After
+    }
+    if(-not $h.NavigationComplete){return}
+    Assert-FirstHomeStructure $h.Home;Assert-FirstHomeSite $h.Site;Assert-FirstHomeNavigation $n
+    if($paid.Count -ne 19 -or @($h.NativePlacements).Count -ne 8 -or @($h.NativePlacements|Where-Object {-not $_.Entity}).Count -or
+        $h.PendingIntent -or -not $h.CrossedIn -or -not $h.CrossedOut){throw 'Incomplete native build smoke'}
+    $u=$h.Upkeep
+    if(-not $u.Authed -or -not $u.Privilege -or $u.MinutesAfter -lt 60 -or $u.MinutesAfter -lt $u.Period -or
+        (Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $u.Before) -or
+        (Get-FirstHomeEconomicKey $u.Before) -cne (Get-FirstHomeEconomicKey @(@($u.After)+@($u.TcInventory))) -or
+        (Get-FirstHomeEconomicKey $u.After) -cne (Get-FirstHomeEconomicKey $n.Inventory)){throw 'Smoke TC debit/auth/upkeep not proven'}
+}
 function Assert-FirstHomeResult($n) {
     if($n.Status -notin @('GREEN','PARTIAL','BLOCKED','FAILED')){throw 'Unknown FirstHome status'}
     if($n.Conservation.EconomicFailure -eq $true -and $n.Status -ne 'FAILED'){throw 'Conservation failure cannot pass'}
     $h=$n.FirstHome
+    if($h.DiagnosticOnly -or ($null -ne $h.Fixture -and @($h.Fixture).Count)){throw 'TEST_FIXTURE cannot be accepted as natural FirstHome'}
     if($null -eq $h -or $h.Schema -ne 1){throw 'Missing FirstHome receipt'}
     if($n.Status -ne 'GREEN' -and -not $h.SaveReady){return}
     Assert-AvatarActor $n;Assert-AvatarSurvivalRows $n.Inventory $n;Assert-AvatarSurvivalEquipment $n
