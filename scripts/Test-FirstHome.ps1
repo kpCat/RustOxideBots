@@ -128,3 +128,49 @@ if($homeSource -notmatch 'HomeJourneySeconds=2100' -or $homeSource -notmatch 'Ho
 $fake=Copy-HomeFixture @{Status='PARTIAL';FirstHome=@{Schema=1;DiagnosticOnly=$true;Fixture=@{Source='TEST_FIXTURE_WOOD'}}}
 Deny-HomeFixture {Assert-FirstHomeResult $fake}
 Write-Output 'PASS OFFLINE_ONLY 7: measured FirstHome schedule, independent runner deadline and no fixture promotion to natural receipt'
+
+# A foundation surface without a female socket still uses Socket_Free.TestTarget(onTerrain).
+# Reject the exact 011 target, missing native previews, blocked geometry and paid retries.
+if(-not (Get-Command Assert-FirstHomeTcPlacement -ErrorAction SilentlyContinue)){throw '012 TC native placement evidence contract is not implemented'}
+$tc=Copy-HomeFixture @{Role='TC';Entity='108';NativeCall='Planner.DoBuild(Construction.Target,Construction)';
+    Before=@(@{Uid='41';Shortname='cupboard.tool';Amount=1;Condition=0;MaxCondition=0});After=@();
+    Diagnostic=@{OnTerrain=$true;Socket=$null;Parent='100';SurfaceParent='100';MaleSockets=1;NativePreview=$true;NativeLos=$true;InsideObject=$false;DeployBlocked=$false;CanBuild=$true;HookDenied=$false;Reach=3;MaxReach=4;Unchanged=$true;LegacyUnchanged=$true}}
+Assert-FirstHomeTcPlacement @($tc)
+foreach($mutation in @({param($x)$x.Diagnostic.OnTerrain=$false;$x.Diagnostic.MaleSockets=0},
+    {param($x)$x.Diagnostic.SurfaceParent='999'},{param($x)$x.Diagnostic.NativeLos=$false},
+    {param($x)$x.Diagnostic.DeployBlocked=$true},{param($x)$x.Diagnostic.NativePreview=$false},
+    {param($x)$x.Diagnostic.Unchanged=$false},{param($x)$x.Diagnostic.LegacyUnchanged=$false},{param($x)$x.After=$x.Before})){
+    $x=Copy-HomeFixture $tc;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeTcPlacement @($x)}
+}
+Deny-HomeFixture {Assert-FirstHomeTcPlacement @($tc,$tc)}
+Write-Output 'PASS OFFLINE_ONLY 8: free-surface TC native preview, exact one-item debit and no paid retry'
+
+# The live 012 failure was a native Unity getter on a detached prefab attribute.
+# Inspect the actual compiled method, without loading/executing game assemblies.
+& (Join-Path $PSScriptRoot 'Test-PluginCompile.ps1') -PluginName RustBotsAvatarSurvival
+$diagnosticIl=& dotnet run --file (Join-Path $PSScriptRoot 'Inspect-RustApi.cs') -p:PublishAot=false -p:NuGetAudit=false -- (Join-Path $repo '.local/compile/RustBotsAvatarSurvival.dll') 'RustBotsAvatarSurvival$' '^HomePreviewTc$'
+if($LASTEXITCODE -ne 0){throw 'TC diagnostic metadata inspection failed'}
+$diagnosticText=$diagnosticIl -join "`n"
+if($diagnosticText -match 'ldfld \.Construction::deployable\r?\n\s*IL_[0-9A-F]+: callvirt UnityEngine.Object::get_name'){
+    throw 'TC telemetry dereferences native Unity Object.name on detached prefab attribute'
+}
+Write-Output 'PASS OFFLINE_ONLY 9: compiled TC telemetry avoids native name getter on prefab attribute'
+
+if(-not (Get-Command Assert-FirstHomeTcAuthorization -ErrorAction SilentlyContinue)){throw '012 native TC autoauth contract is not implemented'}
+$auth=Copy-HomeFixture @{TcNetId='108';Actor='15';Owner='15';BeforeAuthorized=@('15');AfterAuthorized=@('15');InventoryCount=0;NativeAutoauth=$true;NativeAddCalled=$false;AuthorizationHookAllowed=$true;Authed=$true;CanBuild=$true;Registered=$true;BuildingId='10';ExpectedBuildingId='10'}
+$actualTc=Copy-HomeFixture @{NetId='108';Role='TC';Type='BuildingPrivlidge';Owner='15';BuildingId='10'}
+Assert-FirstHomeTcAuthorization $auth '15' '10' $actualTc
+$self=Copy-HomeFixture $auth;$self.BeforeAuthorized=@();$self.NativeAutoauth=$false;$self.NativeAddCalled=$true
+Assert-FirstHomeTcAuthorization $self '15' '10' $actualTc
+foreach($mutation in @({param($x)$x.BeforeAuthorized=@('15','16')},{param($x)$x.AfterAuthorized=@('16')},
+    {param($x)$x.Owner='16'},{param($x)$x.InventoryCount=1},{param($x)$x.BuildingId='11'},
+    {param($x)$x.Authed=$false},{param($x)$x.NativeAddCalled=$true},{param($x)$x.AuthorizationHookAllowed=$false})){
+    $x=Copy-HomeFixture $auth;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
+}
+$x=Copy-HomeFixture $auth;$x.Actor=$x.Owner='16';$x.BeforeAuthorized=$x.AfterAuthorized=@('16')
+Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
+$x=Copy-HomeFixture $auth;$x.BuildingId=$x.ExpectedBuildingId='11'
+Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
+$x=Copy-HomeFixture $auth;$x.TcNetId='109'
+Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
+Write-Output 'PASS OFFLINE_ONLY 10: own native autoauth accepted, foreign auth/items/group and unauthorized self-add denied'

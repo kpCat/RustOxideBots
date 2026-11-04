@@ -1,5 +1,30 @@
 #Requires -Version 5.1
 . (Join-Path $PSScriptRoot 'EconomyValidation.ps1')
+function Assert-FirstHomeTcAuthorization($a,[string]$actor,[string]$building,$tc) {
+    Assert-AvatarUid $a.Actor
+    Assert-AvatarUid $actor;Assert-AvatarUid $building
+    $prior=@($a.BeforeAuthorized);$after=@($a.AfterAuthorized)
+    $automatic=$prior.Count -eq 1 -and $prior[0] -eq $a.Actor
+    if($a.Actor -ne $actor -or $a.BuildingId -ne $building -or $tc.Role -ne 'TC' -or $tc.Type -ne 'BuildingPrivlidge' -or
+        $a.TcNetId -ne $tc.NetId -or $tc.Owner -ne $actor -or $tc.BuildingId -ne $building -or
+        [uint64]$a.Actor -ge 10000000 -or $a.Owner -ne $a.Actor -or $prior.Count -gt 1 -or
+        @($prior|Where-Object {$_ -ne $a.Actor}).Count -or $after.Count -ne 1 -or $after[0] -ne $a.Actor -or
+        $a.InventoryCount -ne 0 -or $a.Registered -ne $true -or -not $a.BuildingId -or $a.BuildingId -ne $a.ExpectedBuildingId -or
+        $a.Authed -ne $true -or $a.CanBuild -ne $true -or $a.NativeAutoauth -ne $automatic -or
+        $a.NativeAddCalled -ne (-not $automatic) -or $a.AuthorizationHookAllowed -ne $true){throw 'TC native own authorization/empty inventory/structural binding not proven'}
+}
+function Assert-FirstHomeTcPlacement($placements) {
+    $tc=@($placements|Where-Object Role -eq 'TC')
+    if($tc.Count -ne 1){throw 'TC must have exactly one native paid placement'}
+    $p=$tc[0];$d=$p.Diagnostic
+    if($p.NativeCall -cne 'Planner.DoBuild(Construction.Target,Construction)' -or -not $p.Entity -or
+        $d.OnTerrain -ne $true -or $null -ne $d.Socket -or -not $d.Parent -or $d.SurfaceParent -ne $d.Parent -or
+        $d.MaleSockets -ne 1 -or $d.NativePreview -ne $true -or $d.NativeLos -ne $true -or
+        $d.InsideObject -ne $false -or $d.DeployBlocked -ne $false -or $d.CanBuild -ne $true -or
+        $d.HookDenied -ne $false -or $d.Unchanged -ne $true -or $d.LegacyUnchanged -ne $true -or
+        (Get-AvatarNumber $d.Reach 'TC reach') -gt (Get-AvatarNumber $d.MaxReach 'TC native reach')){throw 'TC surface/native placement gates were not proven'}
+    Assert-FirstHomePayment ([pscustomobject]@{Before=$p.Before;After=$p.After;Costs=@([pscustomobject]@{Shortname='cupboard.tool';Amount=1});Output=$null})
+}
 function Assert-FirstHomeToolSwitch($switch,[string]$rock,[string]$axe) {
     if($switch.FromUid -ne $axe -or $switch.ToUid -ne $rock -or $rock -eq $axe -or
         (Get-FirstHomeEconomicKey $switch.Before) -cne (Get-FirstHomeEconomicKey $switch.After)){throw 'Tool switch created/repaired/replaced inventory'}
@@ -240,6 +265,8 @@ function Assert-FirstHomeSmokeResult($n) {
         $paid[[string]$op.Kind]=$true;$last=$op.After
     }
     if(-not $h.NavigationComplete){return}
+    Assert-FirstHomeTcPlacement $h.NativePlacements
+    Assert-FirstHomeTcAuthorization $h.TcAuthorization $n.Actor.UserId $h.Home.BuildingId @($h.Home.Entities|Where-Object Role -eq 'TC')[0]
     Assert-FirstHomeStructure $h.Home;Assert-FirstHomeSite $h.Site;Assert-FirstHomeNavigation $n
     if($paid.Count -ne 19 -or @($h.NativePlacements).Count -ne 8 -or @($h.NativePlacements|Where-Object {-not $_.Entity}).Count -or
         $h.PendingIntent -or -not $h.CrossedIn -or -not $h.CrossedOut){throw 'Incomplete native build smoke'}
@@ -284,6 +311,8 @@ function Assert-FirstHomeResult($n) {
             (Get-FirstHomeEconomicKey $audit.SourceInventory) -cne (Get-FirstHomeEconomicKey $n.Inventory) -or
             (Get-FirstHomeEconomicKey $h.Source.TcInventory) -cne (Get-FirstHomeEconomicKey $h.Snapshot.TcInventory)){throw 'Native home inventory changed on restore'}
     }elseif($n.Mode -eq 'JOURNEY'){
+        Assert-FirstHomeTcPlacement $h.NativePlacements
+        Assert-FirstHomeTcAuthorization $h.TcAuthorization $n.Actor.UserId $h.Home.BuildingId @($h.Home.Entities|Where-Object Role -eq 'TC')[0]
         Assert-FirstHomeSite $h.Site
         if(@($n.StarterKit).Count -ne 1 -or $n.StarterKit[0].Shortname -ne 'rock' -or $n.StarterKit[0].Amount -ne 1){throw 'Free home starter material'}
         $last=$n.StarterKit;$paid=@{};$pools=@{};$gathers=0;$selectedTool=$n.State.ToolUid;$switchUsed=$false;$switches=@($h.ToolSwitches)

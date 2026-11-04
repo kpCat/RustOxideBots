@@ -36,6 +36,15 @@ namespace Oxide.Plugins
         private const int HomeJourneySeconds=2100,HomeSmokeSeconds=900,HomeBuildReserve=360,HomeGatherReserve=1350;
         private bool firstHome,homeGather,homeRestored,homeNavComplete,homeSmoke;
         private string homeAdmissionReason,homeObservedPhase;
+        private bool homeTcAttempted;
+        private readonly List<object> homeTcPreviews=new List<object>();
+        private sealed class HomeTcDiagnostic {
+            public bool OnTerrain,NativePreview,NativeLos,InsideObject,DeployBlocked,CanBuild,HookDenied,Unchanged,LegacyUnchanged;
+            public int MaleSockets;
+            public string Socket,Parent,SurfaceParent;
+            public float Reach,MaxReach;
+            public object Evidence;
+        }
         private readonly List<object> homeFixture=new List<object>(),homePlacements=new List<object>(),homePhases=new List<object>();
         private string homePhase,homeIntent,homeForeign;
         private float homeWait,homeLegTime,homeTravelSeconds;
@@ -54,7 +63,7 @@ namespace Oxide.Plugins
         private readonly List<object> homeSites=new List<object>(),homeOperations=new List<object>(),homeNav=new List<object>();
         private readonly List<object> homeToolSwitches=new List<object>();
         private Item homeGatherTool;
-        private object homeSiteReceipt,homeUpkeep,homeRebind,homePortal,homeDoorClosed;
+        private object homeSiteReceipt,homeUpkeep,homeRebind,homePortal,homeDoorClosed,homeTcAuthorization;
         private readonly Dictionary<string,Item> homeTools=new Dictionary<string,Item>();
         private string HomeData { get { return Data("economy.home.json"); } }
         private void HomeIssueFixture() {
@@ -334,7 +343,8 @@ namespace Oxide.Plugins
             if(list.Length!=1)throw new InvalidOperationException("Ambiguous native home socket "+suffix);return list[0];
         }
         private Construction.Target HomeTarget(Construction c,BaseEntity parent,Socket_Base socket,Vector3 position) {
-            var target=new Construction.Target {valid=true,player=npc,entity=parent,socket=socket,onTerrain=parent==null,position=position,normal=Vector3.up,
+            // Socket_Free.TestTarget reads onTerrain even on a building surface. A female socket uses false.
+            var target=new Construction.Target {valid=true,player=npc,entity=parent,socket=socket,onTerrain=socket==null,position=position,normal=Vector3.up,
                 rotation=Vector3.zero,ray=new Ray(npc.eyes.position,(position-npc.eyes.position).normalized),
                 shouldParent=parent!=null && parent.SupportsChildDeployables() && (parent.ForceDeployableSetParent() || c.deployable!=null && c.deployable.setSocketParent),
                 isHoldingShift=false,snappingMode=0,isSnapped=false};
@@ -363,6 +373,46 @@ namespace Oxide.Plugins
             }
             if(candidates.Count!=1)throw new InvalidOperationException("No unique native roof socket centered above own foundation");return candidates[0];
         }
+        private HomeTcDiagnostic HomePreviewTc(Construction c,Construction.Target t,string label,bool hookDenied,bool priorUnchanged=true) {
+            var before=JsonConvert.SerializeObject(Contents());int entities=BaseNetworkable.serverEntities.Count;
+            var oldPhrase=Construction.lastPlacementError;var oldDebug=Construction.lastPlacementErrorDebug;
+            bool oldDetailed=Construction.lastPlacementErrorIsDetailed;var oldBlock=Construction.lastBuildingBlockError;var oldHit=DeployVolume.LastDeployHit;
+            var scratch=new GameObject("RustBots012ReadOnlyPlacement");
+            try {
+                var male=new List<Socket_Base>();c.FindMaleSockets(t,male);
+                var predictions=new List<object>();bool los=false,blocked=false;
+                foreach(var socket in male) {
+                    var p=socket.DoPlacement(t);bool populated=p.isPopulated,mods=populated && socket.CheckSocketMods(ref p);
+                    bool sight=populated && Planner.HasLineOfSight(ref p,c,t);
+                    bool volume=populated && DeployVolume.Check(p.position,p.rotation,PrefabAttribute.server.FindAll<DeployVolume>(c.prefabID),-1);
+                    predictions.Add(new {Socket=socket.socketName,Type=socket.GetType().Name,Populated=populated,Mods=mods,Position=Point(p.position),Rotation=Point(p.rotation.eulerAngles),NativeLos=sight,DeployBlocked=volume,DeployHit=DeployVolume.LastDeployHit==null?null:DeployVolume.LastDeployHit.name});
+                    los=sight;blocked=volume;
+                }
+                Construction.lastPlacementError="";Construction.lastPlacementErrorDebug="";Construction.lastPlacementErrorIsDetailed=false;Construction.lastBuildingBlockError=null;
+                var trial=t;bool preview=c.UpdatePlacement(scratch.transform,c,ref trial);
+                var phrase=Construction.lastPlacementError==null?null:Construction.lastPlacementError.translated;
+                var debug=Construction.lastPlacementErrorDebug;
+                var surface=Physics.RaycastAll(t.position+Vector3.up*0.1f,Vector3.down,0.2f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore)
+                    .Where(x=>x.normal.y>=0.85f).OrderBy(x=>x.distance).ToArray();
+                var obb=new OBB(scratch.transform.position,scratch.transform.rotation,c.bounds);
+                bool inside=AntiHack.TestIsBuildingInsideSomething(t,t.position);
+                var result=new HomeTcDiagnostic {OnTerrain=t.onTerrain,Socket=t.socket==null?null:t.socket.socketName,Parent=Id(t.entity),SurfaceParent=surface.Length==0?null:Id(surface[0].collider.GetComponentInParent<BaseEntity>()),
+                    MaleSockets=male.Count,NativePreview=preview,NativeLos=los,InsideObject=inside,DeployBlocked=blocked,CanBuild=npc.CanBuild() && npc.CanBuild(scratch.transform.position,scratch.transform.rotation,c.bounds),HookDenied=hookDenied,
+                    Reach=Vector3.Distance(npc.eyes.position,t.position),MaxReach=c.maxplaceDistance,Unchanged=entities==BaseNetworkable.serverEntities.Count && before==JsonConvert.SerializeObject(Contents()),LegacyUnchanged=priorUnchanged,
+                    Evidence=new {Label=label,Valid=t.valid,Player=Id(npc),ActiveUid=npc.GetActiveItem()==null?null:npc.GetActiveItem().uid.Value.ToString(),Held=Id(npc.GetHeldEntity()),Deployable=c.deployable==null?null:c.deployable.fullName,
+                        Position=Point(t.position),Normal=Point(t.normal),Rotation=Point(t.rotation),RayOrigin=Point(t.ray.origin),RayDirection=Point(t.ray.direction),t.shouldParent,t.isSnapped,t.snappingMode,
+                        ParentPosition=t.entity==null?null:Point(t.entity.transform.position),ParentRotation=t.entity==null?null:Point(t.entity.transform.rotation.eulerAngles),Predictions=predictions,Phrase=phrase,ErrorDebug=debug,Detailed=Construction.lastPlacementErrorIsDetailed,
+                        PreviewPosition=Point(scratch.transform.position),PreviewRotation=Point(scratch.transform.rotation.eulerAngles),BoundsCenter=Point(obb.position),BoundsExtents=Point(obb.extents),
+                        Surface=surface.Select(x=>new {Entity=Id(x.collider.GetComponentInParent<BaseEntity>()),Name=x.collider.name,Type=x.collider.GetType().Name,Layer=x.collider.gameObject.layer,Position=Point(x.point),Normal=Point(x.normal)}).ToArray(),
+                        Overlaps=Physics.OverlapBox(obb.position,obb.extents,scratch.transform.rotation,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).Select(x=>new {Entity=Id(x.GetComponentInParent<BaseEntity>()),Name=x.name,Layer=x.gameObject.layer}).ToArray(),
+                        Capsule=npc.GetComponents<Collider>().Select(x=>new {Type=x.GetType().Name,x.enabled,x.isTrigger,Center=Point(x.bounds.center),Extents=Point(x.bounds.extents)}).ToArray(),
+                        Nearby=BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(x=>HomeStructural(x) && Vector3.Distance(x.transform.position,t.position)<6).Select(x=>HomeRow("NEARBY",x)).ToArray(),
+                        CanPlacePrivilege=npc.CanPlaceBuildingPrivilege(scratch.transform.position,scratch.transform.rotation,c.bounds,null),Privilege=Id(npc.GetBuildingPrivilege(obb,false,0,null,true))}};
+                homeTcPreviews.Add(result);Log("HOME_TC_PREVIEW",result);return result;
+            }finally {
+                UnityEngine.Object.Destroy(scratch);Construction.lastPlacementError=oldPhrase;Construction.lastPlacementErrorDebug=oldDebug;Construction.lastPlacementErrorIsDetailed=oldDetailed;Construction.lastBuildingBlockError=oldBlock;DeployVolume.LastDeployHit=oldHit;
+            }
+        }
         private BaseEntity HomePlace(string role,string definition,string tool,BaseEntity parent,Socket_Base socket,Vector3 position) {
             Item item=homeTools[tool];if(!Activate(item.uid))throw new InvalidOperationException("Paid planner activation failed");
             var planner=npc.GetHeldEntity() as Planner;var c=homeDefinitions[definition];
@@ -371,12 +421,24 @@ namespace Oxide.Plugins
                 throw new InvalidOperationException("Native home ownership/permission/affordability/reach gate "+role);
             var t=HomeTarget(c,parent,socket,position);
             if(!t.valid)throw new InvalidOperationException("Native placement support surface unavailable");
-            if(Oxide.Core.Interface.CallHook("CanBuild",planner,c,t)!=null)throw new InvalidOperationException("Native CanBuild hook denied home");
+            bool hookDenied=Oxide.Core.Interface.CallHook("CanBuild",planner,c,t)!=null;
+            if(hookDenied)throw new InvalidOperationException("Native CanBuild hook denied home");
+            HomeTcDiagnostic diagnostic=null;
+            if(role=="TC") {
+                if(homeTcAttempted)throw new InvalidOperationException("TC paid retry forbidden");
+                var legacy=t;legacy.onTerrain=false;var legacyPreview=HomePreviewTc(c,legacy,"011_TARGET_NO_SOCKET",false);
+                if(!legacyPreview.Unchanged)throw new InvalidOperationException("Legacy TC preview changed native state; no paid attempt");
+                diagnostic=HomePreviewTc(c,t,"012_FREE_SURFACE",hookDenied,legacyPreview.Unchanged);
+                if(!diagnostic.NativePreview || !diagnostic.NativeLos || diagnostic.InsideObject || diagnostic.DeployBlocked || !diagnostic.CanBuild || !diagnostic.Unchanged || diagnostic.MaleSockets!=1 || diagnostic.SurfaceParent!=Id(parent))
+                    throw new InvalidOperationException("PLACEMENT_TC_BLOCKED native preview; see HOME_TC_PREVIEW; no paid attempt");
+                homeTcAttempted=true;
+            }
             var costs=definition=="DOOR" || definition=="TC"?new List<Cost>{new Cost {Shortname=tool,Amount=1}}:HomeCosts(c.defaultGrade.CostToBuild((BuildingGrade.Enum)(-1)));
             var before=Contents();HomeStartPayment("BUILD_"+role,new {Target=Point(position),Socket=socket==null?null:socket.socketName,Costs=costs});
             Log("HOME_NATIVE_ATTEMPT",new {Role=role,Definition=definition,Target=Point(t.position),RayOrigin=Point(t.ray.origin),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Owner=npc.userID.ToString(),Time=Time.realtimeSinceStartup});
             var created=planner.DoBuild(t,c) as DecayEntity;
-            var placement=new {Role=role,NativeCall="Planner.DoBuild(Construction.Target,Construction)",Target=Point(t.position),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Entity=Id(created),Error=Construction.lastPlacementErrorDebug,Time=Time.realtimeSinceStartup};
+            string nativeDebug=Construction.lastPlacementErrorDebug,nativePhrase=Construction.lastPlacementError==null?null:Construction.lastPlacementError.translated;
+            var placement=new {Role=role,NativeCall="Planner.DoBuild(Construction.Target,Construction)",Target=Point(t.position),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Entity=Id(created),Error=nativeDebug,Phrase=nativePhrase,Detailed=Construction.lastPlacementErrorIsDetailed,Diagnostic=diagnostic,Before=before,After=Contents(),Time=Time.realtimeSinceStartup};
             homePlacements.Add(placement);Log("HOME_NATIVE_RESULT",placement);
             if(created==null)throw new InvalidOperationException("Native placement rejected "+role+": "+Construction.lastPlacementErrorDebug+"; no retry");
             homeEntities.Add(role,created);HomeEndPayment("BUILD_"+role,before,costs,null,Id(created));
@@ -403,8 +465,19 @@ namespace Oxide.Plugins
             if(homeStep==5){var wall=homeEntities["WALL_N"];var socket=HomeRoofSocket(wall);HomePlace("ROOF","ROOF","building.planner",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;return;}
             if(homeStep==6){
                 var tc=(BuildingPrivlidge)HomePlace("TC","TC","cupboard.tool",foundation,null,foundation.transform.TransformPoint(new Vector3(0.65f,0,0.6f)));
-                if(tc.authorizedPlayers.Count!=0 || tc.inventory.itemList.Count!=0)throw new InvalidOperationException("New TC is occupied");
-                tc.AddPlayer(npc,npc.userID);if(!tc.IsAuthed(npc) || !tc.CanBuild(npc))throw new InvalidOperationException("Native TC auth refused before final door");homeStep++;return;
+                var prior=tc.authorizedPlayers.OrderBy(x=>x).ToArray();bool automatic=tc.IsAuthed(npc);var row=HomeRow("TC",tc);
+                Log("HOME_TC_NEW_STATE",new {Owner=tc.OwnerID.ToString(),Actor=npc.userID.ToString(),Authorized=prior,Inventory=HomeTcItems(),Structure=row,NativeAutoauth=automatic});
+                if(tc.OwnerID!=npc.userID || tc.buildingID!=foundation.buildingID || !row.Registered || tc.inventory==null || tc.inventory.itemList.Count!=0 || prior.Any(x=>x!=npc.userID))
+                    throw new InvalidOperationException("New TC has foreign auth/items or invalid owner/building registration");
+                // Installed ItemModDeployable.OnDeployed already authorizes the actual deploying player.
+                // Only a missing self authorization may be added, with the same native hook gate.
+                bool hookAllowed=automatic || Oxide.Core.Interface.CallHook("OnCupboardAuthorize",tc,npc)==null;
+                if(!hookAllowed)throw new InvalidOperationException("Native TC authorization hook denied self");
+                if(!automatic)tc.AddPlayer(npc,npc.userID);
+                homeTcAuthorization=new {TcNetId=Id(tc),Owner=tc.OwnerID.ToString(),Actor=npc.userID.ToString(),BeforeAuthorized=prior,AfterAuthorized=tc.authorizedPlayers.OrderBy(x=>x).ToArray(),InventoryCount=tc.inventory.itemList.Count,
+                    NativeAutoauth=automatic,NativeAddCalled=!automatic,AuthorizationHookAllowed=hookAllowed,Authed=tc.IsAuthed(npc),CanBuild=tc.CanBuild(npc),Registered=row.Registered,BuildingId=tc.buildingID.ToString(),ExpectedBuildingId=foundation.buildingID.ToString()};
+                Log("HOME_TC_AUTH",homeTcAuthorization);
+                if(!tc.IsAuthed(npc) || !tc.CanBuild(npc) || tc.authorizedPlayers.Any(x=>x!=npc.userID))throw new InvalidOperationException("Native TC auth refused before final door");homeStep++;return;
             }
             if(homeStep==7){var wall=homeEntities["DOORWAY"];var socket=HomeSocket(wall,"/doorway-female/1");HomePlace("DOOR","DOOR","door.hinged.wood",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;homeWait=Time.realtimeSinceStartup+8;homePhase="VERIFY";return;}
         }
@@ -624,10 +697,10 @@ namespace Oxide.Plugins
             return true;
         }
         private object HomeResult() {
-            return !firstHome?null:new {Schema=1,Stage=homePhase,DiagnosticOnly=homeSmoke,Fixture=homeFixture,NativePlacements=homePlacements,Phases=homePhases,Schedule=new {JourneySeconds=HomeJourneySeconds,SmokeSeconds=HomeSmokeSeconds,BuildReserve=HomeBuildReserve,GatherReserve=HomeGatherReserve},AdmissionReason=homeAdmissionReason,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
+            return !firstHome?null:new {Schema=1,Stage=homePhase,DiagnosticOnly=homeSmoke,Fixture=homeFixture,NativePlacements=homePlacements,TcPreviews=homeTcPreviews,Phases=homePhases,Schedule=new {JourneySeconds=HomeJourneySeconds,SmokeSeconds=HomeSmokeSeconds,BuildReserve=HomeBuildReserve,GatherReserve=HomeGatherReserve},AdmissionReason=homeAdmissionReason,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
                 Operations=homeOperations,ToolSwitches=homeToolSwitches,Home=homeEntities.Count==8?DescribeHome():null,PartialEntities=homeEntities.Select(x=>HomeRow(x.Key,x.Value)).ToArray(),
                 Decay=new {Enabled=ConVar.Decay.upkeep,Scale=ConVar.Decay.scale,WoodDuration=ConVar.Decay.duration_wood},
-                Upkeep=homeUpkeep,Portal=homePortal,Navigation=homeNav,NavigationComplete=homeNavComplete,CrossedIn=homeCrossedIn,CrossedOut=homeCrossedOut,Restored=homeRestored,Rebind=homeRebind,
+                TcAuthorization=homeTcAuthorization,Upkeep=homeUpkeep,Portal=homePortal,Navigation=homeNav,NavigationComplete=homeNavComplete,CrossedIn=homeCrossedIn,CrossedOut=homeCrossedOut,Restored=homeRestored,Rebind=homeRebind,
                 Snapshot=homeSnapshot,Source=homeRestoreSource,PendingIntent=homeIntent,SaveReady=homeSnapshot!=null,
                 NativeCapsule=npc==null?new object[0]:npc.GetComponents<Collider>().Select(x=>(object)new {Type=x.GetType().Name,x.enabled,x.isTrigger}).ToArray()};
         }
