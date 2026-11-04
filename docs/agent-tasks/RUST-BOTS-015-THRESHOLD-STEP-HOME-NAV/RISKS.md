@@ -1,0 +1,9 @@
+# Риски / решения без самообмана
+
+1. **Порог — реальное препятствие.** Own doorway MeshCollider native penetration 11.279mm. Малый размер и почти вертикальная MTD недостаточны, чтобы выключить guard. Штатный низкий step и центрирование door path должны быть проверены; вне подтверждённой поддержки стоп.
+2. **Узкий портал.** Native halfwidth ~0.60 m, capsule r0.5; прежнее пересечение почти по краю (required0.5767). Проверить реальное центрирование входной/выходной траектории. Если Nav mesh не допускает центрированного пути, нельзя подкрутить teleport и выдать fake PASS.
+3. **Семантика native physics.** Даже непрерывные позиции при Rigidbody/agent may not prove collision response. Нужна связь с actual penetration/ground/step and temporal resolution. Не давать `Clear=true` при осознанном физическом контакте; отдельные статусы и fail-closed негативы обязательны.
+4. **История 013.** Его исторический outbound collider unknown, 014 обнаружил inbound doorway. Не «решать» старый outbound без нового фактического OUT evidence.
+5. **Экономика/владение.** BUILD_SMOKE содержит TEST_FIXTURE, это не естественное выживание. В 009 crash atomicity still NOT_PROVEN; world/wipe identity отделена от .sav. TC temporary bot ID may change: own-only native disk witness or reject.
+6. **Продукт масштабный.** Дом1x1 diagnostic ≠ 50–100 persistent NPC. После HOME GREEN: storage/boxes sorting, workbenches/blueprints, sleeping bags native death+respawn, rebuilding after TC loss, PvP/clans/squads/base defense, Giant Excavator diesel/start/loot/defense, optional cargo/rig, Semantic Pack at end. Не добавлять всё в 015.
+7. **Бюджет и сохранность.** До 3 server starts, ideally 1 smoke+1 NATURAL+1 RESTORE. Если нужен 2-й smoke, остановиться на нём. Owner Server read-only, no SteamCMD/update, foreign PID untouched, no secrets Git, complete cleanup.
