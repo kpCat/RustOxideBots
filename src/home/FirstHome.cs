@@ -35,9 +35,11 @@ namespace Oxide.Plugins
         }
         private bool firstHome,homeGather,homeRestored,homeNavComplete;
         private string homePhase,homeIntent,homeForeign;
-        private float homeWait,homeLegTime;
-        private int homeStep,homeNavStage;
-        private Vector3 homeSite,homeOutside,homeInside,homeNavStart;
+        private float homeWait,homeLegTime,homeTravelSeconds;
+        private int homeStep,homeNavStage,homeSearchIndex;
+        private Vector3 homeSite,homeOutside,homeInside,homeNavStart,homeSearchOrigin;
+        private DecayEntity[] homeForeignStructures;
+        private const int HomeSearchLimit=(512+4096)*4;
         private Quaternion homeRotation;
         private HomeSnapshot homeSnapshot;
         private readonly Dictionary<string,Construction> homeDefinitions=new Dictionary<string,Construction>();
@@ -47,6 +49,8 @@ namespace Oxide.Plugins
         private readonly Dictionary<string,DecayEntity> homeEntities=new Dictionary<string,DecayEntity>();
         private readonly Dictionary<BaseEntity,string> homeDisk=new Dictionary<BaseEntity,string>();
         private readonly List<object> homeSites=new List<object>(),homeOperations=new List<object>(),homeNav=new List<object>();
+        private readonly List<object> homeToolSwitches=new List<object>();
+        private Item homeGatherTool;
         private object homeSiteReceipt,homeUpkeep,homeRebind,homePortal,homeDoorClosed;
         private readonly Dictionary<string,Item> homeTools=new Dictionary<string,Item>();
         private string HomeData { get { return Data("economy.home.json"); } }
@@ -98,15 +102,39 @@ namespace Oxide.Plugins
             homeBudget["wood"]+=reserve;homePhase="TOOL";
             Log("HOME_PLAN",new {Budget=homeBudget,UpkeepReserve=reserve,Recipes=homeRecipes,Placement="SERVER_ACCOUNTED_BUILD"});
         }
+        private static bool HomeStructural(DecayEntity e) { return e is BuildingBlock || e is BuildingPrivlidge || e is Door; }
         private string ForeignHomeKey() {
-            return JsonConvert.SerializeObject(BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(x=>(x is BuildingBlock || x is BuildingPrivlidge || x is Door) && !homeEntities.Values.Contains(x)).OrderBy(x=>x.net.ID.Value)
+            return JsonConvert.SerializeObject(BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(x=>HomeStructural(x) && !homeEntities.Values.Contains(x)).OrderBy(x=>x.net.ID.Value)
                 .Select(x=>new {Id=Id(x),x.OwnerID,x.buildingID,Position=Point(x.transform.position)}));
         }
         private void BeginHomeGather() {
-            if(!FindHomeSite())throw new InvalidOperationException("Bounded safe home site unavailable before materials");
+            agent.isStopped=true;navigating=false;homeSearchOrigin=npc.transform.position;homeSearchIndex=0;
+            homeForeignStructures=BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(HomeStructural).ToArray();
+            homePhase="SITE_SEARCH";state.Goal="HOME_SITE";
+        }
+        private void HomeGatherAtSelectedSite() {
             homeGather=true;homePhase="GATHER";state.Goal="NEED_RESOURCE";discoveries=0;rejected.Clear();
+            homeGatherTool=product;
             if(!Activate(product.uid))throw new InvalidOperationException("Home earned axe missing");melee=npc.GetHeldEntity() as BaseMelee;
             if(melee==null)throw new InvalidOperationException("Home gathering requires paid held axe");Discover();
+        }
+        private bool HomeSwitchGatherTool() {
+            if(dispenser==null || homeGatherTool==null)throw new InvalidOperationException("Home gathering tool/source missing");
+            float wear=melee.GetGatherInfoFromIndex(dispenser.gatherType).conditionLost;
+            if(wear<=0 || float.IsNaN(wear) || float.IsInfinity(wear))throw new InvalidOperationException("Unknown loaded tool wear");
+            if(homeGatherTool.condition>wear+1)return false;
+            if(homeGatherTool!=product || product.condition<=0 || rock==null || rock.GetOwnerPlayer()!=npc || rock.parent!=npc.inventory.containerBelt || homeToolSwitches.Count!=0)
+                throw new InvalidOperationException("Bounded home tool durability unavailable before native debit");
+            var before=Contents();
+            if(!Activate(rock.uid))throw new InvalidOperationException("Original rock activation refused");
+            melee=npc.GetHeldEntity() as BaseMelee;
+            if(melee==null || melee.GetItem()!=rock || melee.GetOwnerPlayer()!=npc || rock.condition<=melee.GetGatherInfoFromIndex(dispenser.gatherType).conditionLost+1)
+                throw new InvalidOperationException("Original rock cannot sustain home gather");
+            homeGatherTool=rock;
+            var receipt=new {FromUid=product.uid.Value.ToString(),ToUid=rock.uid.Value.ToString(),Wear=wear,Reserve=1,Before=before,After=Contents(),Equipment=Equipment(rock)};
+            homeToolSwitches.Add(receipt);Log("HOME_TOOL_SWITCH",receipt);
+            // A rock has a shorter reach. Reuse discovery/physical approach with its actual loaded profile.
+            navigating=false;agent.isStopped=true;state.Goal="NEED_RESOURCE";nextAction=Time.realtimeSinceStartup+Mathf.Max(1,melee.repeatDelay);Discover();return true;
         }
         private void HomeWriteIntent(string stage,object payload) {
             // Per-operation durable receipt. An existing non-complete file blocks retry; no compensation.
@@ -147,25 +175,46 @@ namespace Oxide.Plugins
         private void HomeMaterialsReady() {
             homeGather=false;homePhase="SITE";agent.isStopped=true;navigating=false;
             if(homeBudget.Any(x=>Quantity(x.Key)<x.Value))throw new InvalidOperationException("Incomplete full home/upkeep budget");
+            homeForeignStructures=BaseNetworkable.serverEntities.OfType<DecayEntity>().Where(HomeStructural).ToArray();
+            // Revalidate the selected footprint BEFORE any home craft payment. Never buy tools then choose a different site.
+            if(!HomeCheckSite(homeSite,homeRotation))throw new InvalidOperationException("Selected home site changed before paid home craft");
             homeTools["building.planner"]=HomeCraft("building.planner",2);
             homeTools["hammer"]=HomeCraft("hammer",3);
             homeTools["door.hinged.wood"]=HomeCraft("door.hinged.wood",4);
             homeTools["cupboard.tool"]=HomeCraft("cupboard.tool",5);
-            if(!FindHomeSite())throw new InvalidOperationException("Bounded safe home site unavailable");
             homeForeign=ForeignHomeKey();HomeMove(homeOutside,"SITE");homePhase="TRAVEL";
         }
-        private bool FindHomeSite() {
-            for(int i=1;i<=512;i++) {
-                float angle=Halton(i,2)*Mathf.PI*2,r=8+Halton(i,3)*160;
-                var p=npc.transform.position+new Vector3(Mathf.Cos(angle),0,Mathf.Sin(angle))*r;p.y=TerrainMeta.HeightMap.GetHeight(p);
-                var rot=Quaternion.Euler(0,Mathf.Floor(Halton(i,5)*8)*45,0);var reasons=new List<string>();
+        private void HomeSearchBatch() {
+            float start=Time.realtimeSinceStartup;
+            for(int count=0;count<64 && homeSearchIndex<HomeSearchLimit;count++) {
+                int index=homeSearchIndex++,i=index/4+1;var rot=Quaternion.Euler(0,Mathf.Floor(Halton(i<=512?i:i-512,5)*8)*45+(index%4)*90,0);Vector3 p;
+                if(i<=512) {
+                    float angle=Halton(i,2)*Mathf.PI*2,r=8+Halton(i,3)*160;
+                    p=homeSearchOrigin+new Vector3(Mathf.Cos(angle),0,Mathf.Sin(angle))*r;
+                }else {
+                    i-=512;p=TerrainMeta.Position+new Vector3((0.05f+Halton(i,2)*0.9f)*TerrainMeta.Size.x,0,(0.05f+Halton(i,3)*0.9f)*TerrainMeta.Size.z);
+                }
+                p.y=TerrainMeta.HeightMap.GetHeight(p);
+                if(Vector3.Distance(p,npc.transform.position)>800)homeSites.Add(new {Candidate=Point(p),Reasons=new[] {"APPROACH_BOUND"}});
+                else if(HomeCheckSite(p,rot)){HomeGatherAtSelectedSite();return;}
+                if(Time.realtimeSinceStartup-start>0.03f)break;
+            }
+            if(homeSearchIndex>=HomeSearchLimit)throw new InvalidOperationException("Bounded safe home site unavailable before materials");
+        }
+        private bool HomeCheckSite(Vector3 p,Quaternion rot) {
+                var reasons=new List<string>();
                 float min,max;bool water;HomeSurface(p,rot,out min,out max,out water);p.y=max+0.12f;
-                var outside=p+rot*new Vector3(0,0,-3);outside.y=TerrainMeta.HeightMap.GetHeight(outside);Vector3 foot=Vector3.zero;NavHit navHit;
-                bool sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(outside),out navHit,new Vector3(0.25f,0.5f,0.25f),false) && Ground(navHit.position.Value,out foot);
+                Vector3 foot=Vector3.zero;bool sampled=false;
                 Construction.Placement preview=default(Construction.Placement);bool nativePreview=false;
-                if(sampled && HomeFoundationPreview(p,foot,out preview)) {
-                    rot=preview.rotation;HomeSurface(p,rot,out min,out max,out water);p.y=max+0.12f;
-                    nativePreview=HomeFoundationPreview(p,foot,out preview) && Vector3.Distance(preview.position,p)<0.05f && Quaternion.Angle(preview.rotation,rot)<0.05f;
+                // Native terrain yaw follows the planning ray. Recompute the -Z doorway approach after each prediction.
+                for(int pass=0;pass<4;pass++) {
+                    var outside=p+rot*new Vector3(0,0,-3);outside.y=TerrainMeta.HeightMap.GetHeight(outside);NavHit navHit;
+                    sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(outside),out navHit,new Vector3(0.25f,0.5f,0.25f),false) && Ground(navHit.position.Value,out foot);
+                    if(!sampled || !HomeFoundationPreview(p,foot,out preview))break;
+                    float turn=Quaternion.Angle(preview.rotation,rot);rot=preview.rotation;
+                    HomeSurface(p,rot,out min,out max,out water);float height=max+0.12f;
+                    nativePreview=turn<0.05f && Mathf.Abs(height-p.y)<0.01f && Vector3.Distance(preview.position,p)<0.05f;
+                    p.y=height;if(nativePreview)break;
                 }
                 float depth=homeDefinitions["FOUNDATION"].bounds.size.y;
                 float entryDelta=p.y-TerrainMeta.HeightMap.GetHeight(p+rot*new Vector3(0,0,-1.5f));
@@ -174,27 +223,49 @@ namespace Oxide.Plugins
                 if(depth<=0 || max-min>depth*0.5f)reasons.Add("FOUNDATION_DEPTH");
                 if(Mathf.Abs(entryDelta)>0.25f || !sampled || Mathf.Abs(outsideDelta)>0.25f)reasons.Add("ENTRANCE_HEIGHT");
                 if(!nativePreview)reasons.Add("NATIVE_FOUNDATION_PREVIEW");
-                if(BaseNetworkable.serverEntities.OfType<DecayEntity>().Any(x=>Vector3.Distance(x.transform.position,p)<45))reasons.Add("FOREIGN_BUILDING_OR_TC");
-                if(TerrainMeta.Path.Monuments.Any(x=>Vector3.Distance(x.transform.position,p)<120))reasons.Add("MONUMENT");
+                var siteObb=new OBB(p,rot,new Bounds(new Vector3(0,0.1f,0),new Vector3(5,6,5)));
+                var nearest=homeForeignStructures.Where(x=>x!=null && !x.IsDestroyed).OrderBy(x=>x.WorldSpaceBounds().Distance(siteObb)).FirstOrDefault();
+                float foreignDistance=nearest==null?float.MaxValue:nearest.WorldSpaceBounds().Distance(siteObb);
+                if(foreignDistance<45)reasons.Add("FOREIGN_BUILDING_OR_TC");
+                float monumentOrigin=float.MaxValue,monumentBounds=float.MaxValue;
+                foreach(var monument in TerrainMeta.Path.Monuments) {
+                    monumentOrigin=Math.Min(monumentOrigin,Vector3.Distance(monument.transform.position,p));monumentBounds=Math.Min(monumentBounds,monument.Distance(siteObb));
+                }
+                bool preventBuilding=GamePhysics.CheckOBB(siteObb,Rust.Layers.Mask.Prevent_Building,QueryTriggerInteraction.Collide);
+                if(monumentOrigin<120 || monumentBounds<6 || preventBuilding)reasons.Add("MONUMENT_OR_PREVENT_BUILDING");
                 int deny=(int)(TerrainTopology.Enum.Cliff|TerrainTopology.Enum.Cliffside|TerrainTopology.Enum.Mountain|TerrainTopology.Enum.Monument|TerrainTopology.Enum.Road|TerrainTopology.Enum.Roadside|
                     TerrainTopology.Enum.Rail|TerrainTopology.Enum.Railside|TerrainTopology.Enum.Building|TerrainTopology.Enum.Swamp|TerrainTopology.Enum.Ocean|TerrainTopology.Enum.Oceanside|
                     TerrainTopology.Enum.Offshore|TerrainTopology.Enum.River|TerrainTopology.Enum.Riverside|TerrainTopology.Enum.Lake|TerrainTopology.Enum.Lakeside);
                 int topology=TerrainMeta.TopologyMap.GetTopology(p,6f);
                 if((topology&deny)!=0)reasons.Add("TOPOLOGY");
-                if(TerrainMeta.Path.Roads.Any(x=>x.Path.Points.Any(q=>Vector3.Distance(q,p)<25)))reasons.Add("ROAD");
+                float roadDistance=float.MaxValue;
+                foreach(var road in TerrainMeta.Path.Roads) {
+                    var points=road.Path.Points;
+                    for(int j=1;j<points.Length;j++) {
+                        var a=points[j-1];var d=points[j]-a;float t=d.sqrMagnitude>0?Mathf.Clamp01(Vector3.Dot(p-a,d)/d.sqrMagnitude):0;
+                        roadDistance=Math.Min(roadDistance,Vector3.Distance(p,a+d*t));
+                    }
+                }
+                if(roadDistance<25)reasons.Add("ROAD");
                 // Reject every above-ground collider, including natural resources. Never delete it to fit.
                 int collisions=Physics.OverlapBox(p+Vector3.up*1.6f,new Vector3(2.5f,1.45f,2.5f),rot,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).Count(c=>c.GetComponentInParent<BaseEntity>()!=npc);
                 if(collisions!=0)reasons.Add("COLLISION");
-                if(!npc.CanBuild(p,rot,new Bounds(Vector3.zero,new Vector3(5,4,5))))reasons.Add("BUILD_PERMISSION");
-                var path=new RustNavMeshPath();bool complete=sampled && agent.CalculatePath(foot,path) && path.status==NavMeshPathStatus.PathComplete && path.GetPathLength()<=400;
-                if(!complete)reasons.Add("RUSTNAV");
-                if(reasons.Count!=0){homeSites.Add(new {Candidate=Point(p),Reasons=reasons,HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,Water=water,Topology=topology,NativePreview=nativePreview,Sampled=sampled,Path=path.status.ToString(),Complete=complete,Collisions=collisions});continue;}
+                var privilege=npc.GetBuildingPrivilege(siteObb,false,1f,null,false);bool permission=npc.CanBuild(siteObb,false);
+                if(privilege!=null || !permission)reasons.Add("BUILD_PERMISSION_OR_FOREIGN_TC");
+                var path=new RustNavMeshPath();bool complete=false;float pathLength=0,travelSeconds=0,remaining=deadline-Time.realtimeSinceStartup,reserve=homePhase=="SITE_SEARCH"?650:120;
+                if(reasons.Count==0) {
+                    complete=agent.CalculatePath(foot,path) && path.status==NavMeshPathStatus.PathComplete;
+                    if(complete){pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/3+30);complete=pathLength<=800 && travelSeconds<=300 && remaining>=travelSeconds+reserve;}
+                    if(!complete)reasons.Add("RUSTNAV_OR_TRAVEL_BOUND");
+                }
+                if(reasons.Count!=0){homeSites.Add(new {Candidate=Point(p),Reasons=reasons,HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,Water=water,Topology=topology,NativePreview=nativePreview,Sampled=sampled,Path=path.status.ToString(),Complete=complete,Collisions=collisions,
+                    MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,ForeignId=Id(nearest),ForeignType=nearest==null?null:nearest.GetType().Name,PrivilegeId=Id(privilege),RoadDistance=roadDistance});return false;}
                 homeSite=p;homeRotation=rot;homeOutside=foot;
                 homeSiteReceipt=new {Position=Point(p),Rotation=new[] {rot.x,rot.y,rot.z,rot.w},HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,NativePreview=nativePreview,
-                    Water=false,Topology=topology,ForbiddenTopology=deny,Monument=false,Road=false,Foreign=false,Collision=false,Permission=true,Path=path.status.ToString()};
+                    Water=false,Topology=topology,ForbiddenTopology=deny,Monument=false,Road=false,Foreign=false,Collision=false,Permission=true,Path=path.status.ToString(),
+                    MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,RoadDistance=roadDistance,
+                    PrivilegeChecked=true,PermissionCached=false,PrivilegeId=Id(privilege),PathLength=pathLength,TravelSeconds=travelSeconds,DeadlineRemaining=remaining,PhaseReserve=reserve,SearchLimit=HomeSearchLimit,SearchIndex=homeSearchIndex};
                 Log("HOME_SITE",homeSiteReceipt);return true;
-            }
-            return false;
         }
         private void HomeSurface(Vector3 p,Quaternion rotation,out float min,out float max,out bool water) {
             min=float.MaxValue;max=float.MinValue;water=false;
@@ -217,6 +288,8 @@ namespace Oxide.Plugins
         private void HomeMove(Vector3 destination,string stage) {
             var path=new RustNavMeshPath();
             if(!agent.CalculatePath(destination,path) || path.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV "+stage+" "+path.status);
+            homeTravelSeconds=Mathf.Ceil(path.GetPathLength()/3+30);
+            if(homeTravelSeconds>300)throw new InvalidOperationException("HOME_NAV travel bound exceeds300 seconds");
             homeNavStart=npc.transform.position;target=destination;homeLegTime=progressTime=Time.realtimeSinceStartup;progress=homeNavStart;repaths=0;
             if(!agent.SetDestination(destination))throw new InvalidOperationException("Home SetDestination rejected");agent.isStopped=false;agent.speed=3;
             navigating=true;homeNav.Add(new {Event="ISSUED",Stage=stage,Start=Point(homeNavStart),Target=Point(destination),Path=path.status.ToString(),Length=path.GetPathLength(),Time=homeLegTime});
@@ -229,7 +302,8 @@ namespace Oxide.Plugins
             }
             if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV lost before physical arrival: "+agent.pathStatus+" distance="+distance);
             if(Vector3.Distance(progress,npc.transform.position)>0.5f){progress=npc.transform.position;progressTime=now;}
-            if(now-homeLegTime>150 || now-progressTime>12){if(repaths++>=1)throw new InvalidOperationException("HOME_NAV bounded stuck");if(!agent.SetDestination(target))throw new InvalidOperationException("Home repath failed");agent.speed=3;progressTime=now;}
+            if(now-homeLegTime>homeTravelSeconds)throw new InvalidOperationException("HOME_NAV physical travel timeout");
+            if(now-progressTime>12){if(repaths++>=1)throw new InvalidOperationException("HOME_NAV bounded stuck");if(!agent.SetDestination(target))throw new InvalidOperationException("Home repath failed");agent.speed=3;progressTime=now;}
             return false;
         }
         private Socket_Base HomeSocket(BaseEntity entity,string suffix) {
@@ -482,6 +556,7 @@ namespace Oxide.Plugins
             if(homePhase=="NAV"){HomePhysicalSample(now);HomeCrossing(previous,position,now);}
             total+=step;previous=position;previousTime=now;Sample(now);
             if(now>deadline)throw new InvalidOperationException("Bounded FirstHome deadline");
+            if(homePhase=="SITE_SEARCH"){HomeSearchBatch();return true;}
             if(homePhase=="TRAVEL" || homePhase=="BUILD_TRAVEL" || homePhase=="RESTORE_TRAVEL") {
                 if(HomeArrived(now))homePhase=homePhase=="RESTORE_TRAVEL"?"NAV_WAIT":"BUILD";
                 if(homePhase=="NAV_WAIT")homeWait=now+30;return true;
@@ -520,7 +595,7 @@ namespace Oxide.Plugins
         }
         private object HomeResult() {
             return !firstHome?null:new {Schema=1,Stage=homePhase,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
-                Operations=homeOperations,Home=homeEntities.Count==8?DescribeHome():null,PartialEntities=homeEntities.Select(x=>HomeRow(x.Key,x.Value)).ToArray(),
+                Operations=homeOperations,ToolSwitches=homeToolSwitches,Home=homeEntities.Count==8?DescribeHome():null,PartialEntities=homeEntities.Select(x=>HomeRow(x.Key,x.Value)).ToArray(),
                 Decay=new {Enabled=ConVar.Decay.upkeep,Scale=ConVar.Decay.scale,WoodDuration=ConVar.Decay.duration_wood},
                 Upkeep=homeUpkeep,Portal=homePortal,Navigation=homeNav,NavigationComplete=homeNavComplete,CrossedIn=homeCrossedIn,CrossedOut=homeCrossedOut,Restored=homeRestored,Rebind=homeRebind,
                 Snapshot=homeSnapshot,Source=homeRestoreSource,PendingIntent=homeIntent,SaveReady=homeSnapshot!=null,

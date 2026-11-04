@@ -1,5 +1,24 @@
 #Requires -Version 5.1
 . (Join-Path $PSScriptRoot 'EconomyValidation.ps1')
+function Assert-FirstHomeToolSwitch($switch,[string]$rock,[string]$axe) {
+    if($switch.FromUid -ne $axe -or $switch.ToUid -ne $rock -or $rock -eq $axe -or
+        (Get-FirstHomeEconomicKey $switch.Before) -cne (Get-FirstHomeEconomicKey $switch.After)){throw 'Tool switch created/repaired/replaced inventory'}
+    $from=@($switch.Before|Where-Object Uid -eq $axe);$to=@($switch.Before|Where-Object Uid -eq $rock)
+    $wear=Get-AvatarNumber $switch.Wear 'loaded tool wear';$reserve=Get-AvatarNumber $switch.Reserve 'tool wear reserve'
+    if($from.Count -ne 1 -or $to.Count -ne 1 -or $from[0].Shortname -ne 'stonehatchet' -or $to[0].Shortname -ne 'rock' -or
+        $wear -le 0 -or $reserve -lt 1 -or $from[0].Condition -le 0 -or $from[0].Condition -gt ($wear+$reserve) -or $to[0].Condition -le ($wear+$reserve)){throw 'Broken/unknown/unusable tool switch'}
+    $e=$switch.Equipment
+    if($e.ActiveUid -ne $rock -or $e.ItemUid -ne $rock -or $e.HeldItemUid -ne $rock -or $e.HeldType -ne 'BaseMelee' -or $e.IsHeld -ne $true -or
+        $e.OwnerNetId -ne $e.ActorNetId -or $e.HeldOwnerNetId -ne $e.ActorNetId -or $e.HeldParentNetId -ne $e.ActorNetId){throw 'Tool switch did not select exact owned native held rock'}
+}
+function Assert-FirstHomeGatherTool($op,$switch,[string]$expected,[string]$rock,[string]$axe,[string]$actor) {
+    if($op.Harvest.ToolUid -eq $expected){return $expected}
+    if($expected -ne $axe -or $op.Harvest.ToolUid -ne $rock -or $null -eq $switch){throw 'Unreceipted/repeated home tool transition'}
+    Assert-FirstHomeToolSwitch $switch $rock $axe
+    if($switch.Equipment.ActorNetId -ne $actor -or
+        (Get-FirstHomeEconomicKey $switch.Before) -cne (Get-FirstHomeEconomicKey $op.Before)){throw 'Tool switch is not bound to actual actor/economic chain'}
+    return $rock
+}
 function Assert-FirstHomeSite($site) {
     $range=Get-AvatarNumber $site.HeightRange 'footprint height range';$depth=Get-AvatarNumber $site.FoundationDepth 'foundation depth'
     $entry=Get-AvatarNumber $site.EntryDelta 'entrance height';$outside=Get-AvatarNumber $site.OutsideDelta 'approach height'
@@ -7,6 +26,15 @@ function Assert-FirstHomeSite($site) {
         $site.NativePreview -ne $true -or $site.Permission -ne $true -or $site.Path -ne 'PathComplete'){throw 'Unsafe/unpreviewed home foundation or entrance'}
     foreach($field in @('Water','Monument','Road','Foreign','Collision')){if($site.$field -ne $false){throw 'Excluded home site accepted'}}
     if($site.ForbiddenTopology -ne 16776578 -or ((Get-AvatarNumber $site.Topology 'topology') -band 16776578) -ne 0){throw 'Forbidden site topology'}
+    if((Get-AvatarNumber $site.MonumentOriginDistance 'monument origin distance') -lt 120 -or
+        (Get-AvatarNumber $site.MonumentBoundsDistance 'native monument bounds distance') -lt 6 -or
+        (Get-AvatarNumber $site.ForeignDistance 'structural bounds distance') -lt 45 -or
+        (Get-AvatarNumber $site.RoadDistance 'road segment distance') -lt 25 -or
+        $site.PreventBuilding -ne $false -or $site.PrivilegeChecked -ne $true -or $site.PermissionCached -ne $false -or $null -ne $site.PrivilegeId){throw 'Missing/unsafe native site clearance or privilege witness'}
+    $length=Get-AvatarNumber $site.PathLength 'site path length';$seconds=Get-AvatarNumber $site.TravelSeconds 'site travel bound'
+    if($length -lt 0 -or $length -gt 800 -or $seconds -lt ($length/3+30) -or $seconds -gt 300){throw 'Site approach exceeds bounded physical travel'}
+    $reserve=Get-AvatarNumber $site.PhaseReserve 'remaining home phase reserve';$remaining=Get-AvatarNumber $site.DeadlineRemaining 'remaining gameplay deadline'
+    if($reserve -lt 120 -or $remaining -lt ($seconds+$reserve)){throw 'Site cannot fit remaining bounded gameplay'}
 }
 function Assert-FirstHomeStructure($shelter) {
     if($shelter.Placement -ne 'SERVER_ACCOUNTED_BUILD' -or $shelter.ForeignUnchanged -ne $true){throw 'Unknown placement or foreign mutation'}
@@ -216,19 +244,27 @@ function Assert-FirstHomeResult($n) {
     }elseif($n.Mode -eq 'JOURNEY'){
         Assert-FirstHomeSite $h.Site
         if(@($n.StarterKit).Count -ne 1 -or $n.StarterKit[0].Shortname -ne 'rock' -or $n.StarterKit[0].Amount -ne 1){throw 'Free home starter material'}
-        $last=$n.StarterKit;$paid=@{};$pools=@{};$gathers=0
+        $last=$n.StarterKit;$paid=@{};$pools=@{};$gathers=0;$selectedTool=$n.State.ToolUid;$switchUsed=$false;$switches=@($h.ToolSwitches)
+        if($switches.Count -gt 1){throw 'Repeated home tool switch'}
         foreach($op in @($h.Operations)){
             Assert-AvatarSurvivalRows $op.Before $n;Assert-AvatarSurvivalRows $op.After $n
             if((Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $op.Before)){throw 'Broken home economic UID/condition chain'}
             if($op.Kind -eq 'GATHER'){
                 $gathers++;$g=$op.Harvest
+                $nextTool=Assert-FirstHomeGatherTool $op $(if($switches.Count){$switches[0]}else{$null}) $selectedTool $n.State.ToolUid $n.State.ProductUid $n.Actor.NetId
+                if($nextTool -ne $selectedTool){$switchUsed=$true;$selectedTool=$nextTool}
                 foreach($v in @($g.Amount,$g.PoolBefore,$g.PoolAfter,$g.ToolConditionBefore,$g.ToolConditionAfter,$g.Distance)){$null=Get-AvatarNumber $v 'home gather'}
                 if($g.Mechanism -ne 'NATIVE_PLAYER_GATHER' -or $g.Provenance -ne 'NATURAL' -or $g.AdapterCredit -ne 0 -or $g.NewDrops -ne 0 -or
                     $g.InitiatorPlayer -ne $true -or $g.WeaponOwned -ne $true -or $g.DidGather -ne $true -or $g.Grounded -ne $true -or $g.LineOfSight -ne $true -or
                     $g.Amount -le 0 -or $g.PoolAfter -le 0 -or $g.PoolBefore-$g.PoolAfter -lt $g.Amount -or $g.ToolConditionBefore -le $g.ToolConditionAfter){throw 'Unpaid/non-native home resources'}
                 if($pools.ContainsKey([string]$g.SourceId) -and [Math]::Abs($pools[[string]$g.SourceId]-$g.PoolBefore) -gt 0.001){throw 'Home source pool chain broken'};$pools[[string]$g.SourceId]=$g.PoolAfter
                 $tool=@($op.Before|Where-Object Uid -eq $g.ToolUid);$afterTool=@($op.After|Where-Object Uid -eq $g.ToolUid)
-                if($tool.Count -ne 1 -or $afterTool.Count -ne 1 -or $tool[0].Condition -ne $g.ToolConditionBefore -or $afterTool[0].Condition -ne $g.ToolConditionAfter){throw 'Home gather used a different tool UID'}
+                if($tool.Count -ne 1 -or $afterTool.Count -ne 1 -or $tool[0].Condition -ne $g.ToolConditionBefore -or $afterTool[0].Condition -ne $g.ToolConditionAfter -or
+                    $g.ToolUid -notin @($n.State.ToolUid,$n.State.ProductUid) -or $afterTool[0].Condition -le 0 -or $tool[0].MaxCondition -ne $afterTool[0].MaxCondition){throw 'Home gather used a different/broken tool UID'}
+                foreach($old in @($op.Before|Where-Object {$_.Shortname -in @('rock','stonehatchet') -and $_.Uid -ne $g.ToolUid})){
+                    $same=@($op.After|Where-Object Uid -eq $old.Uid)
+                    if($same.Count -ne 1 -or $same[0].Condition -ne $old.Condition -or $same[0].MaxCondition -ne $old.MaxCondition){throw 'Gather repaired/mutated inactive tool'}
+                }
                 foreach($name in @(@($op.Before.Shortname)+@($op.After.Shortname)|Sort-Object -Unique)){
                     $b=[double](($op.Before|Where-Object Shortname -eq $name|Measure-Object Amount -Sum).Sum)
                     $a=[double](($op.After|Where-Object Shortname -eq $name|Measure-Object Amount -Sum).Sum)
@@ -237,7 +273,7 @@ function Assert-FirstHomeResult($n) {
             }else{
                 if($paid.ContainsKey([string]$op.Kind)){throw 'Duplicate home payment/build intent'};$paid[[string]$op.Kind]=$op
                 Assert-FirstHomePayment $op
-                if($op.Kind -eq 'CRAFT_TOOL'){$expected=$n.Recipe.Ingredients}
+                if($op.Kind -eq 'CRAFT_TOOL'){$expected=$n.Recipe.Ingredients;$selectedTool=$n.State.ProductUid}
                 elseif($op.Kind -like 'CRAFT_*'){
                     $name=$op.Kind.Substring(6);$r=$h.Recipes.$name
                     if($null -eq $r -or $r.Known -ne $true -or $r.Allowed -ne $true -or $r.Workbench -ne 0 -or $r.AmountToCreate -ne 1 -or $op.Output.Shortname -ne $name){throw 'Unknown/unpaid native home recipe'};$expected=$r.Ingredients
@@ -252,6 +288,7 @@ function Assert-FirstHomeResult($n) {
             $last=$op.After
         }
         if($paid.Count -ne 19 -or $gathers -ne @($n.Harvests).Count -or $pools.Count -ne @($n.Economy.State.Sources).Count){throw 'Incomplete paid home ledger'}
+        if($switches.Count -ne [int]$switchUsed){throw 'Unused/fabricated home tool switch'}
         $u=$h.Upkeep
         if((Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $u.Before) -or
             (Get-FirstHomeEconomicKey $u.After) -cne (Get-FirstHomeEconomicKey $n.Inventory) -or

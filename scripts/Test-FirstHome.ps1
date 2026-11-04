@@ -3,13 +3,17 @@ $ErrorActionPreference='Stop'
 $validator=Join-Path $PSScriptRoot 'FirstHomeValidation.ps1'
 if(-not (Test-Path -LiteralPath $validator)){throw 'FirstHome safety contracts are not implemented'}
 . $validator
-$site=[pscustomobject]@{HeightRange=1.09;FoundationDepth=2.8;EntryDelta=0.224;OutsideDelta=0.069;NativePreview=$true;Water=$false;Topology=0;ForbiddenTopology=16776578;Monument=$false;Road=$false;Foreign=$false;Collision=$false;Permission=$true;Path='PathComplete'}
+$site=[pscustomobject]@{HeightRange=1.09;FoundationDepth=2.8;EntryDelta=0.224;OutsideDelta=0.069;NativePreview=$true;Water=$false;Topology=0;ForbiddenTopology=16776578;Monument=$false;Road=$false;Foreign=$false;Collision=$false;Permission=$true;Path='PathComplete';
+    MonumentOriginDistance=130;MonumentBoundsDistance=10;ForeignDistance=50;RoadDistance=30;PreventBuilding=$false;PrivilegeChecked=$true;PermissionCached=$false;PrivilegeId=$null;PathLength=700;TravelSeconds=264;DeadlineRemaining=700;PhaseReserve=360}
 Assert-FirstHomeSite $site
 function Copy-HomeFixture($value){$value|ConvertTo-Json -Depth 30|ConvertFrom-Json}
 function Deny-HomeFixture([scriptblock]$action){$denied=$false;try{& $action}catch{$denied=$true};if(-not $denied){throw 'Unsafe home receipt was accepted'}}
 foreach($mutation in @(
  {param($x)$x.HeightRange=1.41}, {param($x)$x.EntryDelta=0.26}, {param($x)$x.OutsideDelta=-0.26},
- {param($x)$x.NativePreview=$false}, {param($x)$x.Collision=$true}, {param($x)$x.Topology=2048}
+ {param($x)$x.NativePreview=$false}, {param($x)$x.Collision=$true}, {param($x)$x.Topology=2048},
+ {param($x)$x.MonumentBoundsDistance=0}, {param($x)$x.MonumentOriginDistance=119}, {param($x)$x.ForeignDistance=44},
+ {param($x)$x.RoadDistance=24}, {param($x)$x.PreventBuilding=$true}, {param($x)$x.PrivilegeId='88'},
+ {param($x)$x.PermissionCached=$true}, {param($x)$x.PrivilegeChecked=$false}, {param($x)$x.PathLength=801}, {param($x)$x.TravelSeconds=301}, {param($x)$x.DeadlineRemaining=623}
 )){$x=Copy-HomeFixture $site;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeSite $x}}
 # Synthetic inputs only. A free or disconnected spawned prefab must never pass as a home.
 $roles=@('FOUNDATION','WALL_N','WALL_E','WALL_W','DOORWAY','ROOF','DOOR','TC')
@@ -32,6 +36,19 @@ $x=Copy-HomeFixture $payment;$x.After+=@{Uid='2';Shortname='stones';Amount=5};De
 $x=Copy-HomeFixture $payment;$x.After[0].Uid='2';Deny-HomeFixture {Assert-FirstHomePayment $x}
 $x=Copy-HomeFixture $payment;$x.After[1].Condition=100;Deny-HomeFixture {Assert-FirstHomePayment $x}
 Write-Output 'PASS OFFLINE_ONLY 2: exact native UID payment, no free build, recredit or unrelated output'
+$switch=Copy-HomeFixture @{FromUid='3';ToUid='1';Wear=0.334;Reserve=1;Before=@(@{Uid='1';Shortname='rock';Amount=1;Condition=82;MaxCondition=100},@{Uid='3';Shortname='stonehatchet';Amount=1;Condition=1.3;MaxCondition=100});
+    After=@(@{Uid='1';Shortname='rock';Amount=1;Condition=82;MaxCondition=100},@{Uid='3';Shortname='stonehatchet';Amount=1;Condition=1.3;MaxCondition=100});
+    Equipment=@{ActiveUid='1';ItemUid='1';HeldItemUid='1';ActorNetId='19';OwnerNetId='19';HeldOwnerNetId='19';HeldParentNetId='19';HeldType='BaseMelee';IsHeld=$true}}
+Assert-FirstHomeToolSwitch $switch '1' '3'
+foreach($mutation in @({param($x)$x.Before[1].Condition=0},{param($x)$x.After[1].Condition=100},{param($x)$x.ToUid='7'},{param($x)$x.Equipment.HeldOwnerNetId='77'},{param($x)$x.Equipment.ItemUid='3'},{param($x)$x.Wear=0})){
+    $x=Copy-HomeFixture $switch;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeToolSwitch $x '1' '3'}
+}
+$op=Copy-HomeFixture @{Before=$switch.Before;Harvest=@{ToolUid='1'}}
+if((Assert-FirstHomeGatherTool $op $switch '3' '1' '3' '19') -ne '1'){throw 'Original rock transition missing'}
+Deny-HomeFixture {Assert-FirstHomeGatherTool $op $null '3' '1' '3' '19'}
+Deny-HomeFixture {Assert-FirstHomeGatherTool $op $switch '3' '1' '3' '20'}
+$x=Copy-HomeFixture $op;$x.Before[0].Condition=81;Deny-HomeFixture {Assert-FirstHomeGatherTool $x $switch '3' '1' '3' '19'}
+$x=Copy-HomeFixture $op;$x.Harvest.ToolUid='3';Deny-HomeFixture {Assert-FirstHomeGatherTool $x $switch '1' '1' '3' '19'}
 $s=[pscustomobject]@{WorldKey=('A'*64);ActorId='avatar-007-0123456789abcdef0123456789abcdef';Home=$h;InventorySHA256=('B'*64)}
 $r=Copy-HomeFixture $s
 Assert-FirstHomeRestore $s $r

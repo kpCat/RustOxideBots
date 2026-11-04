@@ -100,6 +100,32 @@
 - Live starts не используются для изучения неизвестных сигнатур. Две sandbox-denied/preflight попытки без PID не считаются RustDedicated starts; повторённый preflight вне sandbox прошёл. Первый настоящий run: `aee154abff86469a8ca15f1c8166e535`.
 - Первый run0.2.0 — PARTIAL до home materials,0build; native gather/paid axe и197.790817м реально подтверждены. Все raw сохранены. Offline native-map decode выявил чрезмерный .18м authored flatness gate; engine defect не доказан.
 - Ruling: ограничить depth range половиной настоящей foundation глубины и входной перепад0.25м, добавить native foundation preview с planned ray и полный reasons ledger. Не ослаблять воду/дороги/монументы/foreign/collision/permission/native structural gates. Если admission всё ещё пуст — остановиться с честным BLOCKED_SITE; не тратить третий start без требуемого engine defect.
-- Второй run0.2.1 `3268a3d257a4470892ec8abf567d3e24` — PARTIAL,340native previews/344complete approaches,0accepted sites,0build. Ни home inventory snapshot, ни TC/door/upkeep/navigation не появились. Current C# source frozen и совпадает с capture. Это повторный JOURNEY; independent RESTORE не проводился.
-- Budget gate:2реальных starts использованы; третьего нет, engine defect отсутствует. Полные G3 gameplay/restore пункты остаются **NOT_PROVEN/NOT_CONDUCTED**, не отмечать их passed. BLOCKED_SITE — итог ACCEPTANCE; fixtures/публикация этого не меняют.
-- Final safety:21leasesclosed; all process/ports/rules/active locks0. Owner3086files, changes0. Независимое final evidence review подтвердило оба immutable165-record journals, live compile/save/source и отсутствие ложного home claim.
+- Второй run0.2.1 `3268a3d257a4470892ec8abf567d3e24` — PARTIAL,340native previews/344calculated Complete paths,0accepted sites,0build. Ни home inventory snapshot, ни TC/door/upkeep/navigation не появились. Source commit5310 совпадал с capture. Это повторный JOURNEY; independent RESTORE не проводился.
+- Budget gate в commit5310:2реальных starts использованы; третьего тогда нет, engine defect отсутствует. Полные G3 gameplay/restore пункты **NOT_PROVEN/NOT_CONDUCTED**. Исторический BLOCKED_SITE не становится GREEN от fixtures/публикации.
+- Safety в commit5310:21leasesclosed; all process/ports/rules/active locks0. Owner3086files, changes0. Независимое review подтвердило оба immutable165-record journals, live compile/save/source и отсутствие ложного home claim.
+
+## Продолжение по разрешению владельца
+
+Владелец явно разрешил **ещё 2 старта после offline fix и review**. Это отдельное разрешение сверх исходного §6, а не объявление найденного engine defect. Исторические два PARTIAL и их raw остаются неизменными. Дополнительный бюджет предназначен для JOURNEY и независимого RESTORE; новые live доказательства пока отсутствуют.
+
+1. Исправить ложную классификацию любого DecayEntity как чужого дома: переиспользовать семейство BuildingBlock/BuildingPrivlidge/Door; отдельно сохранить физические коллизии любых объектов, standalone TC и uncached native permission.
+2. Сверить native monument bounds и фактические no-build проверки установленного Construction. Заменять authored эвристику можно только обоснованным native критерием с явными witnesses, без отключения native placement checks.
+3. Расширить bounded Halton search по текущим TerrainMeta bounds и обрабатывать кандидатов небольшими порциями между физическими samples. Выбранный site повторно проверить до оплаченного home craft; не искать другой после оплаты инструментов.
+4. До третьего старта: focused отрицательные contracts, C#7.3 compile, Test-All, независимый read-only review и safety/cache gates. Затем один JOURNEY; четвёртый старт использовать для RESTORE только при пригодном сохранённом доме.
+5. Сохранить исходные 18 разрешённых public paths. Обновить API_DECISION/RESULT по реальному результату, повторить privacy/scope, две encoding проверки, owner hashes и cleanup, затем exact-path commit и обычный push.
+
+### Доказанный authored defect третьего JOURNEY
+
+Run `ad44b7ffe71c49bdb611cb81827340dc`,0.2.2: site принят на16184-й попытке; native complete path152м и все clearance guards прошли. После299 успешных native axe hits получено3057wood; следующий удар сломал axe до выдачи ресурса.352 успешных harvest receipts всего,0home entities, незавершённый PREPARED intent; PARTIAL, никакого adapter retry. Это ошибка планирования wear, не engine defect. ACK/native save присутствуют, но процесс не вышел за30с: FORCED_OWNED_JOB, promotion=false; все22leasesclosed/process/ports/rules/locks0.
+
+Минимальный фикс перед оставшимся разрешённым стартом: до PREPARED учитывать loaded conditionLost с положительным резервом; one-way перейти с оплаченного axe на тот же исходный rock, повторно пройти Discover/Approach с его меньшим reach. Не менять ProductUid/ToolUid, не чинить condition и не создавать replacement item. FirstHome-only deadline1100с при runner1200с; старые режимы900с. Сохранить полный result-файл, сократить только его повторную многомегабайтную запись в консоль. Причина задержки native exit пока UNKNOWN; сокращение лога не объявляется доказанным исправлением shutdown.
+
+### Четвёртый JOURNEY и итоговый budget gate
+
+Run `39baf6925235477ebbca7aa07d2b73fd`,0.2.3: полный stock3763/3760wood после paid axe;488native hits,1470committed journal records. Один bound switch на исходный rock оставил оба инструмента положительными: axe1.313834/rock35.87207. Site принят на16184-й попытке; initial calculated Complete path153.463м, не физический SITE leg. Runtime source frozen SHA4A18E5357C4735CA03C5839E249B7871539F255D9EC4361AE4EFA9BA52001DA7 совпадает с captured live source.
+
+До home craft повторный admission отказал по RUSTNAV_OR_TRAVEL_BOUND. Native preview/geometry/permission/collision проходят и final calculated path statusComplete, но remaining≤110.49564с меньше120с phase reserve плюс minimum30с travel. Final path length/travel seconds не записаны и не объявляются прошедшими. Это authored timing-plan недостаточность, не engine defect и не изменение site geometry. Крафт planner/hammer/door/TC, placement/upgrade/upkeep не выполнялись; entities/snapshot0. Native gathers и paid axe отражены в Operations; HOME_NAV и RESTORE не проводились.
+
+GRACEFUL/ACK/native save, promotion=true, но это world-only checkpoint. Safety после final Test-All16:49:59UTC:23leasesclosed, processes/ports/rules/brokers/occupied locks0. Owner16:46:58UTC:3086files, SHA/length changes0. Test-All/current C#7.3 compile PASS; независимый native receipt/journal/source review выполнен. Mojibake, escaped Cyrillic, privacy и exact7-current-path/18-baseline-path guards обязательны перед доставкой.
+
+Исходные2плюс явно разрешённые2старта исчерпаны. Conditional fifth RESTORE неприменим без completed home snapshot; новый JOURNEY им не разрешён. **PARTIAL / BLOCKED_BUDGET**, главная цель остаётся не достигнута. Дальше в этой доставке — только audits/docs/exact commit/ordinary push. Новый Goal/Slice не начинается; новый live требует отдельного бюджета и исправленного offline/review плана.

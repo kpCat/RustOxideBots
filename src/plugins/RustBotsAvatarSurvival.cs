@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.2.1")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.2.3")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public partial class RustBotsAvatarSurvival : RustPlugin
     {
@@ -264,7 +264,7 @@ namespace Oxide.Plugins
             if(!Activate(rock.uid))throw new InvalidOperationException("Starter rock native activation failed");melee=npc.GetHeldEntity() as BaseMelee;
             if(melee==null)throw new InvalidOperationException("Starter rock BaseMelee missing");
             CraftGuard("stonehatchet","MISSING_INGREDIENTS");CraftGuard("rustbots.invalid.recipe","RECIPE_UNAVAILABLE");CraftGuard("rifle.ak","WORKBENCH_REQUIRED");
-            previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+900;Sample(previousTime);active=true;Discover();
+            previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+(firstHome?1100:900);Sample(previousTime);active=true;Discover();
         }
         private bool Ground(Vector3 p,out Vector3 foot,bool clear=true) {
             foot=p;RaycastHit hit;
@@ -386,7 +386,8 @@ namespace Oxide.Plugins
             total+=step;previous=npc.transform.position;previousTime=now;Sample(now);
             if(now>deadline)throw new InvalidOperationException("Bounded gameplay deadline");
             if(state.Goal=="CRAFT"){PollCraft();return;}
-            if(npc.GetActiveItem()!=(homeGather?product:rock) || npc.GetHeldEntity()!=melee)throw new InvalidOperationException("Real gathering tool selection lost");
+            if(homeGather && HomeSwitchGatherTool())return;
+            if(npc.GetActiveItem()!=(homeGather?homeGatherTool:rock) || npc.GetHeldEntity()!=melee)throw new InvalidOperationException("Real gathering tool selection lost");
             if(navigating) {
                 float distance=Vector3.Distance(npc.transform.position,target);
                 if(distance<=1.05f) {
@@ -407,12 +408,14 @@ namespace Oxide.Plugins
             hit.PointStart=npc.transform.position;hit.PointEnd=source.transform.position;return hit;
         }
         private void Harvest() {
-            var gatheringTool=homeGather?product:rock;
+            var gatheringTool=homeGather?homeGatherTool:rock;
             ResourceDispenser d;ItemAmount item;float distance;
             if(!Eligible(source,out d,out item) || d!=dispenser || item!=pool || !Reach(out distance)) {
                 rejected.Add(sourceId);navigating=false;Discover();return;
             }
             if(gatheringTool.condition<=0 || gatheringTool.GetOwnerPlayer()!=npc)throw new InvalidOperationException("Owned tool broken/missing");
+            if(homeGather && gatheringTool.condition<=melee.GetGatherInfoFromIndex(dispenser.gatherType).conditionLost+1)
+                throw new InvalidOperationException("Home tool wear guard before PREPARED");
             if(economy && !sourceRecords.ContainsKey(source)) {
                 var record=DescribeSource(source,dispenser,pool);sourceRecords.Add(source,record);economyState.Sources.Add(record);
             }
@@ -532,9 +535,9 @@ namespace Oxide.Plugins
             if(item==null || item.parent!=npc.inventory.containerBelt || item.GetOwnerPlayer()!=npc)return false;
             npc.UpdateActiveItem(uid);return npc.GetActiveItem()==item;
         }
-        private object Equipment() {
-            var item=npc.GetActiveItem();var held=npc.GetHeldEntity();
-            return new {ActorNetId=Id(npc),ActiveUid=item==null?null:item.uid.Value.ToString(),ItemUid=product==null?null:product.uid.Value.ToString(),
+        private object Equipment(Item expectedItem=null) {
+            var item=npc.GetActiveItem();var held=npc.GetHeldEntity();var expected=expectedItem??product;
+            return new {ActorNetId=Id(npc),ActiveUid=item==null?null:item.uid.Value.ToString(),ItemUid=expected==null?null:expected.uid.Value.ToString(),
                 OwnerNetId=item==null?null:Id(item.GetOwnerPlayer()),HeldOwnerNetId=held==null?null:Id(held.GetOwnerPlayer()),HeldParentNetId=held==null?null:Id(held.GetParentEntity()),
                 HeldType=held==null?null:held.GetType().Name,HeldNetId=Id(held),HeldItemUid=held==null || held.GetItem()==null?null:held.GetItem().uid.Value.ToString(),IsHeld=held!=null && held.HasFlag((BaseEntity.Flags)1024)};
         }
@@ -658,7 +661,7 @@ namespace Oxide.Plugins
             if(economy)RestoreEconomy();
             restored=true;ActivationNegatives();holdTime=Time.realtimeSinceStartup+2;active=true;
             restoreAudit.Stage="COMPLETE";
-            if(firstHome){previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+900;Sample(previousTime);HomeRestoreRebind();}
+            if(firstHome){previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+1100;Sample(previousTime);HomeRestoreRebind();}
             Log("RESTORE",new {State=state,Expected=snapshot.Inventory,Actual=Contents(),Equipment=Equipment(),Restored=restored});
         }
         private void Save() {
@@ -693,7 +696,7 @@ namespace Oxide.Plugins
                     JournalSHA256=File.Exists(Data("economy.journal"))?RustBots.EconomyJournal.HashBytes(File.ReadAllBytes(Data("economy.journal"))):null,CrashAtomic="NOT_PROVEN",CrashRecovery="OFFLINE_ONLY"}:null,
                 Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN" || firstHome && saved && !economicFailure,EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
-            Puts("RUSTBOTS_RESULT "+JsonConvert.SerializeObject(result));
+            Puts("RUSTBOTS_RESULT "+(firstHome?JsonConvert.SerializeObject(new {RunId=token,Status=status,Reason=reason,Mode=mode,ResultFile=Data("result.json"),FullEvidenceInFile=true}):JsonConvert.SerializeObject(result)));
         }
         private void Cleanup() { if(npc!=null && !npc.IsDestroyed){npc.UpdateActiveItem(default(ItemId));npc.inventory.Strip();npc.Kill();}npc=null; }
         private void Unload() { Cleanup();if(journal!=null)journal.Dispose(); }
