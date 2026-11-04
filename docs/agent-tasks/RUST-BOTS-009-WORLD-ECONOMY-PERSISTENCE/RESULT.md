@@ -16,7 +16,7 @@
 | Craft duplicate / interrupted stages | OFFLINE_ONLY | PREPARED, DEBITTING, DEBITED, OUTPUT_CREATED, COMMITTED; recovered intent не повторяется |
 | UID/held/personality restore 009 | NOT_PROVEN | 008 lifecycle переиспользован, но новый completed JOURNEY отсутствует |
 | Safety / owner / history | Проверено после двух запусков | Owner changes=0; processes/ports/rules/open leases/occupied locks=0; historical raw changes=0 |
-| Code / scope | OFFLINE + LIVE load | Test-All exit 0, C# 7.3 compile, обе live загрузки Oxide; allowlist 18 файлов |
+| Code / scope | OFFLINE, исторический LIVE load | Test-All exit 0, C# 7.3 compile; v0.1.3/4 live loaded, итоговый v0.1.5 только offline; allowlist 18 файлов |
 
 ## Baseline и установленный runtime
 
@@ -81,7 +81,7 @@ Focused OFFLINE_ONLY проверки используют настоящий he
 
 ## Проверки и сохранность
 
-`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1` — **exit 0** после финального v0.1.4 admission исправления, до второго live. Включены прежние regression suites, focused economy contracts и C# 7.3 compile всех пяти plugins против installed DLL. Live captured v0.1.4 — source + реально подключённый BCL helper — SHA **305CE45592CCBC2CB3219B94CA6BBFD83C713729FB8F605913660E9C52DBB354**; совпадает с итоговой реализацией. v0.1.3 capture первого run: **09EADBC7F7D1DC6ED6E8686077DB55D65E82F3F57AC2482AB1FBBF49DC651CB4**.
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1` — **exit 0** после v0.1.4 admission исправления, до второго live; повторён после обязательного map-identity дополнения v0.1.5. Включены прежние regression suites, focused economy/map contracts и C# 7.3 compile всех пяти plugins против installed DLL. Live captured v0.1.4 — source + реально подключённый BCL helper — SHA **305CE45592CCBC2CB3219B94CA6BBFD83C713729FB8F605913660E9C52DBB354**. v0.1.3 capture первого run: **09EADBC7F7D1DC6ED6E8686077DB55D65E82F3F57AC2482AB1FBBF49DC651CB4**. Итоговый v0.1.5 изменён после этих запусков по обязательному дополнению владельца; совпадение с live capture и live compilation для него не заявляются.
 
 Финальный safety audit 11:53:40 UTC: Rust/SteamCMD/helper processes=0, TCP/UDP test endpoints=0, firewall rules=0, live brokers=0, open leases=0, occupied locks=0; все 17 исторических/new leases закрыты. Owner **Server/: 3086 файлов, SHA/length changes=0**. 22 исторических raw-файла 007–008 unchanged; source 001/003/004/006 unchanged. SteamCMD, updater, BAT, обновление Rust/Oxide и owner runtime не запускались и не изменялись.
 
@@ -89,6 +89,18 @@ Focused OFFLINE_ONLY проверки используют настоящий he
 - escaped Cyrillic в изменённых файлах проверены.
 
 Отдельный public audit проверяет strict UTF-8/NUL, обе encoding-проверки, owner values, credentials/Steam IDs, RCON secrets обоих runs и non-loopback IP. Server/, .local/ и artifacts/ остаются ignored, Server/ tracked files=0. Raw/секреты не входят в public allowlist.
+
+## Обязательное дополнение: любые совместимые карты
+
+После первого PARTIAL delivery владелец уточнил обязательную map-independent архитектуру. v0.1.5 разделяет стабильную identity карты/мира и состояние save. Динамические World.Name/Procedural/Seed/Size, native map file и numeric format берутся из подтверждённого API; содержимое реальной .map хешируется один раз. MapKey включает kind/level/seed/size/format/map SHA, WorldKey — MapKey + persistent native wipe GUID. Изменяющийся SHA .sav, cache key/generation, URL и transient Entity ID не используются как постоянная identity мира.
+
+Journal/state разделены по WorldKey directories. При новой карте, seed/size/version или wipe прежние данные остаются изолированными; автоматического переноса/replay нет. Неизвестная identity останавливает работу до Load/debit. Strict exact save/generation/hash proof остаётся отдельным gate состояния. Runtime discovery ресурсов/навигации не содержит координат или seed тестовой карты; фиксированные 424242/2000 остаются только параметрами существующего безопасного test runner.
+
+Для последовательных обычных RESTORE разрешён новый completed checkpoint без повторного craft. Original source/payment journal не меняется; native health следующего save хранится отдельно от health входного checkpoint, особенно для staged ore. Независимое review поймало смешение входного и выходного health в receipts; реалистичный regression 80 → native 100 → output checkpoint 100 наблюдался RED и закрыт до финального Test-All.
+
+OFFLINE tests реально проверяют committed-intent reopen для той же карты/wipe при другом отдельном save proof, отказ при изменении level/map hash/seed/size/format/kind/wipe, различие namespaces и неизменный SHA старого журнала после cross-world отказов. Проверены procedural и custom descriptors, включая смену содержимого custom map. **MULTI_MAP_E2E=NOT_CONDUCTED; v0.1.5 LIVE=NOT_PROVEN; повторная цепочка native RESTORE=NOT_PROVEN.** Дополнительных live запусков или генерации второй карты не было. Эти архитектурные проверки не меняют общий PARTIAL и не доказывают работу игры на всех картах.
+
+Итоговый v0.1.5 source + helper SHA-256: **7E02414624A3D8FC14FD3F8BE1FDC3CB927707D2A4DEBD40033FB6D3A711FBE6**. Финальный Test-All после input/output checkpoint исправления — exit 0; public audit повторно проверил все 18 файлов и оба live RCON secrets, исторический capture сохранён. Runtime .map hashing выполняется однократно перед созданием actor.
 
 ## Scope и Git delivery
 
@@ -98,4 +110,4 @@ Git прямо разрешён TASK и пользователем. Исполь
 
 Final scope/delivery commands: `git status --short --untracked-files=all`, `git add -n -- $paths`, `git add -- $paths` с массивом ровно 18 allowlist paths; `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --no-ext-diff -- $paths`; `git commit -m 'feat: add guarded world economy journal and recovery probe'`; обычный `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master`; затем HTTPS ls-remote, `git rev-parse HEAD origin/master`, `git status --short`, `git ls-files -- Server/`. Ни force, ни broad add, ни history rewrite не используются.
 
-Финальный commit/ref SHA и remote equality записываются после commit в ignored `.local/audit/economy009/delivery.json` и сообщаются в финальном ответе: commit не может содержать собственный SHA. Доставка PARTIAL означает публикацию честного bounded результата; она не меняет outcome на GREEN.
+Первый PARTIAL commit **a5f7413ae9440b99072576c8a006d88f209286a9** обычным push опубликован в master; HEAD/tracking/public ref перед map-дополнением совпали. Дополнение коммитится тем же exact-path процессом, message `fix: separate map identity from economy save checkpoints`; bounded diff выполняется против a5f7413 для review и против исходного 58d384e для cumulative 18-path guard. Финальный commit/ref SHA и remote equality записываются после commit в ignored `.local/audit/economy009/delivery.json` и сообщаются в финальном ответе: commit не может содержать собственный SHA. Доставка PARTIAL означает публикацию честного bounded результата; она не меняет outcome на GREEN.

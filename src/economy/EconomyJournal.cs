@@ -1,6 +1,37 @@
 // BCL-only helper appended to the isolated Oxide source by the probe runner.
 namespace RustBots
 {
+    public sealed class EconomyWorldIdentity
+    {
+        public string Kind, Level, MapVersion, MapSHA256, WipeId;
+        public uint Seed, Size;
+        public string MapKey()
+        {
+            if ((Kind != "PROCEDURAL" && Kind != "CUSTOM") || string.IsNullOrWhiteSpace(Level) || Size == 0 ||
+                string.IsNullOrWhiteSpace(MapVersion) || MapSHA256 == null || !System.Text.RegularExpressions.Regex.IsMatch(MapSHA256, "^[A-Fa-f0-9]{64}$"))
+                throw new System.IO.InvalidDataException("UNKNOWN_MAP_IDENTITY");
+            using (var memory = new System.IO.MemoryStream())
+            {
+                using (var writer = new System.IO.BinaryWriter(memory, System.Text.Encoding.UTF8, true))
+                {
+                    writer.Write("economy-map-v2"); writer.Write(Kind); writer.Write(Level); writer.Write(Seed); writer.Write(Size);
+                    writer.Write(MapVersion); writer.Write(MapSHA256.ToUpperInvariant());
+                }
+                return EconomyJournal.HashBytes(memory.ToArray());
+            }
+        }
+        public string WorldKey()
+        {
+            System.Guid wipe;
+            if (!System.Guid.TryParse(WipeId, out wipe) || wipe == System.Guid.Empty) throw new System.IO.InvalidDataException("UNKNOWN_WIPE_IDENTITY");
+            return EconomyJournal.Hash("economy-world-v2/" + MapKey() + "/" + wipe.ToString("D"));
+        }
+        public void RequireSame(EconomyWorldIdentity actual)
+        {
+            if (actual == null || WorldKey() != actual.WorldKey()) throw new System.IO.InvalidDataException("CROSS_WORLD_REPLAY_DENIED");
+        }
+        public string JournalDirectory(string dataRoot) { return System.IO.Path.Combine(dataRoot, "RustBotsAvatarSurvival.worlds", WorldKey()); }
+    }
     public sealed class EconomyJournal : System.IDisposable
     {
         public sealed class Entry
@@ -19,6 +50,12 @@ namespace RustBots
         {
             using (var sha = System.Security.Cryptography.SHA256.Create())
                 return System.BitConverter.ToString(sha.ComputeHash(value)).Replace("-", "");
+        }
+        public static string HashFile(string path)
+        {
+            using (var file = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read))
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return System.BitConverter.ToString(sha.ComputeHash(file)).Replace("-", "");
         }
         private static void Require(bool condition, string reason) { if (!condition) throw new System.IO.InvalidDataException(reason); }
         public EconomyJournal(string path, string world, string actor, string recipe)

@@ -1,8 +1,36 @@
 #Requires -Version 5.1
 . (Join-Path $PSScriptRoot 'AvatarSurvivalValidation.ps1')
+function Get-EconomyWorldKeys($w) {
+    if($w.Kind -notin @('PROCEDURAL','CUSTOM') -or [string]::IsNullOrWhiteSpace($w.Level) -or $w.MapVersion -notmatch '^[0-9]+$' -or $w.MapSHA256 -notmatch '^[A-Fa-f0-9]{64}$'){throw 'Unknown map identity'}
+    foreach($field in @('Seed','Size')){$v=Get-AvatarNumber $w.$field 'map parameter';if($v -lt 0 -or $v -gt [uint32]::MaxValue -or $v -ne [Math]::Floor($v)){throw 'Invalid map parameter'}}
+    $wipe=[guid]::Empty
+    if($w.Size -eq 0 -or -not [guid]::TryParse($w.WipeId,[ref]$wipe) -or $wipe -eq [guid]::Empty){throw 'Unknown wipe identity'}
+    $memory=New-Object IO.MemoryStream;$writer=New-Object IO.BinaryWriter($memory,[Text.Encoding]::UTF8,$true)
+    try {
+        $writer.Write('economy-map-v2');$writer.Write([string]$w.Kind);$writer.Write([string]$w.Level);$writer.Write([uint32]$w.Seed);$writer.Write([uint32]$w.Size)
+        $writer.Write([string]$w.MapVersion);$writer.Write($w.MapSHA256.ToUpperInvariant());$writer.Flush();$bytes=$memory.ToArray()
+    }finally{$writer.Dispose();$memory.Dispose()}
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try {
+        $map=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','')
+        $world=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes('economy-world-v2/'+$map+'/'+$wipe.ToString('D')))).Replace('-','')
+    }finally{$sha.Dispose()}
+    return @{MapKey=$map;WorldKey=$world}
+}
+function Get-EconomyDataDirectory([string]$install,[string]$key) {
+    if($key -cnotmatch '^[A-F0-9]{64}$'){throw 'Invalid economy namespace'}
+    Join-Path $install ('oxide\data\RustBotsAvatarSurvival.worlds\'+$key)
+}
+function Assert-EconomyMapMatch($expected,$actual) {
+    foreach($field in @('Kind','Level','Seed','Size','MapVersion','MapSHA256')) {
+        if($null -eq $expected.$field -or $expected.$field -ine $actual.$field){throw ('CROSS_MAP_REPLAY_DENIED: '+$field)}
+    }
+}
 function Assert-EconomyResult($n) {
     if($n.Status -ne 'GREEN'){return}
     $e=$n.Economy;$s=$e.State
+    $keys=Get-EconomyWorldKeys $e.World;$stateKeys=Get-EconomyWorldKeys $s.World
+    if($s.Schema -ne 2 -or $e.WorldKey -cne $keys.WorldKey -or $e.MapKey -cne $keys.MapKey -or $s.WorldKey -cne $keys.WorldKey -or $stateKeys.WorldKey -cne $keys.WorldKey){throw 'Cross-world economy identity'}
     if(-not $e.WorldKey -or $e.CrashAtomic -ne 'NOT_PROVEN' -or $e.CrashRecovery -ne 'OFFLINE_ONLY' -or
         $s.ActorId -ne $n.State.ActorId -or $s.CraftIntent -ne $n.State.CraftIntent -or $s.ProductUid -ne $n.State.ProductUid){throw 'Economy actor/intent/crash classification mismatch'}
     $sources=@($s.Sources)
@@ -32,10 +60,11 @@ function Assert-EconomyResult($n) {
                         if([Math]::Abs($x-$y) -gt 0.001){throw 'Restored source geometry differs'}
                     }
                 }
-                foreach($v in @($r.SavedHealth,$r.CurrentHealth,$r.StartHealth,$source.Health)){$null=Get-AvatarNumber $v 'source health'}
-                $staged=$source.Type -eq 'OreResourceEntity';$health=if($staged){$r.StartHealth}else{$source.Health}
-                if($r.Staged -ne $staged -or [Math]::Abs($r.SavedHealth-$source.Health) -gt 0.001 -or [Math]::Abs($r.CurrentHealth-$health) -gt 0.001 -or
-                    [Math]::Abs($actual.ExpectedPool-$r.After) -gt 0.001 -or [Math]::Abs($actual.ExpectedFraction-$r.FractionAfter) -gt 0.00001){throw 'Restored native health/pool differs'}
+                $checkpoint=$e.InputSnapshotHealth.($source.Incarnation);$outputCheckpoint=$s.SnapshotHealth.($source.Incarnation)
+                foreach($v in @($r.SavedHealth,$r.CheckpointHealth,$r.CurrentHealth,$r.StartHealth,$checkpoint,$outputCheckpoint)){$null=Get-AvatarNumber $v 'source health'}
+                $staged=$source.Type -eq 'OreResourceEntity';$health=if($staged){$r.StartHealth}else{$checkpoint}
+                if($r.Staged -ne $staged -or [Math]::Abs($r.CheckpointHealth-$checkpoint) -gt 0.001 -or [Math]::Abs($r.SavedHealth-$checkpoint) -gt 0.001 -or [Math]::Abs($r.CurrentHealth-$health) -gt 0.001 -or
+                    [Math]::Abs($outputCheckpoint-$r.CurrentHealth) -gt 0.001 -or [Math]::Abs($actual.ExpectedPool-$r.After) -gt 0.001 -or [Math]::Abs($actual.ExpectedFraction-$r.FractionAfter) -gt 0.00001){throw 'Restored native health/pool differs'}
                 if($r.SavedUid -ne $source.SavedUid -or $r.Candidates -ne 1 -or $r.DiskWitness -ne $true -or $r.NeighborsUnchanged -ne $true -or $r.Neighbors -lt 1 -or $r.ItemCredits -ne 0 -or
                     $r.Decision -notin @('APPLY','NOOP') -or ($pass -eq 2 -and $r.Decision -ne 'NOOP') -or
                     [Math]::Abs($r.After-$source.ExpectedPool) -gt 0.001 -or [Math]::Abs($r.FractionAfter-$source.ExpectedFraction) -gt 0.00001){throw 'Unproven source replay/neighbor conservation'}
@@ -83,7 +112,8 @@ function Read-EconomyJournal([string]$path,[string]$world,[string]$actor,[string
     return $records
 }
 function Assert-EconomyBinding($prior,$proof,[string]$root) {
-    if($prior.Status -ne 'GREEN' -or -not $prior.WorldEconomy -or $proof.EconomyWorldKey -cne $prior.Navigation.Economy.WorldKey){throw 'Unbound economy provenance'}
+    Assert-EconomyResult $prior.Navigation
+    if($prior.Status -ne 'GREEN' -or -not $prior.WorldEconomy -or $proof.EconomyWorldKey -cne $prior.Navigation.Economy.WorldKey -or $proof.EconomyMapKey -cne $prior.Navigation.Economy.MapKey){throw 'Unbound economy provenance'}
     foreach($entry in @(@('economy.journal','EconomyJournalSHA256'),@('economy.json','EconomyStateSHA256'))) {
         $hash=(Get-FileHash -LiteralPath (Join-Path $root $entry[0]) -Algorithm SHA256).Hash
         if($hash -cne $prior.($entry[1]) -or $hash -cne $proof.($entry[1])){throw 'Economy proof hash mismatch'}
@@ -94,11 +124,15 @@ function Assert-EconomyBinding($prior,$proof,[string]$root) {
     if(($state|ConvertTo-Json -Depth 20 -Compress) -cne ($n.Economy.State|ConvertTo-Json -Depth 20 -Compress)){throw 'Economy state receipt differs'}
     $records=@(Read-EconomyJournal (Join-Path $root 'economy.journal') $n.Economy.WorldKey $n.State.ActorId $state.RecipeHash)
     $craft=@($records|Where-Object {$_.Kind -eq 'CRAFT' -and $_.Stage -eq 'COMMITTED'})
-    if($craft.Count -ne 1 -or $craft[0].Intent -ne $n.State.CraftIntent -or $craft[0].Payload.Output.Uid -ne $n.State.ProductUid -or
-        (Get-AvatarSurvivalKey $craft[0].Payload.After) -cne (Get-AvatarSurvivalKey $n.Craft.After)){throw 'Journal craft receipt differs'}
+    if($craft.Count -ne 1 -or $craft[0].Intent -ne $n.State.CraftIntent -or $craft[0].Payload.Output.Uid -ne $n.State.ProductUid){throw 'Journal craft receipt differs'}
+    $product=@($n.Inventory|Where-Object Uid -eq $n.State.ProductUid)
+    if($product.Count -ne 1){throw 'Journal product missing'}
+    foreach($field in @('Uid','Shortname','Amount','Condition','MaxCondition')){if($product[0].$field -ne $craft[0].Payload.Output.$field){throw 'Journal product attributes differ'}}
+    $nonProduct=@($n.Inventory|Where-Object Uid -ne $n.State.ProductUid)
+    if((Get-AvatarSurvivalKey $nonProduct) -cne (Get-AvatarSurvivalKey @($craft[0].Payload.After|Where-Object Uid -ne $n.State.ProductUid))){throw 'Journal remaining inventory differs'}
     $hits=@($records|Where-Object {$_.Kind -eq 'GATHER' -and $_.Stage -eq 'APPLIED'})
-    if($hits.Count -ne @($n.Harvests).Count){throw 'Journal harvest count differs'}
-    for($i=0;$i -lt $hits.Count;$i++) {
+    if($n.Mode -eq 'JOURNEY' -and $hits.Count -ne @($n.Harvests).Count){throw 'Journal harvest count differs'}
+    for($i=0;$n.Mode -eq 'JOURNEY' -and $i -lt $hits.Count;$i++) {
         $a=$hits[$i].Payload;$b=$n.Harvests[$i]
         foreach($field in @('SourceId','Resource','Amount','PoolBefore','PoolAfter','FractionBefore','FractionAfter','ToolUid','ToolConditionBefore','ToolConditionAfter')){if($a.$field -ne $b.$field){throw 'Journal native harvest differs'}}
         if((Get-AvatarSurvivalKey $a.Before) -cne (Get-AvatarSurvivalKey $b.Before) -or (Get-AvatarSurvivalKey $a.After) -cne (Get-AvatarSurvivalKey $b.After)){throw 'Journal harvest UID receipt differs'}
@@ -113,6 +147,7 @@ function Write-EconomySaveProof([string]$runtime) {
     $path=Join-Path $runtime 'world-proof.json';$proof=Get-Content $path -Raw -Encoding UTF8|ConvertFrom-Json
     foreach($field in @('EconomyJournalSHA256','EconomyStateSHA256')){$proof|Add-Member -NotePropertyName $field -NotePropertyValue $p.$field}
     $proof|Add-Member -NotePropertyName EconomyWorldKey -NotePropertyValue $p.Navigation.Economy.WorldKey
+    $proof|Add-Member -NotePropertyName EconomyMapKey -NotePropertyValue $p.Navigation.Economy.MapKey
     Assert-EconomyBinding $p $proof $runtime
     [IO.File]::WriteAllText($path,($proof|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
 }

@@ -32,7 +32,6 @@ $oldScenario = $env:RUST_BOTS_SCENARIO
 $oldRestore = $env:RUST_BOTS_RESTORE
 $oldResume = $env:RUST_BOTS_RESUME_JOURNEY
 $oldEconomy=$env:RUST_BOTS_WORLD_ECONOMY
-$oldEconomyWorld=$env:RUST_BOTS_ECONOMY_WORLD
 $isSurvival = $SurvivalGather -or $SurvivalCraft
 $scenario = if ($AvatarSurvival) {'AVATAR_SURVIVAL'} elseif ($PlayerAvatar) {'PLAYER_AVATAR'} elseif ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
 $pluginName = if ($AvatarSurvival) {'RustBotsAvatarSurvival'} elseif ($PlayerAvatar) {'RustBotsAvatarProbe'} elseif ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
@@ -115,11 +114,11 @@ try {
         $env:RUST_BOTS_RESTORE = if ($RestoreFrom) { '1' } else { '' }
         $env:RUST_BOTS_RESUME_JOURNEY = if ($ResumeJourney) { '1' } else { '' }
         $env:RUST_BOTS_WORLD_ECONOMY=if($WorldEconomy){'1'}else{''}
-        $env:RUST_BOTS_ECONOMY_WORLD=''
         if($WorldEconomy){
             $map=@($loadedManifest.Files|Where-Object Name -match '\.map$')
             if($map.Count -ne 1){throw 'Missing exact economy map identity'}
-            $env:RUST_BOTS_ECONOMY_WORLD=$cache.Compatibility.Key+'/'+$loadedManifest.Generation+'/'+$report.Cache.LoadedSaveSHA256+'/'+$map[0].SHA256
+            if($map[0].Name -notmatch '\.([0-9]+)\.map$'){throw 'Unknown test map format'}
+            $report['EconomyMap']=@{Kind='PROCEDURAL';Level=$cache.Compatibility.Description.Level;Seed=$cache.Compatibility.Seed;Size=$cache.Compatibility.Size;MapVersion=$matches[1];MapSHA256=$map[0].SHA256}
             $report['WorldEconomy']=$true
         }
         if ($RestoreFrom) {
@@ -130,7 +129,7 @@ try {
                 -not $prior.PortsReleased -or -not $prior.FirewallRemoved -or $prior.Cache.Key -ne $cache.Compatibility.Key -or
                 -not $prior.Navigation.Persistence.Saved -or -not $prior.Navigation.Conservation.Ok) { throw 'Unsafe/incomplete restore provenance' }
             if ($AvatarSurvival) {
-                if($prior.Scenario -ne $scenario -or $prior.Navigation.Mode -ne 'JOURNEY'){throw 'Avatar restore requires completed journey'}
+                if($prior.Scenario -ne $scenario -or ($prior.Navigation.Mode -ne 'JOURNEY' -and -not ($WorldEconomy -and $prior.Navigation.Mode -eq 'RESTORE'))){throw 'Avatar restore requires completed journey/checkpoint'}
                 Assert-AvatarSurvivalResult $prior.Navigation
                 if($WorldEconomy){Assert-EconomyResult $prior.Navigation;if(-not $prior.WorldEconomy){throw 'Source is not WorldEconomy'}}
                 elseif($prior.WorldEconomy){throw 'WorldEconomy snapshot requires WorldEconomy restore'}
@@ -154,9 +153,11 @@ try {
                 $report['RestoreBinding']=$proof
                 if($WorldEconomy){
                     Assert-EconomyBinding $prior $proof $priorRoot
-                    $env:RUST_BOTS_ECONOMY_WORLD=$prior.Navigation.Economy.WorldKey
+                    Assert-EconomyMapMatch $prior.Navigation.Economy.World $report.EconomyMap
+                    $economyDirectory=Get-EconomyDataDirectory $install $prior.Navigation.Economy.WorldKey
+                    New-Item -ItemType Directory -Force -Path $economyDirectory | Out-Null
                     foreach($name in @('economy.journal','economy.json')) {
-                        Copy-Item -LiteralPath (Join-Path $priorRoot $name) -Destination (Join-Path $install ('oxide\data\RustBotsAvatarSurvival.'+$name))
+                        Copy-Item -LiteralPath (Join-Path $priorRoot $name) -Destination (Join-Path $economyDirectory $name)
                     }
                 }
                 Copy-Item -LiteralPath $actorSnapshot -Destination (Join-Path $install 'oxide\data\RustBotsAvatarSurvival.state.json')
@@ -229,7 +230,7 @@ try {
                     if ($AvatarSurvival) {
                         Assert-AvatarSurvivalResult $nav
                         if($RestoreFrom){Assert-AvatarSurvivalRestart $prior.Navigation $nav}
-                        if($WorldEconomy){Assert-EconomyResult $nav}
+                        if($WorldEconomy){Assert-EconomyResult $nav;if($nav.Status -eq 'GREEN'){Assert-EconomyMapMatch $nav.Economy.World $report.EconomyMap}}
                     } elseif ($PlayerAvatar) {
                         Assert-AvatarResult $nav
                     } elseif ($isSurvival) {
@@ -254,8 +255,9 @@ try {
                         Copy-Item -LiteralPath (Join-Path $install ('oxide\data\'+$pluginName+'.state.json')) -Destination (Join-Path $runtime 'actor-state.json')
                         $report['ActorStateSHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'actor-state.json') -Algorithm SHA256).Hash
                         if($WorldEconomy){
+                            $economyDirectory=Get-EconomyDataDirectory $install $nav.Economy.WorldKey
                             foreach($name in @('economy.journal','economy.json')) {
-                                Copy-Item -LiteralPath (Join-Path $install ('oxide\data\RustBotsAvatarSurvival.'+$name)) -Destination (Join-Path $runtime $name)
+                                Copy-Item -LiteralPath (Join-Path $economyDirectory $name) -Destination (Join-Path $runtime $name)
                             }
                             $report['EconomyJournalSHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'economy.journal') -Algorithm SHA256).Hash
                             $report['EconomyStateSHA256']=(Get-FileHash -LiteralPath (Join-Path $runtime 'economy.json') -Algorithm SHA256).Hash
@@ -323,7 +325,6 @@ try {
         $env:RUST_BOTS_RESTORE = $oldRestore
         $env:RUST_BOTS_RESUME_JOURNEY = $oldResume
         $env:RUST_BOTS_WORLD_ECONOMY=$oldEconomy
-        $env:RUST_BOTS_ECONOMY_WORLD=$oldEconomyWorld
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (($PlayerAvatar -or $AvatarSurvival) -and $report.Status -eq 'GREEN') {
             $report['AvatarCompletedSave']=Test-ProbeCompletedSave $report (Read-ProbeLog $log)
@@ -332,7 +333,7 @@ try {
         }
         if (Test-Path -LiteralPath $runtime) { Save-Report }
         try {
-            if ($AvatarSurvival -and -not $RestoreFrom -and $cache -and $report.Cache.Promoted -and $report.Status -eq 'GREEN') {
+            if ($AvatarSurvival -and (-not $RestoreFrom -or $WorldEconomy) -and $cache -and $report.Cache.Promoted -and $report.Status -eq 'GREEN') {
                 Write-AvatarSurvivalSaveProof $runtime $cache.Root
                 if($WorldEconomy){Write-EconomySaveProof $runtime}
             }

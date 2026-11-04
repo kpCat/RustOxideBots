@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.4")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.5")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public class RustBotsAvatarSurvival : RustPlugin
     {
@@ -49,11 +49,16 @@ namespace Oxide.Plugins
             public float InitialPool, InitialFraction, ExpectedPool, ExpectedFraction, StartAmount, Health;
         }
         private sealed class EconomyState {
+            public int Schema=2;
+            public RustBots.EconomyWorldIdentity World;
+            public Dictionary<string,float> SnapshotHealth=new Dictionary<string,float>();
             public string WorldKey, RecipeHash, ActorId, InventoryHash, CraftIntent, ProductUid;
             public List<EconomySource> Sources=new List<EconomySource>();
         }
         private sealed class DiskWitness { public string Uid; public uint Prefab; public float Health; }
         private bool economy;
+        private RustBots.EconomyWorldIdentity currentWorld;
+        private Dictionary<string,float> restoreInputHealth;
         private EconomyState economyState;
         private RustBots.EconomyJournal journal;
         private readonly Dictionary<ResourceEntity,DiskWitness> diskLoaded=new Dictionary<ResourceEntity,DiskWitness>();
@@ -87,7 +92,21 @@ namespace Oxide.Plugins
         private string gatherMechanism, craftMechanism;
         private static string Id(BaseNetworkable e) { return e == null || e.net == null ? null : e.net.ID.Value.ToString(); }
         private static float[] Point(Vector3 p) { return new[] { p.x,p.y,p.z }; }
-        private string Data(string suffix) { return Path.Combine(root,"oxide","data","RustBotsAvatarSurvival."+suffix); }
+        private string Data(string suffix) {
+            if(suffix.StartsWith("economy.",StringComparison.Ordinal) && currentWorld!=null)return Path.Combine(currentWorld.JournalDirectory(Path.Combine(root,"oxide","data")),suffix);
+            return Path.Combine(root,"oxide","data","RustBotsAvatarSurvival."+suffix);
+        }
+        private RustBots.EconomyWorldIdentity ReadCurrentWorld() {
+            // Installed World getters resolve procedural and custom map filenames; no test seed/coordinates here.
+            string file=Path.GetFullPath(Path.Combine(World.MapFolderName,World.MapFileName));
+            if(!file.StartsWith(Path.GetFullPath(root).TrimEnd('\\')+"\\",StringComparison.OrdinalIgnoreCase) || !File.Exists(file))
+                throw new InvalidOperationException("UNKNOWN_MAP_IDENTITY: native map file outside isolated world or absent");
+            var version=System.Text.RegularExpressions.Regex.Match(World.SaveFileName,@"\.([0-9]+)\.sav$");
+            if(!version.Success)throw new InvalidOperationException("UNKNOWN_MAP_FORMAT");
+            var identity=new RustBots.EconomyWorldIdentity {Kind=World.Procedural?"PROCEDURAL":"CUSTOM",Level=World.Name,Seed=World.Seed,Size=World.Size,
+                MapVersion=version.Groups[1].Value,MapSHA256=RustBots.EconomyJournal.HashFile(file),WipeId=SaveRestore.WipeId};
+            identity.WorldKey();return identity;
+        }
         private void Log(string kind,object value) { Puts("RUSTBOTS_AVATAR_SURVIVAL_"+kind+" "+JsonConvert.SerializeObject(value)); }
         private Exception Balance(string reason) { economicFailure=true;return new InvalidOperationException(reason); }
         private void OnEntityLoaded(BaseNetworkable entity,BaseNetworkable.LoadInfo info) {
@@ -112,11 +131,14 @@ namespace Oxide.Plugins
         }
         private void PrepareEconomy(Snapshot snapshot) {
             economyState=JsonConvert.DeserializeObject<EconomyState>(File.ReadAllText(Data("economy.json")));
-            string world=Environment.GetEnvironmentVariable("RUST_BOTS_ECONOMY_WORLD");
-            if(economyState==null || economyState.WorldKey!=world || economyState.ActorId!=snapshot.State.ActorId || economyState.RecipeHash!=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe)) ||
+            string world=currentWorld.WorldKey();
+            if(economyState==null || economyState.Schema!=2 || economyState.World==null || economyState.WorldKey!=world || economyState.ActorId!=snapshot.State.ActorId || economyState.RecipeHash!=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe)) ||
                 economyState.InventoryHash!=RustBots.EconomyJournal.Hash(Key(snapshot.Inventory,false)) || economyState.CraftIntent!=snapshot.State.CraftIntent || economyState.ProductUid!=snapshot.State.ProductUid ||
-                economyState.Sources==null || economyState.Sources.Count!=2 || economyState.Sources.Select(x=>x.Incarnation).Distinct().Count()!=2)
+                economyState.Sources==null || economyState.Sources.Count!=2 || economyState.Sources.Select(x=>x.Incarnation).Distinct().Count()!=2 ||
+                economyState.SnapshotHealth==null || economyState.SnapshotHealth.Count!=2 || economyState.Sources.Any(x=>!economyState.SnapshotHealth.ContainsKey(x.Incarnation)))
                 throw new InvalidOperationException("Economy world/actor/recipe/UID binding mismatch");
+            economyState.World.RequireSame(currentWorld);
+            restoreInputHealth=new Dictionary<string,float>(economyState.SnapshotHealth);
             if(!File.Exists(Data("economy.journal")))throw new InvalidOperationException("Missing source journal");
             journal=new RustBots.EconomyJournal(Data("economy.journal"),world,snapshot.State.ActorId,economyState.RecipeHash);journal.RequireComplete();
             if(journal.RecoveryState(snapshot.State.CraftIntent)!="COMMITTED")throw new InvalidOperationException("IN_DOUBT craft cannot restore/retry");
@@ -139,7 +161,7 @@ namespace Oxide.Plugins
                 if(positive.Length!=1 || positive[0].itemDef==null)throw new InvalidOperationException("Source categories incompatible");
                 var actual=DescribeSource(e,d,positive[0]);DiskWitness witness;
                 bool proven=diskLoaded.TryGetValue(e,out witness) && witness.Uid==expected.SavedUid && Id(e)==expected.SavedUid && witness.Prefab==e.prefabID &&
-                    RustBots.EconomyJournal.LoadedHealthMatches(e is StagedResourceEntity,witness.Health,expected.Health,e.Health(),e.startHealth) && e.enableSaving && BaseEntity.saveList.Contains(e) && e.OwnerID==0 && !e.IsLocked() &&
+                    RustBots.EconomyJournal.LoadedHealthMatches(e is StagedResourceEntity,witness.Health,restoreInputHealth[expected.Incarnation],e.Health(),e.startHealth) && e.enableSaving && BaseEntity.saveList.Contains(e) && e.OwnerID==0 && !e.IsLocked() &&
                     actual.Resource==expected.Resource && actual.Population==expected.Population && Mathf.Abs(actual.StartAmount-expected.StartAmount)<0.001f &&
                     Near(actual.Rotation,expected.Rotation,0.001f) && Near(actual.Scale,expected.Scale,0.001f) && Near(actual.Bounds,expected.Bounds,0.001f);
                 string decision=RustBots.EconomyJournal.PoolDecision(expected.InitialPool,expected.ExpectedPool,expected.InitialFraction,expected.ExpectedFraction,actual.ExpectedPool,actual.ExpectedFraction,proven,candidates.Length);
@@ -148,6 +170,7 @@ namespace Oxide.Plugins
             if(plans.Select(x=>x.Item2).Distinct().Count()!=plans.Count)throw new InvalidOperationException("Source mapping is not one-to-one");
             foreach(var plan in plans) {
                 var expected=plan.Item1;var e=plan.Item2;var d=plan.Item3;var item=plan.Item4;float before=item.amount,fraction=d.fractionRemaining;
+                sourceRecords[e]=expected;
                 var neighbors=BaseNetworkable.serverEntities.OfType<ResourceEntity>().Where(x=>x!=e && !x.IsDestroyed && Vector3.Distance(x.transform.position,e.transform.position)<30).ToArray();
                 Func<string> neighborKey=()=>JsonConvert.SerializeObject(neighbors.Select(x=>new {Id=Id(x),Pool=x.GetComponent<ResourceDispenser>()==null?null:x.GetComponent<ResourceDispenser>().containedItems.Select(i=>new {i.itemid,i.amount}).ToArray(),Fraction=x.GetComponent<ResourceDispenser>()==null?0:x.GetComponent<ResourceDispenser>().fractionRemaining}));
                 string others=neighborKey();
@@ -157,7 +180,7 @@ namespace Oxide.Plugins
                 var receipt=new {Pass=pass,expected.Incarnation,expected.SavedUid,expected.Prefab,expected.Position,expected.Rotation,expected.Scale,expected.Type,expected.Resource,expected.Population,
                     Candidates=plan.Item6,DiskWitness=true,Decision=plan.Item5,Before=before,After=item.amount,FractionBefore=fraction,FractionAfter=d.fractionRemaining,
                     expected.InitialPool,expected.ExpectedPool,expected.InitialFraction,expected.ExpectedFraction,Neighbors=neighbors.Length,NeighborsUnchanged=others==neighborKey(),ItemCredits=0,
-                    SavedHealth=diskLoaded[e].Health,CurrentHealth=e.Health(),StartHealth=e.startHealth,Staged=e is StagedResourceEntity,Actual=DescribeSource(e,d,item)};
+                    SavedHealth=diskLoaded[e].Health,CheckpointHealth=restoreInputHealth[expected.Incarnation],CurrentHealth=e.Health(),StartHealth=e.startHealth,Staged=e is StagedResourceEntity,Actual=DescribeSource(e,d,item)};
                 sourceReplays.Add(receipt);Log("SOURCE_REPLAY",receipt);
             }
         }
@@ -197,6 +220,10 @@ namespace Oxide.Plugins
             }catch(Exception ex){PrintError(ex.ToString());Finish(economicFailure?"FAILED":"PARTIAL",ex.GetType().Name+": "+ex.Message);} });
         }
         private void Begin() {
+            if(economy) {
+                currentWorld=ReadCurrentWorld();
+                if(mode=="JOURNEY")Directory.CreateDirectory(currentWorld.JournalDirectory(Path.Combine(root,"oxide","data")));
+            }
             prefab=GameManifest.Current.entities.Where(p=>p.EndsWith("/scientistnpc_roam.prefab",StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
             var obj=prefab==null?null:GameManager.server.FindPrefab(prefab);
             if(obj==null || obj.GetComponent<ScientistNPC>()==null || obj.GetComponent<PlayerInventory>()==null){Finish("BLOCKED","Installed Roam avatar absent");return;}
@@ -223,7 +250,7 @@ namespace Oxide.Plugins
             if(mode=="RESTORE"){Restore();return;}
             state=new StateRow {ActorId="avatar-007-"+Guid.NewGuid().ToString("N"),Goal="NEED_RESOURCE"};
             if(economy) {
-                economyState=new EconomyState {WorldKey=Environment.GetEnvironmentVariable("RUST_BOTS_ECONOMY_WORLD"),ActorId=state.ActorId,RecipeHash=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe))};
+                economyState=new EconomyState {World=currentWorld,WorldKey=currentWorld.WorldKey(),ActorId=state.ActorId,RecipeHash=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe))};
                 journal=new RustBots.EconomyJournal(Data("economy.journal"),economyState.WorldKey,state.ActorId,economyState.RecipeHash);
             }
             // Disclosed subset of installed PlayerInventory.GiveDefaultItems: one starter rock.
@@ -604,6 +631,8 @@ namespace Oxide.Plugins
             state.Goal="COMPLETE";
             if(economy) {
                 journal.RequireComplete();
+                if(sourceRecords.Count!=economyState.Sources.Count || sourceRecords.Keys.Any(e=>e==null || e.IsDestroyed))throw new InvalidOperationException("Source checkpoint incarnation missing");
+                economyState.SnapshotHealth=sourceRecords.ToDictionary(x=>x.Value.Incarnation,x=>x.Key.Health());
                 economyState.InventoryHash=RustBots.EconomyJournal.Hash(Key(Contents(),false));economyState.CraftIntent=state.CraftIntent;economyState.ProductUid=state.ProductUid;
                 File.WriteAllText(Data("economy.json"),JsonConvert.SerializeObject(economyState,Formatting.Indented));
             }
@@ -619,7 +648,7 @@ namespace Oxide.Plugins
                 Backend="RustNavMeshAgent/RustNav",Containers=containers,Normalization=normalization,StarterKit=starter,Inventory=Contents(),Equipment=npc==null?null:Equipment(),
                 EquipmentChecks=equipmentChecks,Recipe=recipe,Craft=craft,Harvests=harvests,Negatives=negatives,Samples=samples,Legs=legs,TotalTraveled=total,
                 RestoreAudit=restoreAudit,EquipmentSamples=equipmentSamples,
-                Economy=economy?new {WorldKey=economyState==null?null:economyState.WorldKey,State=economyState,Replays=sourceReplays,CraftReplay=economyReplay,
+                Economy=economy?new {WorldKey=economyState==null?null:economyState.WorldKey,World=currentWorld,MapKey=currentWorld==null?null:currentWorld.MapKey(),State=economyState,InputSnapshotHealth=restoreInputHealth,Replays=sourceReplays,CraftReplay=economyReplay,
                     JournalSHA256=File.Exists(Data("economy.journal"))?RustBots.EconomyJournal.HashBytes(File.ReadAllBytes(Data("economy.journal"))):null,CrashAtomic="NOT_PROVEN",CrashRecovery="OFFLINE_ONLY"}:null,
                 Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN",EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
