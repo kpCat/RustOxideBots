@@ -17,6 +17,7 @@ $response += Get-ChildItem -LiteralPath $managed -Filter '*.dll' | Where-Object 
     $_.BaseName -notin @('Newtonsoft.Json','protobuf-net','websocket-sharp')
 } | ForEach-Object { '/reference:"' + $_.FullName + '"' }
 $response += '"' + $plugin + '"'
+if($PluginName -eq 'RustBotsAvatarSurvival'){$response += '"' + (Join-Path $repo 'src\economy\EconomyJournal.cs') + '"'}
 $rsp = Join-Path $out 'compile.rsp'
 $response | Set-Content -LiteralPath $rsp -Encoding UTF8
 & dotnet $compiler ('@' + $rsp)

@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.2")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.4")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public class RustBotsAvatarSurvival : RustPlugin
     {
@@ -43,6 +43,23 @@ namespace Oxide.Plugins
             public float Time;
             public List<Cost> Ingredients;
         }
+        private sealed class EconomySource {
+            public string Incarnation, SavedUid, Prefab, Type, Resource, Population;
+            public float[] Position, Rotation, Scale, Bounds;
+            public float InitialPool, InitialFraction, ExpectedPool, ExpectedFraction, StartAmount, Health;
+        }
+        private sealed class EconomyState {
+            public string WorldKey, RecipeHash, ActorId, InventoryHash, CraftIntent, ProductUid;
+            public List<EconomySource> Sources=new List<EconomySource>();
+        }
+        private sealed class DiskWitness { public string Uid; public uint Prefab; public float Health; }
+        private bool economy;
+        private EconomyState economyState;
+        private RustBots.EconomyJournal journal;
+        private readonly Dictionary<ResourceEntity,DiskWitness> diskLoaded=new Dictionary<ResourceEntity,DiskWitness>();
+        private readonly Dictionary<ResourceEntity,EconomySource> sourceRecords=new Dictionary<ResourceEntity,EconomySource>();
+        private readonly List<object> sourceReplays=new List<object>();
+        private object economyReplay;
         private NPCPlayer npc;
         private RustNavMeshAgent agent;
         private Item rock, product;
@@ -73,6 +90,77 @@ namespace Oxide.Plugins
         private string Data(string suffix) { return Path.Combine(root,"oxide","data","RustBotsAvatarSurvival."+suffix); }
         private void Log(string kind,object value) { Puts("RUSTBOTS_AVATAR_SURVIVAL_"+kind+" "+JsonConvert.SerializeObject(value)); }
         private Exception Balance(string reason) { economicFailure=true;return new InvalidOperationException(reason); }
+        private void OnEntityLoaded(BaseNetworkable entity,BaseNetworkable.LoadInfo info) {
+            var e=entity as ResourceEntity;
+            if(e==null || Environment.GetEnvironmentVariable("RUST_BOTS_WORLD_ECONOMY")!="1" || !info.fromDisk || !TestRoot() ||
+                info.msg==null || info.msg.baseNetworkable==null || info.msg.resource==null)return;
+            diskLoaded[e]=new DiskWitness {Uid=info.msg.baseNetworkable.uid.Value.ToString(),Prefab=info.msg.baseNetworkable.prefabID,Health=info.msg.resource.health};
+        }
+        private void OnEntityKill(BaseNetworkable entity) { var e=entity as ResourceEntity;if(e!=null)diskLoaded.Remove(e); }
+        private EconomySource DescribeSource(ResourceEntity e,ResourceDispenser d,ItemAmount item) {
+            var q=e.transform.rotation;var s=e.transform.localScale;var b=e.bounds;
+            return new EconomySource {Incarnation=Guid.NewGuid().ToString("N"),SavedUid=Id(e),Prefab=e.PrefabName,Type=e.GetType().Name,Resource=item.itemDef.shortname,
+                Population=e._spawnable==null || e._spawnable.Population==null?"NONE":e._spawnable.Population.name,
+                Position=Point(e.transform.position),Rotation=new[] {q.x,q.y,q.z,q.w},Scale=Point(s),Bounds=new[] {b.center.x,b.center.y,b.center.z,b.extents.x,b.extents.y,b.extents.z},
+                InitialPool=item.amount,InitialFraction=d.fractionRemaining,ExpectedPool=item.amount,ExpectedFraction=d.fractionRemaining,StartAmount=item.startAmount,Health=e.Health()};
+        }
+        private static bool Near(float[] a,float[] b,float tolerance) {
+            return a!=null && b!=null && a.Length==b.Length && a.Zip(b,(x,y)=>!float.IsNaN(x)&&!float.IsNaN(y)&&!float.IsInfinity(x)&&!float.IsInfinity(y)&&Mathf.Abs(x-y)<=tolerance).All(x=>x);
+        }
+        private void EconomyWrite(string kind,string intent,string stage,object payload) {
+            journal.Append(kind,intent,stage,JsonConvert.SerializeObject(payload));
+        }
+        private void PrepareEconomy(Snapshot snapshot) {
+            economyState=JsonConvert.DeserializeObject<EconomyState>(File.ReadAllText(Data("economy.json")));
+            string world=Environment.GetEnvironmentVariable("RUST_BOTS_ECONOMY_WORLD");
+            if(economyState==null || economyState.WorldKey!=world || economyState.ActorId!=snapshot.State.ActorId || economyState.RecipeHash!=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe)) ||
+                economyState.InventoryHash!=RustBots.EconomyJournal.Hash(Key(snapshot.Inventory,false)) || economyState.CraftIntent!=snapshot.State.CraftIntent || economyState.ProductUid!=snapshot.State.ProductUid ||
+                economyState.Sources==null || economyState.Sources.Count!=2 || economyState.Sources.Select(x=>x.Incarnation).Distinct().Count()!=2)
+                throw new InvalidOperationException("Economy world/actor/recipe/UID binding mismatch");
+            if(!File.Exists(Data("economy.journal")))throw new InvalidOperationException("Missing source journal");
+            journal=new RustBots.EconomyJournal(Data("economy.journal"),world,snapshot.State.ActorId,economyState.RecipeHash);journal.RequireComplete();
+            if(journal.RecoveryState(snapshot.State.CraftIntent)!="COMMITTED")throw new InvalidOperationException("IN_DOUBT craft cannot restore/retry");
+        }
+        private void RestoreEconomy() {
+            var before=Key(Contents());
+            // Both passes re-read native state. A flag is never sufficient evidence for NOOP.
+            ApplySources(1);ApplySources(2);
+            CraftGuard("stonehatchet","DUPLICATE_INTENT");
+            economyReplay=new {CraftState=journal.RecoveryState(state.CraftIntent),DuplicateDenied=true,InventoryUnchanged=before==Key(Contents()),OutputUid=state.ProductUid};
+            if(before!=Key(Contents()))throw Balance("Economy replay changed inventory");
+        }
+        private void ApplySources(int pass) {
+            var plans=new List<Tuple<EconomySource,ResourceEntity,ResourceDispenser,ItemAmount,string,int>>();
+            foreach(var expected in economyState.Sources) {
+                var candidates=BaseNetworkable.serverEntities.OfType<ResourceEntity>().Where(candidate=>!candidate.IsDestroyed && candidate.GetType().Name==expected.Type && candidate.PrefabName==expected.Prefab && Near(Point(candidate.transform.position),expected.Position,0.001f)).ToArray();
+                if(candidates.Length!=1)throw new InvalidOperationException("SOURCE_IDENTITY_AMBIGUOUS: geometric candidates="+candidates.Length);
+                var e=candidates[0];var d=e.GetComponent<ResourceDispenser>();
+                var positive=d==null || d.containedItems==null?new ItemAmount[0]:d.containedItems.Where(x=>x.amount>0).ToArray();
+                if(positive.Length!=1 || positive[0].itemDef==null)throw new InvalidOperationException("Source categories incompatible");
+                var actual=DescribeSource(e,d,positive[0]);DiskWitness witness;
+                bool proven=diskLoaded.TryGetValue(e,out witness) && witness.Uid==expected.SavedUid && Id(e)==expected.SavedUid && witness.Prefab==e.prefabID &&
+                    RustBots.EconomyJournal.LoadedHealthMatches(e is StagedResourceEntity,witness.Health,expected.Health,e.Health(),e.startHealth) && e.enableSaving && BaseEntity.saveList.Contains(e) && e.OwnerID==0 && !e.IsLocked() &&
+                    actual.Resource==expected.Resource && actual.Population==expected.Population && Mathf.Abs(actual.StartAmount-expected.StartAmount)<0.001f &&
+                    Near(actual.Rotation,expected.Rotation,0.001f) && Near(actual.Scale,expected.Scale,0.001f) && Near(actual.Bounds,expected.Bounds,0.001f);
+                string decision=RustBots.EconomyJournal.PoolDecision(expected.InitialPool,expected.ExpectedPool,expected.InitialFraction,expected.ExpectedFraction,actual.ExpectedPool,actual.ExpectedFraction,proven,candidates.Length);
+                plans.Add(Tuple.Create(expected,e,d,positive[0],decision,candidates.Length));
+            }
+            if(plans.Select(x=>x.Item2).Distinct().Count()!=plans.Count)throw new InvalidOperationException("Source mapping is not one-to-one");
+            foreach(var plan in plans) {
+                var expected=plan.Item1;var e=plan.Item2;var d=plan.Item3;var item=plan.Item4;float before=item.amount,fraction=d.fractionRemaining;
+                var neighbors=BaseNetworkable.serverEntities.OfType<ResourceEntity>().Where(x=>x!=e && !x.IsDestroyed && Vector3.Distance(x.transform.position,e.transform.position)<30).ToArray();
+                Func<string> neighborKey=()=>JsonConvert.SerializeObject(neighbors.Select(x=>new {Id=Id(x),Pool=x.GetComponent<ResourceDispenser>()==null?null:x.GetComponent<ResourceDispenser>().containedItems.Select(i=>new {i.itemid,i.amount}).ToArray(),Fraction=x.GetComponent<ResourceDispenser>()==null?0:x.GetComponent<ResourceDispenser>().fractionRemaining}));
+                string others=neighborKey();
+                if(plan.Item5=="APPLY")d.DestroyFraction(before-expected.ExpectedPool);
+                if(RustBots.EconomyJournal.PoolDecision(expected.InitialPool,expected.ExpectedPool,expected.InitialFraction,expected.ExpectedFraction,item.amount,d.fractionRemaining,true,1)!="NOOP" || others!=neighborKey())
+                    throw Balance("Source reconciliation/neighbor conservation failed");
+                var receipt=new {Pass=pass,expected.Incarnation,expected.SavedUid,expected.Prefab,expected.Position,expected.Rotation,expected.Scale,expected.Type,expected.Resource,expected.Population,
+                    Candidates=plan.Item6,DiskWitness=true,Decision=plan.Item5,Before=before,After=item.amount,FractionBefore=fraction,FractionAfter=d.fractionRemaining,
+                    expected.InitialPool,expected.ExpectedPool,expected.InitialFraction,expected.ExpectedFraction,Neighbors=neighbors.Length,NeighborsUnchanged=others==neighborKey(),ItemCredits=0,
+                    SavedHealth=diskLoaded[e].Health,CurrentHealth=e.Health(),StartHealth=e.startHealth,Staged=e is StagedResourceEntity,Actual=DescribeSource(e,d,item)};
+                sourceReplays.Add(receipt);Log("SOURCE_REPLAY",receipt);
+            }
+        }
         private ItemContainer[] Containers() { return new[] {npc.inventory.containerMain,npc.inventory.containerBelt,npc.inventory.containerWear}; }
         private ItemRow Row(Item i) {
             var cs=Containers();int role=Array.IndexOf(cs,i.parent);
@@ -93,6 +181,7 @@ namespace Oxide.Plugins
         }
         private void OnServerInitialized() {
             if(!TestRoot()){Puts("Avatar survival inert: isolated marker/identity missing.");return;}
+            economy=Environment.GetEnvironmentVariable("RUST_BOTS_WORLD_ECONOMY")=="1";
             mode=Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1"?"RESTORE":"JOURNEY";wait=Time.realtimeSinceStartup;
             Puts("RUSTBOTS_READY RustNavMeshAgent/RustNav");
             timer.Every(0.5f,()=> { try {
@@ -133,6 +222,10 @@ namespace Oxide.Plugins
             recipe=ReadRecipe("stonehatchet");if(recipe==null || !recipe.Known || recipe.Workbench!=0 || recipe.Ingredients.Count!=2 || !recipe.Ingredients.Any(i=>i.Shortname=="wood") || !recipe.Ingredients.Any(i=>i.Shortname=="stones"))throw new InvalidOperationException("Loaded recipe unsupported");
             if(mode=="RESTORE"){Restore();return;}
             state=new StateRow {ActorId="avatar-007-"+Guid.NewGuid().ToString("N"),Goal="NEED_RESOURCE"};
+            if(economy) {
+                economyState=new EconomyState {WorldKey=Environment.GetEnvironmentVariable("RUST_BOTS_ECONOMY_WORLD"),ActorId=state.ActorId,RecipeHash=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe))};
+                journal=new RustBots.EconomyJournal(Data("economy.journal"),economyState.WorldKey,state.ActorId,economyState.RecipeHash);
+            }
             // Disclosed subset of installed PlayerInventory.GiveDefaultItems: one starter rock.
             rock=ItemManager.CreateByName("rock",1);
             if(rock==null || !rock.MoveToContainer(npc.inventory.containerBelt,0,false))throw new InvalidOperationException("Starter kit transfer failed");
@@ -168,8 +261,13 @@ namespace Oxide.Plugins
         private bool Eligible(ResourceEntity e,out ResourceDispenser d,out ItemAmount item) {
             d=null;item=null;
             if(e==null || e.IsDestroyed || e.OwnerID!=0 || e.IsLocked() || (need=="wood"?!(e is TreeEntity):!(e is OreResourceEntity)))return false;
+            if(economy && (!e.enableSaving || !BaseEntity.saveList.Contains(e)))return false;
             d=e.GetComponent<ResourceDispenser>();if(d==null || d.containedItems==null || d.fractionRemaining<=0)return false;
             var positive=d.containedItems.Where(i=>i.amount>0).ToArray();if(positive.Length!=1)return false;item=positive[0];
+            if(economy) {
+                var profile=melee.GetGatherInfoFromIndex(d.gatherType);
+                if(!RustBots.EconomyJournal.CanSustainHarvest(item.amount,item.startAmount,e.Health(),e.MaxHealth(),profile.gatherDamage,profile.destroyFraction,Required(need)-Quantity(need)))return false;
+            }
             return item.itemDef!=null && item.itemDef.shortname==need && item.amount>Required(need)-Quantity(need)+50 && !float.IsNaN(item.amount) && !float.IsInfinity(item.amount);
         }
         private bool Approach(ResourceEntity e,out Vector3 position) {
@@ -258,15 +356,21 @@ namespace Oxide.Plugins
                 rejected.Add(sourceId);navigating=false;Discover();return;
             }
             if(rock.condition<=0 || rock.GetOwnerPlayer()!=npc)throw new InvalidOperationException("Owned tool broken/missing");
+            if(economy && !sourceRecords.ContainsKey(source)) {
+                var record=DescribeSource(source,dispenser,pool);sourceRecords.Add(source,record);economyState.Sources.Add(record);
+            }
             var before=Contents();float p=pool.amount,f=dispenser.fractionRemaining,c=rock.condition,h=source.Health();int quantity=Quantity(need);
             var drops=new HashSet<DroppedItem>(BaseNetworkable.serverEntities.OfType<DroppedItem>());
             HitInfo hit=null;int adapterCredit=0;
+            string action=economy?"gather-"+Guid.NewGuid().ToString("N"):null;
+            if(economy)EconomyWrite("GATHER",action,"PREPARED",new {Source=sourceRecords[source],ActorId=state.ActorId,Before=before,ToolUid=state.ToolUid,Condition=c});
             if(gatherMechanism!="SERVER_ACCOUNTED_TOOL") {
                 hit=Hit(true);source.OnAttacked(hit);
                 int gained=Quantity(need)-quantity;
                 if(gained>0 && pool.amount<p && hit.InitiatorPlayer==npc && hit.DidGather)gatherMechanism="NATIVE_PLAYER_GATHER";
                 else if(gatherMechanism==null && gained==0 && Mathf.Abs(pool.amount-p)<0.001f && Key(before)==Key(Contents()) &&
                     !BaseNetworkable.serverEntities.OfType<DroppedItem>().Any(x=>!drops.Contains(x))) {
+                    if(economy)throw new InvalidOperationException("IN_DOUBT: native gather produced zero; economy adapter disabled");
                     nativeProbeZero=true;gatherMechanism="SERVER_ACCOUNTED_TOOL";
                     Log("NATIVE_GATHER_ZERO",new {InitiatorPlayer=hit.InitiatorPlayer==npc,WeaponOwned=melee.GetOwnerPlayer()==npc,hit.DidGather,PoolBefore=p,PoolAfter=pool.amount,
                         HealthBefore=h,HealthAfter=source.Health(),FractionBefore=f,FractionAfter=dispenser.fractionRemaining,InventoryUnchanged=true,NewDrops=0});
@@ -293,6 +397,11 @@ namespace Oxide.Plugins
                 Distance=distance,LineOfSight=true,Grounded=true,NewDrops=newDrops,Before=before,After=Contents()};
             harvests.Add(receipt);Log("HARVEST",receipt);
             if(delta<=0 || p-pool.amount<delta-0.01f || rock.condition>=c || newDrops!=0 || source.IsDestroyed)throw Balance("Native resource/tool conservation failed");
+            if(economy) {
+                if(gatherMechanism!="NATIVE_PLAYER_GATHER" || adapterCredit!=0)throw Balance("Economy requires native gather");
+                var record=sourceRecords[source];record.ExpectedPool=pool.amount;record.ExpectedFraction=dispenser.fractionRemaining;record.Health=source.Health();
+                EconomyWrite("GATHER",action,"APPLIED",receipt);EconomyWrite("GATHER",action,"COMMITTED",new {Source=record,After=Contents()});
+            }
             if(Quantity(need)>=Required(need)){rejected.Add(sourceId);state.Goal="NEED_RESOURCE";Discover();}
         }
         private RecipeRow ReadRecipe(string name) {
@@ -318,19 +427,24 @@ namespace Oxide.Plugins
         private void StartCraft() {
             recipe=ReadRecipe("stonehatchet");if(CraftDenial("stonehatchet")!=null)throw new InvalidOperationException("Loaded craft gate changed");
             state.Goal="CRAFT";state.CraftIntent="avatar007-"+token;state.CraftStatus="DEBITTING";craftBefore=Contents();craftTime=Time.realtimeSinceStartup;
+            if(economy)EconomyWrite("CRAFT",state.CraftIntent,"PREPARED",new {Actor=state.ActorId,Recipe=recipe,Before=craftBefore});
             var crafter=npc.inventory.crafting;var bp=ItemManager.FindItemDefinition("stonehatchet").Blueprint;
             bool available=crafter!=null && crafter.owner==npc && crafter.queue.Count==0 && crafter.containers.Contains(npc.inventory.containerMain) && crafter.containers.Contains(npc.inventory.containerBelt);
+            if(economy && available)throw new InvalidOperationException("Unexpected native crafter; economy path requires reviewed accounted craft");
             bool accepted=available && crafter.CraftItem(bp,npc,null,1,0,null,false,0);
             Log("QUEUE",new {Available=available,Accepted=accepted,Before=craftBefore,After=Contents(),QueueCount=crafter==null?0:crafter.queue.Count,Recipe=recipe});
             if(accepted){craftMechanism="NATIVE_PLAYER_CRAFT";state.CraftStatus="QUEUED";return;}
             if(Key(craftBefore)!=Key(Contents()) || (crafter!=null && crafter.queue.Count!=0))throw Balance("Native queue refusal mutated payment; adapter forbidden");
             // Reuse 005's debit-first synchronous adapter only after a proven no-op refusal.
             craftMechanism="SERVER_ACCOUNTED_CRAFT";
+            if(economy)EconomyWrite("CRAFT",state.CraftIntent,"DEBITTING",new {Before=craftBefore,Recipe=recipe});
             foreach(var cost in recipe.Ingredients){int remaining=cost.Amount;foreach(var i in Containers().Take(2).SelectMany(c=>c.itemList).Where(i=>i.info.shortname==cost.Shortname).ToArray()){
                 int take=Math.Min(i.amount,remaining);int amount=i.amount;i.UseItem(take);if(amount-i.amount!=take)throw Balance("Native UseItem debit mismatch");if(i.amount==0)i.RemoveFromContainer();remaining-=take;if(remaining==0)break;
             }if(remaining!=0)throw new InvalidOperationException("Irreversible partial payment");}
+            if(economy)EconomyWrite("CRAFT",state.CraftIntent,"DEBITED",new {Before=craftBefore,After=Contents()});
             var output=ItemManager.CreateByName("stonehatchet",recipe.AmountToCreate);
             if(output==null || !output.MoveToContainer(npc.inventory.containerMain,-1,false))throw new InvalidOperationException("Paid craft output failure");
+            if(economy)EconomyWrite("CRAFT",state.CraftIntent,"OUTPUT_CREATED",new {Output=Row(output),After=Contents()});
             CompleteCraft();
         }
         private void PollCraft() {
@@ -348,6 +462,7 @@ namespace Oxide.Plugins
             foreach(var cost in recipe.Ingredients)if(debits.Where(d=>d.Shortname==cost.Shortname).Sum(d=>d.Consumed)!=cost.Amount)throw Balance("Exact native payment mismatch");
             craft=new {Mechanism=craftMechanism,Before=craftBefore,After=after,Output=Row(product),Debits=debits,NativeAccepted=craftMechanism=="NATIVE_PLAYER_CRAFT",QueueAfter=npc.inventory.crafting==null?0:npc.inventory.crafting.queue.Count,Elapsed=Time.realtimeSinceStartup-craftTime};
             Log("CRAFT",craft);state.ProductUid=product.uid.Value.ToString();state.CraftStatus="CRAFTED";
+            if(economy)EconomyWrite("CRAFT",state.CraftIntent,"COMMITTED",craft);
             CraftGuard("stonehatchet","DUPLICATE_INTENT");
             if((product.parent!=npc.inventory.containerBelt && !product.MoveToContainer(npc.inventory.containerBelt,1,false)) || !Activate(product.uid))throw new InvalidOperationException("Exact crafted UID native equip failed");
             state.ActiveUid=state.ProductUid;ActivationNegatives();state.Goal="EQUIP";holdTime=Time.realtimeSinceStartup+2;
@@ -418,6 +533,7 @@ namespace Oxide.Plugins
             }
             if(snapshot.Inventory.Count(i=>i.Uid==snapshot.State.ToolUid && i.Shortname=="rock")!=1 || snapshot.Inventory.Select(i=>i.Shortname).Distinct().Count()!=snapshot.Inventory.Count)
                 throw new InvalidOperationException("Invalid original tool or duplicate product");
+            if(economy)PrepareEconomy(snapshot);
             // No duplicate saved actor: enableSaving=false; refuse any saved UID already in this world.
             var worldItems=ItemManager.GetAllItems().ToArray();var worldKey=Key(worldItems.Select(Row));
             var savedHeld=new Dictionary<string,NetworkableId>();
@@ -478,6 +594,7 @@ namespace Oxide.Plugins
             rock=Containers().SelectMany(c=>c.itemList).SingleOrDefault(i=>i.uid.Value.ToString()==state.ToolUid);
             product=npc.inventory.containerBelt.itemList.SingleOrDefault(i=>i.uid.Value.ToString()==state.ProductUid);
             if(rock==null || product==null || !Activate(product.uid))throw new InvalidOperationException("Restored exact selected UID unavailable");
+            if(economy)RestoreEconomy();
             restored=true;ActivationNegatives();holdTime=Time.realtimeSinceStartup+2;active=true;
             restoreAudit.Stage="COMPLETE";
             Log("RESTORE",new {State=state,Expected=snapshot.Inventory,Actual=Contents(),Equipment=Equipment(),Restored=restored});
@@ -485,21 +602,30 @@ namespace Oxide.Plugins
         private void Save() {
             if(!EquipmentValid())throw new InvalidOperationException("Cannot snapshot missing held product");
             state.Goal="COMPLETE";
+            if(economy) {
+                journal.RequireComplete();
+                economyState.InventoryHash=RustBots.EconomyJournal.Hash(Key(Contents(),false));economyState.CraftIntent=state.CraftIntent;economyState.ProductUid=state.ProductUid;
+                File.WriteAllText(Data("economy.json"),JsonConvert.SerializeObject(economyState,Formatting.Indented));
+            }
             using(var native=npc.inventory.Save(true,true))File.WriteAllBytes(Data("inventory.bin"),native.ToProtoBytes());
             File.WriteAllText(Data("state.json"),JsonConvert.SerializeObject(new Snapshot {State=state,Inventory=Contents()},Formatting.Indented));saved=true;
         }
         private void Finish(string status,string reason) {
             if(finished)return;finished=true;active=false;
+            // Terminal result: release the exclusive writer before Windows evidence readers open it.
+            if(journal!=null){journal.Dispose();journal=null;}
             var containers=npc==null?new object[0]:Containers().Select((c,i)=>(object)new {Role=i==0?"MAIN":i==1?"BELT":"WEAR",Uid=c.uid.Value.ToString(),OwnerNetId=Id(c.GetOwnerPlayer()),Capacity=c.capacity}).ToArray();
             var result=new {RunId=token,Status=status,Reason=reason,Mode=mode,Actor=actor,State=state,SpawnCount=spawns,ManualPositionWrites=0,
                 Backend="RustNavMeshAgent/RustNav",Containers=containers,Normalization=normalization,StarterKit=starter,Inventory=Contents(),Equipment=npc==null?null:Equipment(),
                 EquipmentChecks=equipmentChecks,Recipe=recipe,Craft=craft,Harvests=harvests,Negatives=negatives,Samples=samples,Legs=legs,TotalTraveled=total,
                 RestoreAudit=restoreAudit,EquipmentSamples=equipmentSamples,
-                Persistence=new {Saved=saved,Restored=restored,SourcePools="NOT_IMPLEMENTED",CrashJournal="NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN",EconomicFailure=economicFailure}};
+                Economy=economy?new {WorldKey=economyState==null?null:economyState.WorldKey,State=economyState,Replays=sourceReplays,CraftReplay=economyReplay,
+                    JournalSHA256=File.Exists(Data("economy.journal"))?RustBots.EconomyJournal.HashBytes(File.ReadAllBytes(Data("economy.journal"))):null,CrashAtomic="NOT_PROVEN",CrashRecovery="OFFLINE_ONLY"}:null,
+                Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN",EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
             Puts("RUSTBOTS_RESULT "+JsonConvert.SerializeObject(result));
         }
         private void Cleanup() { if(npc!=null && !npc.IsDestroyed){npc.UpdateActiveItem(default(ItemId));npc.inventory.Strip();npc.Kill();}npc=null; }
-        private void Unload() { Cleanup(); }
+        private void Unload() { Cleanup();if(journal!=null)journal.Dispose(); }
     }
 }
