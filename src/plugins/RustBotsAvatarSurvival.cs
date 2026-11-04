@@ -10,9 +10,9 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.6")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.2.1")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
-    public class RustBotsAvatarSurvival : RustPlugin
+    public partial class RustBotsAvatarSurvival : RustPlugin
     {
         private sealed class ItemRow {
             public string Uid, Shortname, Role, ContainerUid, OwnerNetId;
@@ -110,12 +110,13 @@ namespace Oxide.Plugins
         private void Log(string kind,object value) { Puts("RUSTBOTS_AVATAR_SURVIVAL_"+kind+" "+JsonConvert.SerializeObject(value)); }
         private Exception Balance(string reason) { economicFailure=true;return new InvalidOperationException(reason); }
         private void OnEntityLoaded(BaseNetworkable entity,BaseNetworkable.LoadInfo info) {
+            HomeLoaded(entity,info);
             var e=entity as ResourceEntity;
             if(e==null || Environment.GetEnvironmentVariable("RUST_BOTS_WORLD_ECONOMY")!="1" || !info.fromDisk || !TestRoot() ||
                 info.msg==null || info.msg.baseNetworkable==null || info.msg.resource==null)return;
             diskLoaded[e]=new DiskWitness {Uid=info.msg.baseNetworkable.uid.Value.ToString(),Prefab=info.msg.baseNetworkable.prefabID,Health=info.msg.resource.health};
         }
-        private void OnEntityKill(BaseNetworkable entity) { var e=entity as ResourceEntity;if(e!=null)diskLoaded.Remove(e); }
+        private void OnEntityKill(BaseNetworkable entity) { var e=entity as ResourceEntity;if(e!=null)diskLoaded.Remove(e);var h=entity as BaseEntity;if(h!=null)homeDisk.Remove(h); }
         private EconomySource DescribeSource(ResourceEntity e,ResourceDispenser d,ItemAmount item) {
             var q=e.transform.rotation;var s=e.transform.localScale;var b=e.bounds;
             return new EconomySource {Incarnation=Guid.NewGuid().ToString("N"),SavedUid=Id(e),Prefab=e.PrefabName,Type=e.GetType().Name,Resource=item.itemDef.shortname,
@@ -134,8 +135,8 @@ namespace Oxide.Plugins
             string world=currentWorld.WorldKey();
             if(economyState==null || economyState.Schema!=2 || economyState.World==null || economyState.WorldKey!=world || economyState.ActorId!=snapshot.State.ActorId || economyState.RecipeHash!=RustBots.EconomyJournal.Hash(JsonConvert.SerializeObject(recipe)) ||
                 economyState.InventoryHash!=RustBots.EconomyJournal.Hash(Key(snapshot.Inventory,false)) || economyState.CraftIntent!=snapshot.State.CraftIntent || economyState.ProductUid!=snapshot.State.ProductUid ||
-                economyState.Sources==null || economyState.Sources.Count!=2 || economyState.Sources.Select(x=>x.Incarnation).Distinct().Count()!=2 ||
-                economyState.SnapshotHealth==null || economyState.SnapshotHealth.Count!=2 || economyState.Sources.Any(x=>!economyState.SnapshotHealth.ContainsKey(x.Incarnation)))
+                economyState.Sources==null || (firstHome?economyState.Sources.Count<2:economyState.Sources.Count!=2) || economyState.Sources.Select(x=>x.Incarnation).Distinct().Count()!=economyState.Sources.Count ||
+                economyState.SnapshotHealth==null || economyState.SnapshotHealth.Count!=economyState.Sources.Count || economyState.Sources.Any(x=>!economyState.SnapshotHealth.ContainsKey(x.Incarnation)))
                 throw new InvalidOperationException("Economy world/actor/recipe/UID binding mismatch");
             economyState.World.RequireSame(currentWorld);
             restoreInputHealth=new Dictionary<string,float>(economyState.SnapshotHealth);
@@ -193,7 +194,7 @@ namespace Oxide.Plugins
         private List<ItemRow> Contents() { return npc==null?new List<ItemRow>():Containers().SelectMany(c=>c.itemList).Where(i=>i.amount>0).Select(Row).OrderBy(i=>i.Uid,StringComparer.Ordinal).ToList(); }
         private static string Key(IEnumerable<ItemRow> rows,bool owner=true) { return JsonConvert.SerializeObject(rows.OrderBy(i=>i.Uid,StringComparer.Ordinal).Select(i=>new {i.Uid,i.Shortname,i.Amount,i.Condition,i.MaxCondition,i.Role,i.Slot,i.ContainerUid,Owner=owner?i.OwnerNetId:null})); }
         private int Quantity(string name) { return Contents().Where(i=>i.Role!="WEAR" && i.Shortname==name).Sum(i=>i.Amount); }
-        private int Required(string name) { return recipe.Ingredients.Single(i=>i.Shortname==name).Amount; }
+        private int Required(string name) { return homeGather?(homeBudget.ContainsKey(name)?homeBudget[name]:0):recipe.Ingredients.Single(i=>i.Shortname==name).Amount; }
         private bool TestRoot() {
             root=Environment.GetEnvironmentVariable("RUST_BOTS_TEST_ROOT");token=Environment.GetEnvironmentVariable("RUST_BOTS_RUN_TOKEN");Guid guid;
             if(string.IsNullOrEmpty(root)||!Guid.TryParseExact(token,"N",out guid)||Environment.GetEnvironmentVariable("RUST_BOTS_SCENARIO")!="AVATAR_SURVIVAL")return false;
@@ -204,7 +205,9 @@ namespace Oxide.Plugins
         }
         private void OnServerInitialized() {
             if(!TestRoot()){Puts("Avatar survival inert: isolated marker/identity missing.");return;}
+            firstHome=Environment.GetEnvironmentVariable("RUST_BOTS_FIRST_HOME")=="1";
             economy=Environment.GetEnvironmentVariable("RUST_BOTS_WORLD_ECONOMY")=="1";
+            if(firstHome && !economy){Finish("BLOCKED","FirstHome requires world-bound native economy");return;}
             mode=Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1"?"RESTORE":"JOURNEY";wait=Time.realtimeSinceStartup;
             Puts("RUSTBOTS_READY RustNavMeshAgent/RustNav");
             timer.Every(0.5f,()=> { try {
@@ -247,6 +250,7 @@ namespace Oxide.Plugins
             normalization=new {Before=before,AfterStrip=Contents(),RemovedAbsent=absent};
             if(Contents().Count!=0 || !absent)throw new InvalidOperationException("Default loadout not irreversibly stripped");
             recipe=ReadRecipe("stonehatchet");if(recipe==null || !recipe.Known || recipe.Workbench!=0 || recipe.Ingredients.Count!=2 || !recipe.Ingredients.Any(i=>i.Shortname=="wood") || !recipe.Ingredients.Any(i=>i.Shortname=="stones"))throw new InvalidOperationException("Loaded recipe unsupported");
+            if(firstHome)PrepareHome();
             if(mode=="RESTORE"){Restore();return;}
             state=new StateRow {ActorId="avatar-007-"+Guid.NewGuid().ToString("N"),Goal="NEED_RESOURCE"};
             if(economy) {
@@ -293,9 +297,9 @@ namespace Oxide.Plugins
             var positive=d.containedItems.Where(i=>i.amount>0).ToArray();if(positive.Length!=1)return false;item=positive[0];
             if(economy) {
                 var profile=melee.GetGatherInfoFromIndex(d.gatherType);
-                if(!RustBots.EconomyJournal.CanSustainHarvest(item.amount,item.startAmount,e.Health(),e.MaxHealth(),profile.gatherDamage,profile.destroyFraction,Required(need)-Quantity(need)))return false;
+                if(!RustBots.EconomyJournal.CanSustainHarvest(item.amount,item.startAmount,e.Health(),e.MaxHealth(),profile.gatherDamage,profile.destroyFraction,homeGather?1:Required(need)-Quantity(need)))return false;
             }
-            return item.itemDef!=null && item.itemDef.shortname==need && item.amount>Required(need)-Quantity(need)+50 && !float.IsNaN(item.amount) && !float.IsInfinity(item.amount);
+            return item.itemDef!=null && item.itemDef.shortname==need && item.amount>(homeGather?1:Required(need)-Quantity(need))+50 && !float.IsNaN(item.amount) && !float.IsInfinity(item.amount);
         }
         private bool Approach(ResourceEntity e,out Vector3 position) {
             for(int i=0;i<24;i++) {
@@ -320,8 +324,8 @@ namespace Oxide.Plugins
         }
         private void Discover() {
             need=Quantity("wood")<Required("wood")?"wood":Quantity("stones")<Required("stones")?"stones":null;
-            if(need==null){StartCraft();return;}
-            if(discoveries++>=8)throw new InvalidOperationException("Bounded natural source discovery exhausted");
+            if(need==null){if(homeGather)HomeMaterialsReady();else StartCraft();return;}
+            if(discoveries++>=(homeGather?64:8))throw new InvalidOperationException("Bounded natural source discovery exhausted");
             foreach(var e in BaseNetworkable.serverEntities.OfType<ResourceEntity>().Where(e=>!e.IsDestroyed && (need=="wood"?e is TreeEntity:e is OreResourceEntity) && Vector3.Distance(e.transform.position,npc.transform.position)<=400)
                 .OrderBy(e=>Vector3.Distance(e.transform.position,npc.transform.position)).Take(256)) {
                 ResourceDispenser d;ItemAmount item;Vector3 approach;string id=Id(e);
@@ -367,6 +371,7 @@ namespace Oxide.Plugins
         }
         private void Sample(float time) { samples.Add(new {Time=time,Position=Point(npc.transform.position),ActorNetId=Id(npc),ActiveUid=npc.GetActiveItem()==null?null:npc.GetActiveItem().uid.Value.ToString(),Speed=agent.speed,PathStatus=agent.pathStatus.ToString(),HasPath=agent.hasPath}); }
         private void Tick() {
+            if(firstHome && HomeTick())return;
             if(npc.IsDestroyed)throw new InvalidOperationException("Avatar destroyed");float now=Time.realtimeSinceStartup;
             if(mode=="RESTORE" || state.Goal=="EQUIP") {
                 if(!EquipmentValid())throw new InvalidOperationException("Crafted native held selection lost");equipmentChecks++;
@@ -381,7 +386,7 @@ namespace Oxide.Plugins
             total+=step;previous=npc.transform.position;previousTime=now;Sample(now);
             if(now>deadline)throw new InvalidOperationException("Bounded gameplay deadline");
             if(state.Goal=="CRAFT"){PollCraft();return;}
-            if(npc.GetActiveItem()!=rock || npc.GetHeldEntity()!=melee)throw new InvalidOperationException("Real gathering tool selection lost");
+            if(npc.GetActiveItem()!=(homeGather?product:rock) || npc.GetHeldEntity()!=melee)throw new InvalidOperationException("Real gathering tool selection lost");
             if(navigating) {
                 float distance=Vector3.Distance(npc.transform.position,target);
                 if(distance<=1.05f) {
@@ -402,19 +407,20 @@ namespace Oxide.Plugins
             hit.PointStart=npc.transform.position;hit.PointEnd=source.transform.position;return hit;
         }
         private void Harvest() {
+            var gatheringTool=homeGather?product:rock;
             ResourceDispenser d;ItemAmount item;float distance;
             if(!Eligible(source,out d,out item) || d!=dispenser || item!=pool || !Reach(out distance)) {
                 rejected.Add(sourceId);navigating=false;Discover();return;
             }
-            if(rock.condition<=0 || rock.GetOwnerPlayer()!=npc)throw new InvalidOperationException("Owned tool broken/missing");
+            if(gatheringTool.condition<=0 || gatheringTool.GetOwnerPlayer()!=npc)throw new InvalidOperationException("Owned tool broken/missing");
             if(economy && !sourceRecords.ContainsKey(source)) {
                 var record=DescribeSource(source,dispenser,pool);sourceRecords.Add(source,record);economyState.Sources.Add(record);
             }
-            var before=Contents();float p=pool.amount,f=dispenser.fractionRemaining,c=rock.condition,h=source.Health();int quantity=Quantity(need);
+            var before=Contents();float p=pool.amount,f=dispenser.fractionRemaining,c=gatheringTool.condition,h=source.Health();int quantity=Quantity(need);
             var drops=new HashSet<DroppedItem>(BaseNetworkable.serverEntities.OfType<DroppedItem>());
             HitInfo hit=null;int adapterCredit=0;
             string action=economy?"gather-"+Guid.NewGuid().ToString("N"):null;
-            if(economy)EconomyWrite("GATHER",action,"PREPARED",new {Source=sourceRecords[source],ActorId=state.ActorId,Before=before,ToolUid=state.ToolUid,Condition=c});
+            if(economy)EconomyWrite("GATHER",action,"PREPARED",new {Source=sourceRecords[source],ActorId=state.ActorId,Before=before,ToolUid=gatheringTool.uid.Value.ToString(),Condition=c});
             if(gatherMechanism!="SERVER_ACCOUNTED_TOOL") {
                 hit=Hit(true);source.OnAttacked(hit);
                 int gained=Quantity(need)-quantity;
@@ -443,11 +449,12 @@ namespace Oxide.Plugins
             var receipt=new {SourceId=sourceId,Resource=need,Provenance="NATURAL",SourceType=source.GetType().Name,SourcePrefab=source.PrefabName,
                 SourcePosition=Point(source.transform.position),Actor=Point(npc.transform.position),ActorNetId=Id(npc),Time=Time.realtimeSinceStartup,
                 Mechanism=gatherMechanism,Amount=delta,PoolBefore=p,PoolAfter=pool.amount,FractionBefore=f,FractionAfter=dispenser.fractionRemaining,HealthBefore=h,HealthAfter=source.Health(),
-                ToolUid=state.ToolUid,ToolConditionBefore=c,ToolConditionAfter=rock.condition,InitiatorPlayer=hit!=null && hit.InitiatorPlayer==npc,
+                ToolUid=gatheringTool.uid.Value.ToString(),ToolConditionBefore=c,ToolConditionAfter=gatheringTool.condition,InitiatorPlayer=hit!=null && hit.InitiatorPlayer==npc,
                 WeaponOwned=melee.GetOwnerPlayer()==npc,DidGather=hit!=null && hit.DidGather,AdapterCredit=adapterCredit,NativeProbeZero=nativeProbeZero,
                 Distance=distance,LineOfSight=true,Grounded=true,NewDrops=newDrops,Before=before,After=Contents()};
             harvests.Add(receipt);Log("HARVEST",receipt);
-            if(delta<=0 || p-pool.amount<delta-0.01f || rock.condition>=c || newDrops!=0 || source.IsDestroyed)throw Balance("Native resource/tool conservation failed");
+            if(firstHome)homeOperations.Add(new {Kind="GATHER",Before=before,After=Contents(),Harvest=receipt});
+            if(delta<=0 || p-pool.amount<delta-0.01f || gatheringTool.condition>=c || newDrops!=0 || source.IsDestroyed)throw Balance("Native resource/tool conservation failed");
             if(economy) {
                 if(gatherMechanism!="NATIVE_PLAYER_GATHER" || adapterCredit!=0)throw Balance("Economy requires native gather");
                 var record=sourceRecords[source];record.ExpectedPool=pool.amount;record.ExpectedFraction=dispenser.fractionRemaining;record.Health=source.Health();
@@ -513,10 +520,12 @@ namespace Oxide.Plugins
             foreach(var cost in recipe.Ingredients)if(debits.Where(d=>d.Shortname==cost.Shortname).Sum(d=>d.Consumed)!=cost.Amount)throw Balance("Exact native payment mismatch");
             craft=new {Mechanism=craftMechanism,Before=craftBefore,After=after,Output=Row(product),Debits=debits,NativeAccepted=craftMechanism=="NATIVE_PLAYER_CRAFT",QueueAfter=npc.inventory.crafting==null?0:npc.inventory.crafting.queue.Count,Elapsed=Time.realtimeSinceStartup-craftTime};
             Log("CRAFT",craft);state.ProductUid=product.uid.Value.ToString();state.CraftStatus="CRAFTED";
+            if(firstHome)homeOperations.Add(new {Kind="CRAFT_TOOL",Before=craftBefore,After=after,Costs=recipe.Ingredients,Output=Row(product),Intent=state.CraftIntent});
             if(economy)EconomyWrite("CRAFT",state.CraftIntent,"COMMITTED",craft);
             CraftGuard("stonehatchet","DUPLICATE_INTENT");
             if((product.parent!=npc.inventory.containerBelt && !product.MoveToContainer(npc.inventory.containerBelt,1,false)) || !Activate(product.uid))throw new InvalidOperationException("Exact crafted UID native equip failed");
             state.ActiveUid=state.ProductUid;ActivationNegatives();state.Goal="EQUIP";holdTime=Time.realtimeSinceStartup+2;
+            if(firstHome)BeginHomeGather();
         }
         private bool Activate(ItemId uid) {
             var item=npc.inventory.containerBelt.FindItemByUID(uid);
@@ -557,7 +566,7 @@ namespace Oxide.Plugins
         }
         private bool OldEntitiesUnchanged() { return oldEntities.All(p=>p.Value==JsonConvert.SerializeObject(EntityRow(p.Key))); }
         private object[] HeldItems() {
-            return Containers().SelectMany(c=>c.itemList).Where(i=>i.info.shortname=="rock" || i.info.shortname=="stonehatchet").OrderBy(i=>i.uid.Value).Select(i=>{
+            return Containers().SelectMany(c=>c.itemList).Where(i=>i.info.shortname=="rock" || i.info.shortname=="stonehatchet" || firstHome && HomeHoldable(i.info.shortname)).OrderBy(i=>i.uid.Value).Select(i=>{
                 var h=i.GetHeldEntity() as HeldEntity;
                 if(h==null || h.IsDestroyed || h.GetItem()!=i || h.GetOwnerPlayer()!=npc || h.GetParentEntity()!=npc || oldEntities.ContainsKey(h.net.ID))
                     throw new InvalidOperationException("Missing, aliased or foreign native restored held entity");
@@ -579,12 +588,13 @@ namespace Oxide.Plugins
                 if(!ulong.TryParse(row.Uid,out uid) || uid==0 || row.Amount<=0 || row.Slot<0 || !occupied.Add(row.Role+":"+row.Slot) ||
                     float.IsNaN(row.Condition) || float.IsInfinity(row.Condition) || float.IsNaN(row.MaxCondition) || float.IsInfinity(row.MaxCondition) ||
                     row.Condition<0 || row.MaxCondition<row.Condition ||
-                    !((row.Role=="BELT" && row.Amount==1 && row.Condition>0 && (row.Shortname=="rock" || row.Shortname=="stonehatchet")) ||
+                    !((row.Role=="BELT" && row.Amount==1 && ((row.Condition>0 && (row.Shortname=="rock" || row.Shortname=="stonehatchet")) || firstHome && (row.Shortname=="building.planner" || row.Shortname=="hammer"))) ||
                       (row.Role=="MAIN" && (row.Shortname=="wood" || row.Shortname=="stones"))))throw new InvalidOperationException("Unsupported native snapshot row");
             }
             if(snapshot.Inventory.Count(i=>i.Uid==snapshot.State.ToolUid && i.Shortname=="rock")!=1 || snapshot.Inventory.Select(i=>i.Shortname).Distinct().Count()!=snapshot.Inventory.Count)
                 throw new InvalidOperationException("Invalid original tool or duplicate product");
             if(economy)PrepareEconomy(snapshot);
+            if(firstHome)HomeRestorePreflight(snapshot);
             // No duplicate saved actor: enableSaving=false; refuse any saved UID already in this world.
             var worldItems=ItemManager.GetAllItems().ToArray();var worldKey=Key(worldItems.Select(Row));
             var savedHeld=new Dictionary<string,NetworkableId>();
@@ -611,14 +621,14 @@ namespace Oxide.Plugins
                 foreach(var c in cs)foreach(var i in c.contents ?? new List<ProtoBuf.Item>()) {
                     if(i.heldEntity.Value==0)continue;
                     var row=nativeRows.Single(x=>x.Uid==i.UID.Value.ToString());
-                    if(row.Role!="BELT" || (row.Shortname!="rock" && row.Shortname!="stonehatchet") || oldEntities.ContainsKey(i.heldEntity))throw new InvalidOperationException("Unsupported/duplicate held reference");
+                    if(row.Role!="BELT" || (!HomeHoldable(row.Shortname) || !firstHome && row.Shortname!="rock" && row.Shortname!="stonehatchet") || oldEntities.ContainsKey(i.heldEntity))throw new InvalidOperationException("Unsupported/duplicate held reference");
                     var before=EntityRow(i.heldEntity);oldEntities.Add(i.heldEntity,JsonConvert.SerializeObject(before));
                     savedHeld.Add(row.Uid,i.heldEntity);
                     Log("OLD_HELD_REFERENCE",new {ItemUid=row.Uid,SavedHeldNetId=i.heldEntity.Value.ToString(),Resolved=before});
                     // Item.Load copies this into EntityRef. Never allow it to resolve/parent a current-world alias.
                     i.heldEntity=default(NetworkableId);
                 }
-                if(oldEntities.Count!=2)throw new InvalidOperationException("Incomplete source held references");
+                if(oldEntities.Count!=(firstHome?snapshot.Inventory.Count(i=>HomeHoldable(i.Shortname)):2))throw new InvalidOperationException("Incomplete source held references");
                 restoreAudit.PreLoadHeldZero=cs.All(c=>(c.contents ?? new List<ProtoBuf.Item>()).All(i=>i.heldEntity.Value==0));
                 restoreAudit.Stage="NATIVE_LOAD";restoreAudit.LoadCalled=true;
                 npc.inventory.Load(native);
@@ -636,7 +646,7 @@ namespace Oxide.Plugins
             restoreAudit.ForeignItemsUnchanged=worldKey==Key(afterItems.Where(i=>!snapshot.Inventory.Any(row=>row.Uid==i.uid.Value.ToString())).Select(Row));
             restoreAudit.ForeignEntitiesUnchanged=OldEntitiesUnchanged();restoreAudit.Loaded=Contents();
             restoreAudit.SourceUnchanged=sourceState.SequenceEqual(File.ReadAllBytes(Data("state.json"))) && sourceBinary.SequenceEqual(File.ReadAllBytes(Data("inventory.bin")));
-            foreach(var c in new[] {"rock","stonehatchet"}) {
+            foreach(var c in firstHome?new[] {"rock","stonehatchet","building.planner","hammer"}:new[] {"rock","stonehatchet"}) {
                 var row=snapshot.Inventory.Single(i=>i.Shortname==c);var old=savedHeld[row.Uid];
                 restoreAudit.TransientRefs.Add(new {ItemUid=row.Uid,SavedHeldNetId=old.Value.ToString(),Before=JsonConvert.DeserializeObject(oldEntities[old]),After=EntityRow(old)});
             }
@@ -648,6 +658,7 @@ namespace Oxide.Plugins
             if(economy)RestoreEconomy();
             restored=true;ActivationNegatives();holdTime=Time.realtimeSinceStartup+2;active=true;
             restoreAudit.Stage="COMPLETE";
+            if(firstHome){previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+900;Sample(previousTime);HomeRestoreRebind();}
             Log("RESTORE",new {State=state,Expected=snapshot.Inventory,Actual=Contents(),Equipment=Equipment(),Restored=restored});
         }
         private void Save() {
@@ -661,10 +672,15 @@ namespace Oxide.Plugins
                 File.WriteAllText(Data("economy.json"),JsonConvert.SerializeObject(economyState,Formatting.Indented));
             }
             using(var native=npc.inventory.Save(true,true))File.WriteAllBytes(Data("inventory.bin"),native.ToProtoBytes());
-            File.WriteAllText(Data("state.json"),JsonConvert.SerializeObject(new Snapshot {State=state,Inventory=Contents()},Formatting.Indented));saved=true;
+            File.WriteAllText(Data("state.json"),JsonConvert.SerializeObject(new Snapshot {State=state,Inventory=Contents()},Formatting.Indented));
+            if(firstHome)HomeSave();
+            saved=true;
         }
         private void Finish(string status,string reason) {
             if(finished)return;finished=true;active=false;
+            if(firstHome && status=="PARTIAL" && homeUpkeep!=null && homeIntent==null && !saved && equipmentChecks>=3) {
+                try{if(Activate(product.uid))Save();}catch(Exception ex){Log("HOME_CHECKPOINT_REFUSED",ex.Message);}
+            }
             // Terminal result: release the exclusive writer before Windows evidence readers open it.
             if(journal!=null){journal.Dispose();journal=null;}
             var containers=npc==null?new object[0]:Containers().Select((c,i)=>(object)new {Role=i==0?"MAIN":i==1?"BELT":"WEAR",Uid=c.uid.Value.ToString(),OwnerNetId=Id(c.GetOwnerPlayer()),Capacity=c.capacity}).ToArray();
@@ -672,9 +688,10 @@ namespace Oxide.Plugins
                 Backend="RustNavMeshAgent/RustNav",Containers=containers,Normalization=normalization,StarterKit=starter,Inventory=Contents(),Equipment=npc==null?null:Equipment(),
                 EquipmentChecks=equipmentChecks,Recipe=recipe,Craft=craft,Harvests=harvests,Negatives=negatives,Samples=samples,Legs=legs,TotalTraveled=total,
                 RestoreAudit=restoreAudit,EquipmentSamples=equipmentSamples,
+                FirstHome=HomeResult(),
                 Economy=economy?new {WorldKey=economyState==null?null:economyState.WorldKey,World=currentWorld,MapKey=currentWorld==null?null:currentWorld.MapKey(),State=economyState,InputSnapshotHealth=restoreInputHealth,Replays=sourceReplays,CraftReplay=economyReplay,
                     JournalSHA256=File.Exists(Data("economy.journal"))?RustBots.EconomyJournal.HashBytes(File.ReadAllBytes(Data("economy.journal"))):null,CrashAtomic="NOT_PROVEN",CrashRecovery="OFFLINE_ONLY"}:null,
-                Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN",EconomicFailure=economicFailure}};
+                Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN" || firstHome && saved && !economicFailure,EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
             Puts("RUSTBOTS_RESULT "+JsonConvert.SerializeObject(result));
         }
