@@ -84,3 +84,5 @@ Delivery inventory: `git status --short --untracked-files=all`, `git diff --cach
 Команды проверки: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1`; journey `scripts/Invoke-NavigationProbe.ps1 -AvatarSurvival` (два запуска); restore `scripts/Invoke-NavigationProbe.ps1 -AvatarSurvival -RestoreFrom d5f2cbcbecd54c2dae6b772d327b8e3a` (один). Все через тот же PowerShell runner, без ручных команд владельца. Final Test-All receipt: `.local/audit/avatar007/tests-final.txt`.
 
 PERSISTENT_WORLD_SOURCE_POOLS и CRASH_ATOMIC_CRAFT — **NOT_IMPLEMENTED**: обязательный следующий gate — durable per-world depletion/transaction journal с idempotent reconciliation. PLAYER_RENDERED_ANIMATION, native weapon damage/PvP, raids/clans, real Steam session и production50–100 — **NOT_VERIFIED / вне scope**. Восстановление logical avatar не означает непрерывную native Steam-сессию. Следующий Goal не начинался.
+
+Отдельная задача [008 — Held Restore Lifecycle](../RUST-BOTS-008-HELD-RESTORE-LIFECYCLE/RESULT.md) содержит последующие доказательства восстановления. Исторический результат 007 остаётся PARTIAL; его raw evidence не изменялся.

@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.1")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.2")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public class RustBotsAvatarSurvival : RustPlugin
     {
@@ -25,6 +25,15 @@ namespace Oxide.Plugins
         private sealed class Snapshot {
             public StateRow State;
             public List<ItemRow> Inventory;
+        }
+        private sealed class RestoreRow {
+            public string Stage="VALIDATE";
+            public bool LoadCalled, IncomingAbsent, PreLoadHeldZero, SourceUnchanged, ForeignItemsUnchanged, ForeignEntitiesUnchanged, HeldStable;
+            public int ItemsBefore, ItemsAfter, ParentPasses;
+            public List<ItemRow> SourceInventory, NativeBefore, Loaded;
+            public List<object> TransientRefs=new List<object>();
+            public object[] HeldItems;
+            public object[] SourceContainers;
         }
         private sealed class Cost { public string Shortname; public int Amount; }
         private sealed class RecipeRow {
@@ -45,6 +54,10 @@ namespace Oxide.Plugins
         private StateRow state;
         private RecipeRow recipe;
         private object actor, normalization, craft;
+        private RestoreRow restoreAudit;
+        private readonly List<object> equipmentSamples=new List<object>();
+        private readonly Dictionary<NetworkableId,string> oldEntities=new Dictionary<NetworkableId,string>();
+        private string stableHeld;
         private List<ItemRow> craftBefore;
         private readonly List<ItemRow> starter = new List<ItemRow>();
         private readonly List<object> samples = new List<object>(), legs = new List<object>(), harvests = new List<object>(), negatives = new List<object>();
@@ -101,7 +114,7 @@ namespace Oxide.Plugins
             Vector3 spawn;if(!FindSpawn(out spawn)){Finish("BLOCKED","No safe RustNav spawn");return;}
             npc=GameManager.server.CreateEntity(prefab,spawn,Quaternion.identity,true) as NPCPlayer;
             if(npc==null){Finish("BLOCKED","Roam creation failed");return;}
-            spawns++;npc.enableSaving=false;npc.Spawn();timer.Once(1f,()=>{try{Setup();}catch(Exception ex){PrintError(ex.ToString());Finish("PARTIAL","Setup: "+ex.Message);}});
+            spawns++;npc.enableSaving=false;npc.Spawn();timer.Once(1f,()=>{try{Setup();}catch(Exception ex){PrintError(ex.ToString());Finish(economicFailure?"FAILED":"PARTIAL","Setup: "+ex.Message);}});
         }
         private void Setup() {
             agent=npc.GetComponent<RustNavMeshAgent>();var fsm=npc.GetComponent<FSMComponent>();var brain=npc.GetComponent<BaseAIBrain>();
@@ -208,6 +221,10 @@ namespace Oxide.Plugins
             if(npc.IsDestroyed)throw new InvalidOperationException("Avatar destroyed");float now=Time.realtimeSinceStartup;
             if(mode=="RESTORE" || state.Goal=="EQUIP") {
                 if(!EquipmentValid())throw new InvalidOperationException("Crafted native held selection lost");equipmentChecks++;
+                if(mode=="RESTORE") {
+                    if(JsonConvert.SerializeObject(HeldItems())!=stableHeld || !OldEntitiesUnchanged())throw Balance("Restored held changed or old entity mutated");
+                    equipmentSamples.Add(new {Time=now,Equipment=Equipment()});
+                }
                 if(now>=holdTime){Save();Finish("GREEN",mode=="RESTORE"?"Independent exact PlayerInventory/identity/active held restore":"Natural survival, paid crafted UID native held by one avatar");}return;
             }
             float dt=now-previousTime,step=Vector3.Distance(previous,npc.transform.position);
@@ -363,37 +380,106 @@ namespace Oxide.Plugins
                 if(accepted || !unchanged)throw Balance("Activation guard mutation");
             }
         }
+        private object EntityRow(NetworkableId id) {
+            var e=BaseNetworkable.serverEntities.Find(id);var h=e as HeldEntity;
+            var entity=e as BaseEntity;var item=entity==null?null:entity.GetItem();
+            var parent=e==null?null:e.GetParentEntity();var owner=h==null?null:h.GetOwnerPlayer();
+            return new {Found=e!=null,NetId=id.Value.ToString(),Type=e==null?null:e.GetType().Name,Prefab=e==null?null:e.PrefabName,
+                ParentNetId=Id(parent),OwnerNetId=Id(owner),OwnerResolution=h==null?"UNKNOWN_NOT_HELD":"NATIVE_HELD_OWNER",ItemUid=item==null?null:item.uid.Value.ToString(),
+                OwnerItemUid=h==null?null:h.ownerItemUID.Value.ToString(),IsDestroyed=e!=null && e.IsDestroyed,
+                InTestWorld=e!=null,ProbeOwned=e!=null && (e==npc || parent==npc || owner==npc)};
+        }
+        private bool OldEntitiesUnchanged() { return oldEntities.All(p=>p.Value==JsonConvert.SerializeObject(EntityRow(p.Key))); }
+        private object[] HeldItems() {
+            return Containers().SelectMany(c=>c.itemList).Where(i=>i.info.shortname=="rock" || i.info.shortname=="stonehatchet").OrderBy(i=>i.uid.Value).Select(i=>{
+                var h=i.GetHeldEntity() as HeldEntity;
+                if(h==null || h.IsDestroyed || h.GetItem()!=i || h.GetOwnerPlayer()!=npc || h.GetParentEntity()!=npc || oldEntities.ContainsKey(h.net.ID))
+                    throw new InvalidOperationException("Missing, aliased or foreign native restored held entity");
+                return (object)new {Uid=i.uid.Value.ToString(),HeldNetId=Id(h),HeldItemUid=h.GetItem().uid.Value.ToString(),OwnerNetId=Id(h.GetOwnerPlayer()),ParentNetId=Id(h.GetParentEntity())};
+            }).ToArray();
+        }
         private void Restore() {
+            restoreAudit=new RestoreRow();
+            byte[] sourceState=File.ReadAllBytes(Data("state.json")),sourceBinary=File.ReadAllBytes(Data("inventory.bin"));
             var snapshot=JsonConvert.DeserializeObject<Snapshot>(File.ReadAllText(Data("state.json")));
             if(snapshot==null || snapshot.State==null || snapshot.Inventory==null || snapshot.State.Goal!="COMPLETE" || snapshot.State.CraftStatus!="CRAFTED" ||
-                !snapshot.State.ActorId.StartsWith("avatar-007-",StringComparison.Ordinal) || snapshot.State.ProductUid!=snapshot.State.ActiveUid ||
+                snapshot.State.ActorId==null || !snapshot.State.ActorId.StartsWith("avatar-007-",StringComparison.Ordinal) || string.IsNullOrEmpty(snapshot.State.CraftIntent) || snapshot.State.ProductUid!=snapshot.State.ActiveUid ||
                 snapshot.Inventory.Select(i=>i.Uid).Distinct().Count()!=snapshot.Inventory.Count || snapshot.Inventory.Count(i=>i.Uid==snapshot.State.ProductUid && i.Shortname=="stonehatchet" && i.Role=="BELT")!=1)
                 throw new InvalidOperationException("Invalid avatar snapshot before inventory mutation");
+            if(state!=null || restored || spawns!=1 || Contents().Count!=0)throw new InvalidOperationException("Duplicate logical actor or nonempty restore target");
+            var occupied=new HashSet<string>();
+            foreach(var row in snapshot.Inventory) {
+                ulong uid;
+                if(!ulong.TryParse(row.Uid,out uid) || uid==0 || row.Amount<=0 || row.Slot<0 || !occupied.Add(row.Role+":"+row.Slot) ||
+                    float.IsNaN(row.Condition) || float.IsInfinity(row.Condition) || float.IsNaN(row.MaxCondition) || float.IsInfinity(row.MaxCondition) ||
+                    row.Condition<0 || row.MaxCondition<row.Condition ||
+                    !((row.Role=="BELT" && row.Amount==1 && row.Condition>0 && (row.Shortname=="rock" || row.Shortname=="stonehatchet")) ||
+                      (row.Role=="MAIN" && (row.Shortname=="wood" || row.Shortname=="stones"))))throw new InvalidOperationException("Unsupported native snapshot row");
+            }
+            if(snapshot.Inventory.Count(i=>i.Uid==snapshot.State.ToolUid && i.Shortname=="rock")!=1 || snapshot.Inventory.Select(i=>i.Shortname).Distinct().Count()!=snapshot.Inventory.Count)
+                throw new InvalidOperationException("Invalid original tool or duplicate product");
             // No duplicate saved actor: enableSaving=false; refuse any saved UID already in this world.
-            if(ItemManager.GetAllItems().Any(i=>snapshot.Inventory.Any(row=>row.Uid==i.uid.Value.ToString())))throw new InvalidOperationException("Snapshot item UID already exists in world");
-            using(var native=ProtoBuf.PlayerInventory.Deserialize(File.ReadAllBytes(Data("inventory.bin")))) {
+            var worldItems=ItemManager.GetAllItems().ToArray();var worldKey=Key(worldItems.Select(Row));
+            var savedHeld=new Dictionary<string,NetworkableId>();
+            if(worldItems.Any(i=>snapshot.Inventory.Any(row=>row.Uid==i.uid.Value.ToString())))throw new InvalidOperationException("Snapshot item UID already exists in world");
+            restoreAudit.IncomingAbsent=true;restoreAudit.ItemsBefore=worldItems.Length;restoreAudit.SourceInventory=snapshot.Inventory;
+            using(var native=ProtoBuf.PlayerInventory.Deserialize(sourceBinary)) {
                 if(native.invMain==null || native.invBelt==null || native.invWear==null)throw new InvalidOperationException("Incomplete native inventory snapshot");
                 var nativeRows=new List<ItemRow>();var cs=new[] {native.invMain,native.invBelt,native.invWear};
+                if(cs.Select(c=>c.UID.Value).Distinct().Count()!=3 || cs.Any(c=>c.UID.Value==0))throw new InvalidOperationException("Duplicate/zero container UID");
+                var worldContainers=new List<ItemContainer>();
+                foreach(var provider in BaseNetworkable.serverEntities.OfType<IInventoryProvider>())provider.GetAllInventories(worldContainers);
+                worldContainers.AddRange(worldItems.SelectMany(i=>new[] {i.parent,i.contents}));
+                if(worldContainers.Where(c=>c!=null && !Containers().Contains(c)).Any(c=>cs.Any(saved=>saved.UID.Value==c.uid.Value)))throw new InvalidOperationException("Snapshot container UID already exists");
+                for(int r=0;r<cs.Length;r++)if(cs[r].slots!=Containers()[r].capacity)throw new InvalidOperationException("Native container capacity differs");
+                restoreAudit.SourceContainers=cs.Select((c,r)=>(object)new {Role=r==0?"MAIN":r==1?"BELT":"WEAR",Uid=c.UID.Value.ToString(),Capacity=c.slots}).ToArray();
                 for(int r=0;r<cs.Length;r++)foreach(var i in cs[r].contents ?? new List<ProtoBuf.Item>()) {
                     var def=ItemManager.FindItemDefinition(i.itemid);
-                    if(def==null || i.worldEntity.Value!=0 || (i.heldEntity.Value!=0 && BaseNetworkable.serverEntities.Find(i.heldEntity)!=null) ||
-                        (i.contents!=null && i.contents.contents!=null && i.contents.contents.Count!=0))throw new InvalidOperationException("Foreign transient entity or unsupported nested snapshot");
+                    if(def==null || i.worldEntity.Value!=0 || i.slot<0 || i.slot>=cs[r].slots || i.contents!=null)throw new InvalidOperationException("Foreign transient entity or unsupported nested snapshot");
                     nativeRows.Add(new ItemRow {Uid=i.UID.Value.ToString(),Shortname=def.shortname,Amount=i.amount,Slot=i.slot,Role=r==0?"MAIN":r==1?"BELT":"WEAR",
                         ContainerUid=cs[r].UID.Value.ToString(),Condition=i.conditionData==null?0:i.conditionData.condition,MaxCondition=i.conditionData==null?0:i.conditionData.maxCondition});
                 }
                 if(Key(nativeRows,false)!=Key(snapshot.Inventory,false))throw new InvalidOperationException("Native binary snapshot differs before Load");
-                // Held net IDs are transient. Keep Item UID/slot untouched; native owner lifecycle recreates held entities.
-                foreach(var c in cs)foreach(var i in c.contents ?? new List<ProtoBuf.Item>())i.heldEntity=default(NetworkableId);
+                restoreAudit.NativeBefore=nativeRows;restoreAudit.Stage="DETACH_EPHEMERAL_COPY";
+                foreach(var c in cs)foreach(var i in c.contents ?? new List<ProtoBuf.Item>()) {
+                    if(i.heldEntity.Value==0)continue;
+                    var row=nativeRows.Single(x=>x.Uid==i.UID.Value.ToString());
+                    if(row.Role!="BELT" || (row.Shortname!="rock" && row.Shortname!="stonehatchet") || oldEntities.ContainsKey(i.heldEntity))throw new InvalidOperationException("Unsupported/duplicate held reference");
+                    var before=EntityRow(i.heldEntity);oldEntities.Add(i.heldEntity,JsonConvert.SerializeObject(before));
+                    savedHeld.Add(row.Uid,i.heldEntity);
+                    Log("OLD_HELD_REFERENCE",new {ItemUid=row.Uid,SavedHeldNetId=i.heldEntity.Value.ToString(),Resolved=before});
+                    // Item.Load copies this into EntityRef. Never allow it to resolve/parent a current-world alias.
+                    i.heldEntity=default(NetworkableId);
+                }
+                if(oldEntities.Count!=2)throw new InvalidOperationException("Incomplete source held references");
+                restoreAudit.PreLoadHeldZero=cs.All(c=>(c.contents ?? new List<ProtoBuf.Item>()).All(i=>i.heldEntity.Value==0));
+                restoreAudit.Stage="NATIVE_LOAD";restoreAudit.LoadCalled=true;
                 npc.inventory.Load(native);
             }
             state=snapshot.State;
             if(Key(snapshot.Inventory,false)!=Key(Contents(),false))throw new InvalidOperationException("Native UID/amount/condition/slot restore differs");
+            if(Containers().Any(c=>c.GetOwnerPlayer()!=npc) || Containers().SelectMany(c=>c.itemList).Any(i=>i.GetOwnerPlayer()!=npc))throw new InvalidOperationException("Restored inventory owner differs");
             // Load assigns raw parent fields. Replay the installed SetParent lifecycle through its public native helper.
+            restoreAudit.Stage="NATIVE_PARENT";
             foreach(var i in Containers().SelectMany(c=>c.itemList).ToArray())i.RecalulateParentEntity(false);
+            stableHeld=JsonConvert.SerializeObject(HeldItems());restoreAudit.ParentPasses++;
+            foreach(var i in Containers().SelectMany(c=>c.itemList).ToArray())i.RecalulateParentEntity(false);
+            restoreAudit.ParentPasses++;restoreAudit.HeldItems=HeldItems();restoreAudit.HeldStable=stableHeld==JsonConvert.SerializeObject(restoreAudit.HeldItems);
+            var afterItems=ItemManager.GetAllItems().ToArray();restoreAudit.ItemsAfter=afterItems.Length;
+            restoreAudit.ForeignItemsUnchanged=worldKey==Key(afterItems.Where(i=>!snapshot.Inventory.Any(row=>row.Uid==i.uid.Value.ToString())).Select(Row));
+            restoreAudit.ForeignEntitiesUnchanged=OldEntitiesUnchanged();restoreAudit.Loaded=Contents();
+            restoreAudit.SourceUnchanged=sourceState.SequenceEqual(File.ReadAllBytes(Data("state.json"))) && sourceBinary.SequenceEqual(File.ReadAllBytes(Data("inventory.bin")));
+            foreach(var c in new[] {"rock","stonehatchet"}) {
+                var row=snapshot.Inventory.Single(i=>i.Shortname==c);var old=savedHeld[row.Uid];
+                restoreAudit.TransientRefs.Add(new {ItemUid=row.Uid,SavedHeldNetId=old.Value.ToString(),Before=JsonConvert.DeserializeObject(oldEntities[old]),After=EntityRow(old)});
+            }
+            if(!restoreAudit.HeldStable || !restoreAudit.ForeignItemsUnchanged || !restoreAudit.ForeignEntitiesUnchanged || !restoreAudit.SourceUnchanged || afterItems.Length-worldItems.Length!=snapshot.Inventory.Count)
+                throw Balance("Native restore item/entity conservation failure");
             rock=Containers().SelectMany(c=>c.itemList).SingleOrDefault(i=>i.uid.Value.ToString()==state.ToolUid);
             product=npc.inventory.containerBelt.itemList.SingleOrDefault(i=>i.uid.Value.ToString()==state.ProductUid);
             if(rock==null || product==null || !Activate(product.uid))throw new InvalidOperationException("Restored exact selected UID unavailable");
             restored=true;ActivationNegatives();holdTime=Time.realtimeSinceStartup+2;active=true;
+            restoreAudit.Stage="COMPLETE";
             Log("RESTORE",new {State=state,Expected=snapshot.Inventory,Actual=Contents(),Equipment=Equipment(),Restored=restored});
         }
         private void Save() {
@@ -404,11 +490,12 @@ namespace Oxide.Plugins
         }
         private void Finish(string status,string reason) {
             if(finished)return;finished=true;active=false;
-            var containers=npc==null?new object[0]:Containers().Select((c,i)=>(object)new {Role=i==0?"MAIN":i==1?"BELT":"WEAR",Uid=c.uid.Value.ToString(),OwnerNetId=Id(c.GetOwnerPlayer())}).ToArray();
+            var containers=npc==null?new object[0]:Containers().Select((c,i)=>(object)new {Role=i==0?"MAIN":i==1?"BELT":"WEAR",Uid=c.uid.Value.ToString(),OwnerNetId=Id(c.GetOwnerPlayer()),Capacity=c.capacity}).ToArray();
             var result=new {RunId=token,Status=status,Reason=reason,Mode=mode,Actor=actor,State=state,SpawnCount=spawns,ManualPositionWrites=0,
                 Backend="RustNavMeshAgent/RustNav",Containers=containers,Normalization=normalization,StarterKit=starter,Inventory=Contents(),Equipment=npc==null?null:Equipment(),
                 EquipmentChecks=equipmentChecks,Recipe=recipe,Craft=craft,Harvests=harvests,Negatives=negatives,Samples=samples,Legs=legs,TotalTraveled=total,
-                Persistence=new {Saved=saved,Restored=restored,SourcePools="NOT_IMPLEMENTED",CrashJournal="NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN"}};
+                RestoreAudit=restoreAudit,EquipmentSamples=equipmentSamples,
+                Persistence=new {Saved=saved,Restored=restored,SourcePools="NOT_IMPLEMENTED",CrashJournal="NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN",EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
             Puts("RUSTBOTS_RESULT "+JsonConvert.SerializeObject(result));
         }

@@ -29,6 +29,7 @@ function Assert-AvatarSurvivalEquipment($n) {
 }
 function Assert-AvatarSurvivalResult($n) {
     if($n.Status -notin @('GREEN','PARTIAL','BLOCKED','FAILED')){throw 'Invalid bridge status'}
+    if($n.Conservation.EconomicFailure -eq $true -and $n.Status -ne 'FAILED'){throw 'Economic failure cannot be PARTIAL/GREEN'}
     if($n.Status -ne 'GREEN'){return}
     Assert-AvatarActor $n
     if($n.Actor.Type -ne 'ScientistNPC' -or $n.ManualPositionWrites -ne 0 -or $n.State.ActorId -notmatch '^avatar-007-[0-9a-f]{32}$' -or
@@ -53,6 +54,7 @@ function Assert-AvatarSurvivalResult($n) {
     }
     if($n.Mode -eq 'RESTORE') {
         if(-not $n.Persistence.Restored -or @($n.Harvests).Count -ne 0 -or $null -ne $n.Craft -or @($n.StarterKit).Count -ne 0){throw 'Restore replayed gameplay'}
+        Assert-AvatarSurvivalRestore $n
         return
     }
     if($n.Mode -ne 'JOURNEY' -or @($n.StarterKit).Count -ne 1 -or $n.StarterKit[0].Shortname -ne 'rock' -or $n.StarterKit[0].Uid -ne $n.State.ToolUid){throw 'Unaccounted starter kit'}
@@ -135,6 +137,50 @@ function Assert-AvatarSurvivalRestart($prior,$now) {
     if($now.Status -ne 'GREEN'){return}
     if($now.Mode -ne 'RESTORE' -or ($prior.State|ConvertTo-Json -Compress) -cne ($now.State|ConvertTo-Json -Compress) -or
         (Get-AvatarSurvivalKey $prior.Inventory) -cne (Get-AvatarSurvivalKey $now.Inventory)){throw 'Native restart identity/UID/condition/slot mismatch'}
+    if((Get-AvatarSurvivalContainerKey $prior.Containers) -cne (Get-AvatarSurvivalContainerKey $now.Containers)){throw 'Native restart containers differ'}
+    Assert-AvatarSurvivalRestore $now
+}
+function Get-AvatarSurvivalContainerKey($containers) {
+    if(@($containers).Count -ne 3 -or (@($containers.Role|Sort-Object) -join ',') -cne 'BELT,MAIN,WEAR' -or
+        @($containers.Uid|Select-Object -Unique).Count -ne 3){throw 'Incomplete native containers'}
+    (@(foreach($c in $containers){Assert-AvatarUid $c.Uid;$c.Role+'|'+$c.Uid})|Sort-Object) -join ','
+}
+function Assert-AvatarSurvivalRestore($n) {
+    $a=$n.RestoreAudit
+    if((Get-AvatarSurvivalContainerKey $a.SourceContainers) -cne (Get-AvatarSurvivalContainerKey $n.Containers)){throw 'Loaded native containers differ'}
+    foreach($c in $a.SourceContainers) {
+        if($c.Capacity -le 0 -or $c.Capacity -ne ($n.Containers|Where-Object Role -eq $c.Role).Capacity){throw 'Loaded container capacity differs'}
+    }
+    if($a.Stage -ne 'COMPLETE' -or -not $a.LoadCalled -or -not $a.IncomingAbsent -or -not $a.PreLoadHeldZero -or -not $a.SourceUnchanged -or
+        -not $a.ForeignItemsUnchanged -or -not $a.ForeignEntitiesUnchanged -or $a.ParentPasses -ne 2 -or -not $a.HeldStable -or
+        $a.ItemsAfter-$a.ItemsBefore -ne @($n.Inventory).Count){throw 'Unverified native restore lifecycle/conservation'}
+    foreach($rows in @($a.SourceInventory,$a.NativeBefore,$a.Loaded)) {
+        if((Get-AvatarSurvivalKey $rows) -cne (Get-AvatarSurvivalKey $n.Inventory)){throw 'Restore ledger differs'}
+    }
+    $refs=@($a.TransientRefs);$held=@($a.HeldItems)
+    $expected=@($n.State.ToolUid,$n.State.ProductUid)|Sort-Object
+    if($refs.Count -ne 2 -or @($refs.ItemUid|Select-Object -Unique).Count -ne 2 -or
+        @($refs.SavedHeldNetId|Select-Object -Unique).Count -ne 2 -or
+        $held.Count -ne 2 -or @($held.HeldNetId|Select-Object -Unique).Count -ne 2 -or
+        (@($refs.ItemUid|Sort-Object) -join ',') -cne ($expected -join ',') -or
+        (@($held.Uid|Sort-Object) -join ',') -cne ($expected -join ',')){throw 'Incomplete/duplicate native held ledger'}
+    foreach($ref in $refs) {
+        Assert-AvatarUid $ref.SavedHeldNetId
+        if(($ref.Before|ConvertTo-Json -Depth 8 -Compress) -cne ($ref.After|ConvertTo-Json -Depth 8 -Compress) -or
+            $ref.Before.NetId -ne $ref.SavedHeldNetId -or @($n.Inventory|Where-Object Uid -eq $ref.ItemUid).Count -ne 1){throw 'Old entity mutated or unbound reference'}
+    }
+    foreach($h in $held) {
+        Assert-AvatarUid $h.HeldNetId
+        if($h.HeldNetId -in $refs.SavedHeldNetId -or $h.HeldItemUid -ne $h.Uid -or $h.OwnerNetId -ne $n.Actor.NetId -or
+            $h.ParentNetId -ne $n.Actor.NetId -or @($n.Inventory|Where-Object {$_.Uid -eq $h.Uid -and $_.Role -eq 'BELT'}).Count -ne 1){throw 'Stale/foreign/missing native held entity'}
+    }
+    if(($held|Where-Object Uid -eq $n.State.ProductUid).HeldNetId -ne $n.Equipment.HeldNetId){throw 'Active held differs from loaded product'}
+    $samples=@($n.EquipmentSamples)
+    if($samples.Count -lt 3 -or $samples[-1].Time-$samples[0].Time -lt 1){throw 'Missing native tick observations'}
+    for($j=0;$j -lt $samples.Count;$j++) {
+        if(($samples[$j].Equipment|ConvertTo-Json -Compress) -cne ($n.Equipment|ConvertTo-Json -Compress) -or
+            ($j -gt 0 -and $samples[$j].Time -le $samples[$j-1].Time)){throw 'Native active/held changed across ticks'}
+    }
 }
 function Assert-AvatarSurvivalBinding($p,$proof,$key,$gen,$state,$sav,$inv,$actor) {
     if($p.Status -ne 'GREEN' -or $p.Shutdown -ne 'GRACEFUL' -or -not $p.OwnedProcessAbsent -or -not $p.PortsReleased -or -not $p.FirewallRemoved -or
