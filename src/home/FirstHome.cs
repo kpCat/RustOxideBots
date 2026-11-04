@@ -36,7 +36,10 @@ namespace Oxide.Plugins
         private const int HomeJourneySeconds=2100,HomeSmokeSeconds=900,HomeBuildReserve=360,HomeGatherReserve=1350;
         private bool firstHome,homeGather,homeRestored,homeNavComplete,homeSmoke;
         private string homeAdmissionReason,homeObservedPhase;
-        private bool homeTcAttempted;
+        private bool homeTcAttempted,homeDoorAttempted;
+        private readonly List<object> homeApproaches=new List<object>(),homeTileStates=new List<object>();
+        private float homeTilesDeadline;
+        private bool homeTilesPending;
         private readonly List<object> homeTcPreviews=new List<object>();
         private sealed class HomeTcDiagnostic {
             public bool OnTerrain,NativePreview,NativeLos,InsideObject,DeployBlocked,CanBuild,HookDenied,Unchanged,LegacyUnchanged;
@@ -433,6 +436,10 @@ namespace Oxide.Plugins
                     throw new InvalidOperationException("PLACEMENT_TC_BLOCKED native preview; see HOME_TC_PREVIEW; no paid attempt");
                 homeTcAttempted=true;
             }
+            if(role=="DOOR") {
+                if(homeDoorAttempted)throw new InvalidOperationException("Door paid retry forbidden");
+                homeDoorAttempted=true;
+            }
             var costs=definition=="DOOR" || definition=="TC"?new List<Cost>{new Cost {Shortname=tool,Amount=1}}:HomeCosts(c.defaultGrade.CostToBuild((BuildingGrade.Enum)(-1)));
             var before=Contents();HomeStartPayment("BUILD_"+role,new {Target=Point(position),Socket=socket==null?null:socket.socketName,Costs=costs});
             Log("HOME_NATIVE_ATTEMPT",new {Role=role,Definition=definition,Target=Point(t.position),RayOrigin=Point(t.ray.origin),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Owner=npc.userID.ToString(),Time=Time.realtimeSinceStartup});
@@ -482,10 +489,92 @@ namespace Oxide.Plugins
             if(homeStep==7){var wall=homeEntities["DOORWAY"];var socket=HomeSocket(wall,"/doorway-female/1");HomePlace("DOOR","DOOR","door.hinged.wood",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;homeWait=Time.realtimeSinceStartup+8;homePhase="VERIFY";return;}
         }
         private Vector3 HomeBuildStand() {
-            // TC is inside the footprint: approach the open doorway physically within its native 4m reach.
-            Vector3 offset=homeStep==1 || homeStep==5?new Vector3(0,0,3):homeStep==2?new Vector3(3,0,0):homeStep==3?new Vector3(-3,0,0):homeStep==6?new Vector3(0,0,-2.25f):new Vector3(0,0,-3);
-            var p=homeSite+homeRotation*offset;p.y=TerrainMeta.HeightMap.GetHeight(p);Vector3 foot;
-            if(!NavSample(p,out foot))throw new InvalidOperationException("No physical building approach");return foot;
+            var foundation=homeEntities["FOUNDATION"];BaseEntity parent=foundation;Socket_Base socket=null;
+            string definition;Vector3 place;
+            if(homeStep<=4) {
+                int[] suffix={3,4,2,1};socket=HomeSocket(foundation,"/wall-female/"+suffix[homeStep-1]);
+                definition=homeStep==4?"DOORWAY":"WALL";place=foundation.transform.TransformPoint(socket.position);
+            }else if(homeStep==5) {
+                parent=homeEntities["WALL_N"];socket=HomeRoofSocket(parent);definition="ROOF";place=parent.transform.TransformPoint(socket.position);
+            }else if(homeStep==6) {
+                definition="TC";place=foundation.transform.TransformPoint(new Vector3(0.65f,0,0.6f));
+            }else {
+                definition="DOOR";parent=homeEntities["DOORWAY"];socket=HomeSocket(parent,"/doorway-female/1");place=parent.transform.TransformPoint(socket.position);
+            }
+            var c=homeDefinitions[definition];Vector3 foot;
+            // Observe the exact old composite at the post-TC boundary before evaluating new candidates.
+            if(homeStep==7)HomeLegacyApproach();
+            if(HomeApproach(npc.transform.position,"CURRENT",c,parent,place,out foot))return npc.transform.position;
+            var outward=place-foundation.transform.position;outward.y=0;
+            if(homeStep>=6)outward=homeEntities["DOORWAY"].transform.position-foundation.transform.position;
+            outward.y=0;if(outward.sqrMagnitude<0.01f)outward=foundation.transform.forward;outward.Normalize();
+            var edge=homeStep>=6?homeEntities["DOORWAY"].transform.position:place;
+            foreach(float distance in new[] {0.75f,1.25f,1.75f,2.25f})foreach(float side in new[] {0f,-0.6f,0.6f}) {
+                var candidate=edge+outward*distance+Vector3.Cross(Vector3.up,outward)*side;
+                candidate.y=TerrainMeta.HeightMap.GetHeight(candidate);
+                if(HomeApproach(candidate,"GEOMETRY",c,parent,place,out foot))return foot;
+            }
+            throw new InvalidOperationException("No physical building approach; see HOME_APPROACH subreasons step="+homeStep);
+        }
+        private object HomeCollider(Collider c) {
+            var e=c.GetComponentInParent<BaseEntity>();
+            return new {Name=c.name,Type=c.GetType().Name,Layer=c.gameObject.layer,Entity=Id(e),Owner=e==null?null:e.OwnerID.ToString(),Prefab=e==null?null:e.PrefabName,
+                Self=e==npc,Own=e!=null && homeEntities.Values.Contains(e as DecayEntity),Center=Point(c.bounds.center),Extents=Point(c.bounds.extents),c.enabled,c.isTrigger};
+        }
+        private void HomeLegacyApproach() {
+            var input=homeSite+homeRotation*new Vector3(0,0,-3);input.y=TerrainMeta.HeightMap.GetHeight(input);NavHit hit;
+            bool sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(input),out hit,new Vector3(2.5f,3,2.5f),false);
+            var p=sampled?hit.position.Value:input;RaycastHit ray;
+            bool rayHit=Physics.Raycast(p+Vector3.up*4,Vector3.down,out ray,8,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore);
+            var foot=rayHit?ray.point+Vector3.up*0.05f:p;
+            var overlaps=Physics.OverlapCapsule(foot+Vector3.up*0.57f,foot+Vector3.up*1.55f,0.45f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore);
+            float terrainDelta=rayHit?ray.point.y-TerrainMeta.HeightMap.GetHeight(ray.point):0,delta=rayHit?ray.point.y-p.y:0,water=WaterLevel.GetWaterSurface(foot,true,true,null)-foot.y;
+            string reason=!sampled?"NAV_SAMPLE":!rayHit?"RAY_MISS":Mathf.Abs(delta)>1?"RAY_SAMPLE_HEIGHT":Mathf.Abs(terrainDelta)>0.8f?"RAY_TERRAIN_HEIGHT":ray.normal.y<0.85f?"SLOPE":water>0.15f?"WATER":overlaps.Length>0?"CAPSULE_OVERLAP":"ACCEPTED";
+            var receipt=new {Label="LEGACY_COMPOSITE",Step=homeStep,Actor=Point(npc.transform.position),ActorNetId=Id(npc),Input=Point(input),Extents=new[] {2.5f,3,2.5f},Sampled=sampled,NavPoint=sampled?Point(p):null,
+                Pending=RustNavigation.Instance.HasPendingTiles(),OnNavmesh=agent.isOnNavMesh,Reason=reason,RayHit=rayHit,FirstHit=rayHit?HomeCollider(ray.collider):null,RayPoint=rayHit?Point(ray.point):null,
+                Normal=rayHit?Point(ray.normal):null,SampleDelta=delta,TerrainDelta=terrainDelta,WaterDepth=water,Overlaps=overlaps.Select(HomeCollider).ToArray(),Time=Time.realtimeSinceStartup};
+            homeApproaches.Add(receipt);Log("HOME_APPROACH_LEGACY",receipt);
+        }
+        private bool HomeApproach(Vector3 input,string label,Construction c,BaseEntity parent,Vector3 place,out Vector3 foot) {
+            bool pending=RustNavigation.Instance.HasPendingTiles();NavHit nav;
+            var extents=new Vector3(0.25f,0.5f,0.25f);
+            bool sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(input),out nav,extents,false);
+            var p=sampled?nav.position.Value:input;
+            // A current stand is evaluated at the real actor, never moved to a sampled point.
+            var surfacePoint=label=="CURRENT"?input:p;var foundation=homeEntities["FOUNDATION"];
+            var hits=Physics.RaycastAll(surfacePoint+Vector3.up*4,Vector3.down,8,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).OrderBy(x=>x.distance).ToArray();
+            var floors=hits.Where(x=>x.collider.GetComponentInParent<BaseEntity>()!=npc && Mathf.Abs(x.point.y-surfacePoint.y)<=0.25f &&
+                (x.collider.GetComponentInParent<BaseEntity>()==foundation || x.collider.GetComponentInParent<BaseEntity>()==null && Mathf.Abs(x.point.y-TerrainMeta.HeightMap.GetHeight(x.point))<=0.1f)).ToArray();
+            bool supported=floors.Length>0;var floor=supported?floors[0]:default(RaycastHit);
+            foot=supported?floor.point+Vector3.up*0.05f:surfacePoint;
+            var actualFoot=label=="CURRENT"?input:foot;
+            var overlaps=Physics.OverlapCapsule(actualFoot+Vector3.up*0.5f,actualFoot+Vector3.up*1.3f,0.5f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore);
+            var blocking=overlaps.Where(x=>x.GetComponentInParent<BaseEntity>()!=npc &&
+                !(supported && x.GetComponentInParent<BaseEntity>()==foundation && x.bounds.max.y<=actualFoot.y+0.03f)).ToArray();
+            bool ownBlock=blocking.Any(x=>homeEntities.Values.Contains(x.GetComponentInParent<BaseEntity>() as DecayEntity));
+            float water=WaterLevel.GetWaterSurface(actualFoot,true,true,null)-actualFoot.y;
+            var eye=actualFoot+(npc.eyes.position-npc.transform.position);var delta=place-eye;
+            var sight=Physics.RaycastAll(eye,delta.normalized,delta.magnitude,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore);
+            bool los=!sight.Any(x=>x.collider.GetComponentInParent<BaseEntity>()!=npc && x.collider.GetComponentInParent<BaseEntity>()!=parent);
+            float reach=Vector3.Distance(eye,place);
+            bool permission=npc.CanBuild() && npc.CanBuild(place,homeRotation,c.bounds);
+            var path=new RustNavMeshPath();bool calculated=false,complete=false;
+            string reason=pending?"PENDING_TILES":!sampled?"NAV_SAMPLE":!supported?"GROUND_TERRAIN":floor.normal.y<0.85f?"SLOPE":
+                Mathf.Abs(p.y-floor.point.y)>0.25f?"OWN_FOUNDATION_FLOOR":water>0.15f?"WATER":blocking.Length>0?(ownBlock?"CAPSULE_OWN_STRUCTURE":"CAPSULE_FOREIGN"):
+                reach>c.maxplaceDistance?"DOOR_RANGE":!los?"DOOR_LOS":!permission?"PERMISSION":!agent.isOnNavMesh?"NAV_SAMPLE":"ACCEPTED";
+            if(reason=="ACCEPTED") {
+                calculated=agent.CalculatePath(actualFoot,path);complete=calculated && path.status==NavMeshPathStatus.PathComplete;
+                if(!complete)reason="PATH_PARTIAL";
+                else if(Time.realtimeSinceStartup+Mathf.Ceil(path.GetPathLength()/3+30)>deadline)reason="TIME_BUDGET";
+            }
+            var receipt=new {Step=homeStep,Label=label,ActorNetId=Id(npc),Actor=Point(npc.transform.position),Eyes=Point(npc.eyes.position),Candidate=Point(input),NavInput=Point(input),NavExtents=Point(extents),Sampled=sampled,NavPoint=sampled?Point(p):null,Foot=Point(actualFoot),
+                Foundation=Id(foundation),FoundationPosition=Point(foundation.transform.position),FoundationRotation=Point(foundation.transform.rotation.eulerAngles),Doorway=homeEntities.ContainsKey("DOORWAY")?Point(homeEntities["DOORWAY"].transform.position):null,
+                Surface=!supported?null:floor.collider.GetComponentInParent<BaseEntity>()==foundation?"OWN_FOUNDATION_FLOOR":"GROUND_TERRAIN",SurfaceEntity=supported?Id(floor.collider.GetComponentInParent<BaseEntity>()):null,
+                SampleDelta=supported?p.y-floor.point.y:0,TerrainDelta=supported?floor.point.y-TerrainMeta.HeightMap.GetHeight(floor.point):0,NormalY=supported?floor.normal.y:0,
+                RayHits=hits.Select(x=>new {Collider=HomeCollider(x.collider),Position=Point(x.point),Normal=Point(x.normal),x.distance}).ToArray(),WaterDepth=water,Overlaps=overlaps.Select(HomeCollider).ToArray(),Blocking=blocking.Select(HomeCollider).ToArray(),CapsuleClear=blocking.Length==0,
+                Pending=pending,OnNavmesh=agent.isOnNavMesh,AgentPath=agent.pathStatus.ToString(),PathCalculated=calculated,Path=calculated?path.status.ToString():"NOT_CALCULATED",PathLength=complete?path.GetPathLength():0,
+                CanBuild=permission,Los=los,LosHits=sight.Select(x=>HomeCollider(x.collider)).ToArray(),Reach=reach,MaxReach=c.maxplaceDistance,Place=Point(place),Parent=Id(parent),Accepted=reason=="ACCEPTED",Reason=reason,Time=Time.realtimeSinceStartup};
+            homeApproaches.Add(receipt);Log("HOME_APPROACH",receipt);return reason=="ACCEPTED";
         }
         private HomeEntityRow HomeRow(string role,DecayEntity e) {
             var block=e as BuildingBlock;var group=e.GetBuilding();var q=e.transform.rotation;var links=e.GetEntityLinks(true);
@@ -517,8 +606,9 @@ namespace Oxide.Plugins
             if(!tc.IsAuthed(npc))tc.AddPlayer(npc,npc.userID);
             if(!tc.IsAuthed(npc) || !tc.CanBuild(npc) || homeEntities["FOUNDATION"].GetBuildingPrivilege()!=tc)throw new InvalidOperationException("Native TC bot authorization/privilege failed");
             var costs=new List<ItemAmount>();tc.CalculateUpkeepCostAmounts(costs);var rate=HomeCosts(costs);
+            var nativeRate=costs.Select(x=>new {Shortname=x.itemDef.shortname,Amount=x.amount}).ToArray();
             float beforeMinutes=tc.GetProtectedMinutes(true),period=tc.CalculateUpkeepPeriodMinutes();
-            if(period<=0 || rate.Any(x=>Quantity(x.Shortname)<x.Amount))throw new InvalidOperationException("Native upkeep reserve insufficient");
+            if(period<=0 || beforeMinutes!=0 || rate.Any(x=>Quantity(x.Shortname)<x.Amount))throw new InvalidOperationException("Native upkeep reserve insufficient or unaccounted protection");
             var before=Contents();var moved=new List<ItemRow>();
             HomeStartPayment("UPKEEP_TRANSFER",new {Rate=rate,Period=period,BeforeMinutes=beforeMinutes});
             foreach(var item in Containers().Take(2).SelectMany(x=>x.itemList).Where(x=>rate.Any(c=>c.Shortname==x.info.shortname)).ToArray()) {
@@ -528,8 +618,9 @@ namespace Oxide.Plugins
             var after=Contents();var tcItems=HomeTcItems();
             if(moved.Count==0 || moved.Any(x=>after.Any(y=>y.Uid==x.Uid) || !tcItems.Any(y=>y.Uid==x.Uid && y.Shortname==x.Shortname && y.Amount==x.Amount)))throw Balance("Native upkeep transfer UID mismatch");
             float minutes=tc.GetProtectedMinutes(true);
-            if(float.IsNaN(minutes) || float.IsInfinity(minutes) || minutes<=beforeMinutes || minutes<period)throw new InvalidOperationException("Native TC protection period not proven");
-            homeUpkeep=new {Before=before,After=after,Transferred=moved,TcInventory=tcItems,Rate=rate,Period=period,MinutesBefore=beforeMinutes,MinutesAfter=minutes,Authed=tc.IsAuthed(npc),Privilege=true};
+            homeUpkeep=new {Before=before,After=after,Transferred=moved,TcInventory=tcItems,Rate=rate,NativeRate=nativeRate,Period=period,MinutesBefore=beforeMinutes,MinutesAfter=minutes,Authed=tc.IsAuthed(npc),Privilege=true,DecayEnabled=ConVar.Decay.upkeep};
+            Log("HOME_UPKEEP_MEASURED",homeUpkeep);
+            if(float.IsNaN(minutes) || float.IsInfinity(minutes) || minutes<=beforeMinutes || minutes<60)throw new InvalidOperationException("Native TC protection >=60 minutes not proven");
             HomeWriteIntent("COMMITTED",homeUpkeep);homeIntent=null;Log("HOME_UPKEEP",homeUpkeep);
             Activate(product.uid);homePhase="NAV_WAIT";homeWait=Time.realtimeSinceStartup+30;
         }
@@ -662,15 +753,32 @@ namespace Oxide.Plugins
                 if(HomeArrived(now))homePhase=homePhase=="RESTORE_TRAVEL"?"NAV_WAIT":"BUILD";
                 if(homePhase=="NAV_WAIT")homeWait=now+30;return true;
             }
-            if(homePhase=="BUILD"){HomeBuildStep();if(homePhase=="BUILD"){homePhase="BUILD_WAIT";homeWait=now+2;}return true;}
+            if(homePhase=="BUILD"){
+                HomeBuildStep();
+                if(homePhase=="BUILD") {
+                    homePhase="BUILD_WAIT";homeWait=now+2;homeTilesDeadline=now+30;homeTilesPending=false;
+                    var built=homeEntities.Values.Select(x=>x.WorldSpaceBounds().ToBounds()).ToArray();var bounds=built[0];
+                    foreach(var b in built)bounds.Encapsulate(b);
+                    bool before=RustNavigation.Instance.HasPendingTiles();RustNavigation.Instance.RebuildTilesInBounds(bounds,false);
+                    var tiles=new {Step=homeStep,Event="REBUILD_REQUEST",Before=before,After=RustNavigation.Instance.HasPendingTiles(),Center=Point(bounds.center),Size=Point(bounds.size),Time=now};
+                    homeTileStates.Add(tiles);Log("HOME_TILES",tiles);
+                }return true;
+            }
             if(homePhase=="BUILD_WAIT") {
-                if(now<homeWait || RustNavigation.Instance.HasPendingTiles())return true;
+                bool pending=RustNavigation.Instance.HasPendingTiles();
+                if(homeTilesPending!=pending || now>=homeWait && !pending) {
+                    var tiles=new {Step=homeStep,Event="READINESS",Pending=pending,Deadline=homeTilesDeadline,Time=now};homeTileStates.Add(tiles);Log("HOME_TILES",tiles);homeTilesPending=pending;
+                }
+                if(pending){if(now>=homeTilesDeadline)throw new InvalidOperationException("PENDING_TILES_TIMEOUT step="+homeStep);return true;}
+                if(now<homeWait)return true;
                 var stand=HomeBuildStand();if(Vector3.Distance(npc.transform.position,stand)<=0.3f)homePhase="BUILD";else{HomeMove(stand,"BUILD_"+homeStep);homePhase="BUILD_TRAVEL";}return true;
             }
             if(homePhase=="VERIFY"){if(now>=homeWait)HomeAuthorizeAndUpkeep();return true;}
             if(homePhase=="NAV_WAIT") {
                 if(RustNavigation.Instance.HasPendingTiles()){if(now>=homeWait)throw new InvalidOperationException("Native home rebuild pending timeout");return true;}
                 if(!HomeInterior(out homeInside)){if(now>=homeWait)throw new InvalidOperationException("HOME_NAV native floor/clearance/sample unavailable after rebuild");return true;}
+                // Door placement may have used a proven current stand closer than the original site stand.
+                homeOutside=npc.transform.position;
                 HomeReadPortal();HomeOpenDoor(true);homePhase="DOOR_WAIT";homeWait=now+1.5f;return true;
             }
             if(homePhase=="DOOR_WAIT") {
@@ -697,7 +805,7 @@ namespace Oxide.Plugins
             return true;
         }
         private object HomeResult() {
-            return !firstHome?null:new {Schema=1,Stage=homePhase,DiagnosticOnly=homeSmoke,Fixture=homeFixture,NativePlacements=homePlacements,TcPreviews=homeTcPreviews,Phases=homePhases,Schedule=new {JourneySeconds=HomeJourneySeconds,SmokeSeconds=HomeSmokeSeconds,BuildReserve=HomeBuildReserve,GatherReserve=HomeGatherReserve},AdmissionReason=homeAdmissionReason,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
+            return !firstHome?null:new {Schema=1,Stage=homePhase,DiagnosticOnly=homeSmoke,Fixture=homeFixture,NativePlacements=homePlacements,TcPreviews=homeTcPreviews,Approaches=homeApproaches,Tiles=homeTileStates,Phases=homePhases,Schedule=new {JourneySeconds=HomeJourneySeconds,SmokeSeconds=HomeSmokeSeconds,BuildReserve=HomeBuildReserve,GatherReserve=HomeGatherReserve},AdmissionReason=homeAdmissionReason,Placement="SERVER_ACCOUNTED_BUILD",Site=homeSiteReceipt,RejectedSites=homeSites,Budget=homeBudget,Recipes=homeRecipes,GradeCosts=homeGradeCosts,
                 Operations=homeOperations,ToolSwitches=homeToolSwitches,Home=homeEntities.Count==8?DescribeHome():null,PartialEntities=homeEntities.Select(x=>HomeRow(x.Key,x.Value)).ToArray(),
                 Decay=new {Enabled=ConVar.Decay.upkeep,Scale=ConVar.Decay.scale,WoodDuration=ConVar.Decay.duration_wood},
                 TcAuthorization=homeTcAuthorization,Upkeep=homeUpkeep,Portal=homePortal,Navigation=homeNav,NavigationComplete=homeNavComplete,CrossedIn=homeCrossedIn,CrossedOut=homeCrossedOut,Restored=homeRestored,Rebind=homeRebind,

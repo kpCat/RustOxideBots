@@ -1,5 +1,60 @@
 #Requires -Version 5.1
 . (Join-Path $PSScriptRoot 'EconomyValidation.ps1')
+function Assert-FirstHomeApproach($a) {
+    if(-not $a.Reason -or $a.Reason -notin @('ACCEPTED','NAV_SAMPLE','GROUND_TERRAIN','OWN_FOUNDATION_FLOOR','SLOPE','WATER','CAPSULE_FOREIGN','CAPSULE_OWN_STRUCTURE','PATH_PARTIAL','PENDING_TILES_TIMEOUT','PENDING_TILES','DOOR_LOS','DOOR_RANGE','PERMISSION','TIME_BUDGET')){throw 'Missing/unknown home approach subreason'}
+    Assert-AvatarUid $a.ActorNetId
+    foreach($field in @('Actor','Candidate')){if(@($a.$field).Count -ne 3){throw 'Missing approach coordinates'};foreach($v in $a.$field){$null=Get-AvatarNumber $v 'approach coordinate'}}
+    if($a.Accepted -ne $true){if($a.Reason -eq 'ACCEPTED'){throw 'Rejected candidate labelled accepted'};return}
+    if($a.Reason -ne 'ACCEPTED' -or $a.Sampled -ne $true -or $a.Pending -ne $false -or $a.OnNavmesh -ne $true -or
+        $a.Surface -notin @('GROUND_TERRAIN','OWN_FOUNDATION_FLOOR') -or $a.CapsuleClear -ne $true -or
+        $a.PathCalculated -ne $true -or $a.Path -ne 'PathComplete' -or $a.CanBuild -ne $true -or $a.Los -ne $true){throw 'Unproven physical/native complete approach'}
+    foreach($field in @('NavPoint','Foot')){if(@($a.$field).Count -ne 3){throw 'Missing sampled position'};foreach($v in $a.$field){$null=Get-AvatarNumber $v 'sample coordinate'}}
+    if([Math]::Abs((Get-AvatarNumber $a.SampleDelta 'nav floor delta')) -gt 0.25 -or
+        (Get-AvatarNumber $a.NormalY 'floor normal') -lt 0.85 -or (Get-AvatarNumber $a.WaterDepth 'water depth') -gt 0.15 -or
+        (Get-AvatarNumber $a.PathLength 'actual path length') -lt 0 -or
+        (Get-AvatarNumber $a.Reach 'placement reach') -gt (Get-AvatarNumber $a.MaxReach 'native placement range')){throw 'Unsafe sampled floor/range/path'}
+    if($a.Surface -eq 'OWN_FOUNDATION_FLOOR'){Assert-AvatarUid $a.SurfaceEntity}
+    elseif([Math]::Abs((Get-AvatarNumber $a.TerrainDelta 'terrain floor delta')) -gt 0.1){throw 'Nonterrain support claimed as terrain'}
+}
+function Assert-FirstHomeDoorPlacement($placements,$door,[string]$doorway) {
+    $rows=@($placements|Where-Object Role -eq 'DOOR')
+    if($rows.Count -ne 1){throw 'Door must have exactly one paid native placement'}
+    $p=$rows[0]
+    if($p.NativeCall -cne 'Planner.DoBuild(Construction.Target,Construction)' -or $p.Entity -ne $door.NetId -or
+        $door.Type -ne 'Door' -or $p.Parent -ne $doorway -or -not $p.Socket -or -not $p.Socket.EndsWith('/doorway-female/1') -or
+        $door.Registered -ne $true -or $door.Saving -ne $true -or $door.Support -ne $true -or (Get-AvatarNumber $door.Health 'door health') -le 0){throw 'Fake/unbound native door'}
+    Assert-FirstHomePayment ([pscustomobject]@{Before=$p.Before;After=$p.After;Costs=@([pscustomobject]@{Shortname='door.hinged.wood';Amount=1});Output=$null})
+}
+function Assert-FirstHomeUpkeep($u) {
+    $minutes=Get-AvatarNumber $u.MinutesAfter 'native protection';$before=Get-AvatarNumber $u.MinutesBefore 'prior protection';$period=Get-AvatarNumber $u.Period 'native upkeep period'
+    if($u.Authed -ne $true -or $u.Privilege -ne $true -or $u.DecayEnabled -ne $true -or $minutes -lt 60 -or $before -ne 0 -or $period -le 0 -or
+        @($u.Transferred).Count -eq 0 -or @($u.NativeRate).Count -eq 0){throw 'Unpaid/insufficient native upkeep'}
+    foreach($c in $u.NativeRate){if(-not $c.Shortname -or (Get-AvatarNumber $c.Amount 'native upkeep cost') -le 0){throw 'Unknown native upkeep cost'}}
+    if((Get-FirstHomeEconomicKey $u.Before) -cne (Get-FirstHomeEconomicKey @(@($u.After)+@($u.TcInventory))) -or
+        (Get-FirstHomeEconomicKey $u.Transferred) -cne (Get-FirstHomeEconomicKey $u.TcInventory)){throw 'Upkeep transfer lost/replaced/credited UID'}
+}
+function Assert-FirstHomeApproaches($h,[string]$actor) {
+    $legacy=@($h.Approaches|Where-Object Label -eq 'LEGACY_COMPOSITE')
+    foreach($a in $legacy) {
+        if($a.Step -ne 7 -or $a.ActorNetId -ne $actor -or $a.Reason -notin @('NAV_SAMPLE','RAY_MISS','RAY_SAMPLE_HEIGHT','RAY_TERRAIN_HEIGHT','SLOPE','WATER','CAPSULE_OVERLAP','ACCEPTED') -or
+            $a.Sampled -notin @($true,$false) -or $a.RayHit -notin @($true,$false) -or @($a.Actor).Count -ne 3 -or @($a.Input).Count -ne 3 -or
+            ($a.Sampled -and @($a.NavPoint).Count -ne 3)){throw 'Missing/unbound legacy composite subreason'}
+        foreach($v in @($a.Actor)+@($a.Input)+@($a.NavPoint)){$null=Get-AvatarNumber $v 'legacy coordinate'}
+        $expected=if(-not $a.Sampled){'NAV_SAMPLE'}elseif(-not $a.RayHit){'RAY_MISS'}else{
+            $delta=Get-AvatarNumber $a.SampleDelta 'legacy sample delta';$terrain=Get-AvatarNumber $a.TerrainDelta 'legacy terrain delta'
+            if(@($a.Normal).Count -ne 3){throw 'Missing legacy ray normal'}
+            $normal=Get-AvatarNumber $a.Normal[1] 'legacy normal';$water=Get-AvatarNumber $a.WaterDepth 'legacy water'
+            if([Math]::Abs($delta) -gt 1){'RAY_SAMPLE_HEIGHT'}elseif([Math]::Abs($terrain) -gt 0.8){'RAY_TERRAIN_HEIGHT'}elseif($normal -lt 0.85){'SLOPE'}elseif($water -gt 0.15){'WATER'}elseif(@($a.Overlaps).Count){'CAPSULE_OVERLAP'}else{'ACCEPTED'}
+        }
+        if($a.Reason -ne $expected){throw 'Legacy reason contradicts measured subchecks'}
+    }
+    foreach($a in @($h.Approaches|Where-Object {$_.Label -ne 'LEGACY_COMPOSITE'})) {
+        Assert-FirstHomeApproach $a
+        if($a.ActorNetId -ne $actor){throw 'Approach belongs to a different actor'}
+    }
+    if($h.NavigationComplete -and @($h.Approaches|Where-Object {$_.Step -eq 7 -and $_.Accepted -eq $true}).Count -ne 1 -and -not $h.Restored){throw 'Door has no proven physical placement stand'}
+    if($h.NavigationComplete -and -not $h.Restored -and $legacy.Count -ne 1){throw 'Completed smoke/journey has no unique legacy diagnosis'}
+}
 function Assert-FirstHomeTcAuthorization($a,[string]$actor,[string]$building,$tc) {
     Assert-AvatarUid $a.Actor
     Assert-AvatarUid $actor;Assert-AvatarUid $building
@@ -234,6 +289,7 @@ function Assert-FirstHomeHeldRestore($n) {
     }
 }
 function Assert-FirstHomeSmokeResult($n) {
+    Assert-FirstHomeApproaches $n.FirstHome $n.Actor.NetId
     $h=$n.FirstHome
     if($n.Mode -ne 'BUILD_SMOKE' -or $h.DiagnosticOnly -ne $true -or $n.Status -notin @('PARTIAL','BLOCKED','FAILED') -or
         $n.Persistence.Saved -or $n.Persistence.Restored -or $h.SaveReady -or @($n.Harvests).Count -or $n.ManualPositionWrites -ne 0){throw 'Diagnostic smoke crossed natural/save boundary'}
@@ -266,17 +322,20 @@ function Assert-FirstHomeSmokeResult($n) {
     }
     if(-not $h.NavigationComplete){return}
     Assert-FirstHomeTcPlacement $h.NativePlacements
+    Assert-FirstHomeDoorPlacement $h.NativePlacements @($h.Home.Entities|Where-Object Role -eq 'DOOR')[0] @($h.Home.Entities|Where-Object Role -eq 'DOORWAY')[0].NetId
     Assert-FirstHomeTcAuthorization $h.TcAuthorization $n.Actor.UserId $h.Home.BuildingId @($h.Home.Entities|Where-Object Role -eq 'TC')[0]
     Assert-FirstHomeStructure $h.Home;Assert-FirstHomeSite $h.Site;Assert-FirstHomeNavigation $n
     if($paid.Count -ne 19 -or @($h.NativePlacements).Count -ne 8 -or @($h.NativePlacements|Where-Object {-not $_.Entity}).Count -or
         $h.PendingIntent -or -not $h.CrossedIn -or -not $h.CrossedOut){throw 'Incomplete native build smoke'}
     $u=$h.Upkeep
-    if(-not $u.Authed -or -not $u.Privilege -or $u.MinutesAfter -lt 60 -or $u.MinutesAfter -lt $u.Period -or
+    Assert-FirstHomeUpkeep $u
+    if(-not $u.Authed -or -not $u.Privilege -or $u.MinutesAfter -lt 60 -or
         (Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $u.Before) -or
         (Get-FirstHomeEconomicKey $u.Before) -cne (Get-FirstHomeEconomicKey @(@($u.After)+@($u.TcInventory))) -or
         (Get-FirstHomeEconomicKey $u.After) -cne (Get-FirstHomeEconomicKey $n.Inventory)){throw 'Smoke TC debit/auth/upkeep not proven'}
 }
 function Assert-FirstHomeResult($n) {
+    Assert-FirstHomeApproaches $n.FirstHome $n.Actor.NetId
     if($n.Status -notin @('GREEN','PARTIAL','BLOCKED','FAILED')){throw 'Unknown FirstHome status'}
     if($n.Conservation.EconomicFailure -eq $true -and $n.Status -ne 'FAILED'){throw 'Conservation failure cannot pass'}
     $h=$n.FirstHome
@@ -312,6 +371,7 @@ function Assert-FirstHomeResult($n) {
             (Get-FirstHomeEconomicKey $h.Source.TcInventory) -cne (Get-FirstHomeEconomicKey $h.Snapshot.TcInventory)){throw 'Native home inventory changed on restore'}
     }elseif($n.Mode -eq 'JOURNEY'){
         Assert-FirstHomeTcPlacement $h.NativePlacements
+        Assert-FirstHomeDoorPlacement $h.NativePlacements @($h.Home.Entities|Where-Object Role -eq 'DOOR')[0] @($h.Home.Entities|Where-Object Role -eq 'DOORWAY')[0].NetId
         Assert-FirstHomeTcAuthorization $h.TcAuthorization $n.Actor.UserId $h.Home.BuildingId @($h.Home.Entities|Where-Object Role -eq 'TC')[0]
         Assert-FirstHomeSite $h.Site
         if(@($n.StarterKit).Count -ne 1 -or $n.StarterKit[0].Shortname -ne 'rock' -or $n.StarterKit[0].Amount -ne 1){throw 'Free home starter material'}
@@ -364,7 +424,7 @@ function Assert-FirstHomeResult($n) {
         if((Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $u.Before) -or
             (Get-FirstHomeEconomicKey $u.After) -cne (Get-FirstHomeEconomicKey $n.Inventory) -or
             (Get-FirstHomeEconomicKey $u.Before) -cne (Get-FirstHomeEconomicKey @(@($u.After)+@($u.TcInventory)))){throw 'TC transfer created/lost/replaced an item UID'}
-        if($u.Authed -ne $true -or $u.Privilege -ne $true -or (Get-AvatarNumber $u.MinutesAfter 'upkeep minutes') -lt (Get-AvatarNumber $u.Period 'upkeep period') -or $u.MinutesAfter -le $u.MinutesBefore){throw 'Native upkeep/auth not proven'}
+        Assert-FirstHomeUpkeep $u
     }else{throw 'Unknown home mode'}
     if($n.Status -eq 'GREEN'){
         Assert-FirstHomeNavigation $n

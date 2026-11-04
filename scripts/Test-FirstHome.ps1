@@ -174,3 +174,47 @@ Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
 $x=Copy-HomeFixture $auth;$x.TcNetId='109'
 Deny-HomeFixture {Assert-FirstHomeTcAuthorization $x '15' '10' $actualTc}
 Write-Output 'PASS OFFLINE_ONLY 10: own native autoauth accepted, foreign auth/items/group and unauthorized self-add denied'
+
+# 013: a composite false or an uncalculated default path must never be evidence.
+if(-not (Get-Command Assert-FirstHomeApproach -ErrorAction SilentlyContinue)){throw '013 separate approach evidence contract is not implemented'}
+$approach=Copy-HomeFixture @{Step=7;Label='CURRENT';ActorNetId='19';Actor=@(0,0,0);Candidate=@(0,0,0);Sampled=$true;NavPoint=@(0,0,0);Foot=@(0,0.05,0);
+    Surface='GROUND_TERRAIN';SurfaceEntity=$null;SampleDelta=0;TerrainDelta=0;NormalY=1;WaterDepth=0;CapsuleClear=$true;Pending=$false;OnNavmesh=$true;
+    PathCalculated=$true;Path='PathComplete';PathLength=0;CanBuild=$true;Los=$true;Reach=2;MaxReach=4;Accepted=$true;Reason='ACCEPTED'}
+Assert-FirstHomeApproach $approach
+foreach($mutation in @({param($x)$x.Reason=$null},{param($x)$x.Sampled=$false},{param($x)$x.PathCalculated=$false},
+    {param($x)$x.Path='PathPartial'},{param($x)$x.CapsuleClear=$false},{param($x)$x.Surface='ROOF'},
+    {param($x)$x.Pending=$true},{param($x)$x.Los=$false},{param($x)$x.Reach=4.1})){
+    $x=Copy-HomeFixture $approach;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeApproach $x}
+}
+$x=Copy-HomeFixture $approach;$x.Accepted=$false;$x.Reason='NAV_SAMPLE';$x.Sampled=$false
+Assert-FirstHomeApproach $x
+$x.Reason=$null;Deny-HomeFixture {Assert-FirstHomeApproach $x}
+$legacy=Copy-HomeFixture @{Label='LEGACY_COMPOSITE';Step=7;ActorNetId='19';Actor=@(0,0,0);Input=@(0,0,-3);Sampled=$true;NavPoint=@(0,0,-3);RayHit=$true;Reason='CAPSULE_OVERLAP';SampleDelta=0;TerrainDelta=0;Normal=@(0,1,0);WaterDepth=0;Overlaps=@(@{Self=$true})}
+$diagnosis=Copy-HomeFixture @{NavigationComplete=$true;Restored=$false;Approaches=@($legacy,$approach)}
+Assert-FirstHomeApproaches $diagnosis '19'
+$x=Copy-HomeFixture $diagnosis;$x.Approaches[0].Reason=$null;Deny-HomeFixture {Assert-FirstHomeApproaches $x '19'}
+$x=Copy-HomeFixture $diagnosis;$x.Approaches=@($approach);Deny-HomeFixture {Assert-FirstHomeApproaches $x '19'}
+$x=Copy-HomeFixture $diagnosis;$x.Approaches[0].Reason='ACCEPTED';Deny-HomeFixture {Assert-FirstHomeApproaches $x '19'}
+Write-Output 'PASS OFFLINE_ONLY 11: approach subreason, physical support, pending tiles and actual complete path'
+
+if(-not (Get-Command Assert-FirstHomeDoorPlacement -ErrorAction SilentlyContinue)){throw '013 native door evidence contract is not implemented'}
+$door=Copy-HomeFixture @{Role='DOOR';Entity='107';Parent='104';Socket='synthetic/doorway-female/1';NativeCall='Planner.DoBuild(Construction.Target,Construction)';
+    Before=@(@{Uid='42';Shortname='door.hinged.wood';Amount=1;Condition=0;MaxCondition=0});After=@()}
+$doorRow=Copy-HomeFixture @{Role='DOOR';NetId='107';Type='Door';Owner='19';BuildingId='10';Registered=$true;Saving=$true;Support=$true;Health=100}
+Assert-FirstHomeDoorPlacement @($door) $doorRow '104'
+foreach($mutation in @({param($x)$x.NativeCall='Spawn'},{param($x)$x.After=$x.Before},{param($x)$x.Entity='108'},{param($x)$x.Parent='999'},{param($x)$x.Socket=$null})){
+    $x=Copy-HomeFixture $door;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeDoorPlacement @($x) $doorRow '104'}
+}
+Deny-HomeFixture {Assert-FirstHomeDoorPlacement @($door,$door) $doorRow '104'}
+Write-Output 'PASS OFFLINE_ONLY 12: native door socket/entity binding and exact paid item, no fake spawn or retry'
+
+if(-not (Get-Command Assert-FirstHomeUpkeep -ErrorAction SilentlyContinue)){throw '013 native upkeep evidence contract is not implemented'}
+$upkeep=Copy-HomeFixture @{Before=@(@{Uid='50';Shortname='wood';Amount=5;Condition=0;MaxCondition=0});After=@();Transferred=@(@{Uid='50';Shortname='wood';Amount=5;Condition=0;MaxCondition=0});
+    TcInventory=@(@{Uid='50';Shortname='wood';Amount=5;Condition=0;MaxCondition=0});Rate=@(@{Shortname='wood';Amount=100});NativeRate=@(@{Shortname='wood';Amount=99.5});
+    Period=1440;MinutesBefore=0;MinutesAfter=72.36181;Authed=$true;Privilege=$true;DecayEnabled=$true}
+Assert-FirstHomeUpkeep $upkeep
+foreach($mutation in @({param($x)$x.MinutesAfter=59.9},{param($x)$x.MinutesBefore=100},{param($x)$x.TcInventory[0].Uid='51'},
+    {param($x)$x.NativeRate[0].Amount=0},{param($x)$x.DecayEnabled=$false},{param($x)$x.Transferred=@()})){
+    $x=Copy-HomeFixture $upkeep;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeUpkeep $x}
+}
+Write-Output 'PASS OFFLINE_ONLY 13: native fractional upkeep, >=60 actual minutes, exact UID conservation and no free credit'
