@@ -199,6 +199,61 @@ function Get-HomeRotated($q,$p){
     $c=@(($u[1]*$v[2]-$u[2]*$v[1]),($u[2]*$v[0]-$u[0]*$v[2]),($u[0]*$v[1]-$u[1]*$v[0]))
     @(for($i=0;$i -lt 3;$i++){[double]$p[$i]+2*($w*$v[$i]+$c[$i])})
 }
+function Assert-FirstHomePhysics($p,[switch]$RequireClear) {
+    Assert-AvatarUid $p.ActorNetId
+    if($p.Schema -ne 2 -or $p.Event -ne 'PHYSICS' -or $p.Radius -ne 0.5 -or $p.Height -ne 1.8 -or
+        $p.Clear -notin @($true,$false) -or $p.LegacyClear -notin @($true,$false) -or
+        @($p.Overlaps).Count -ne $p.OverlapCount){throw 'Missing actual capsule/overlap evidence'}
+    foreach($field in @('Position','CapsuleA','CapsuleB')){
+        if(@($p.$field).Count -ne 3){throw 'Missing physical capsule coordinates'}
+        foreach($v in $p.$field){$null=Get-AvatarNumber $v 'capsule coordinate'}
+    }
+    foreach($shape in @(@('CapsuleA',0.5),@('CapsuleB',1.3))){
+        $expected=@($p.Position[0],($p.Position[1]+$shape[1]),$p.Position[2])
+        if((Get-WorldDistance $expected $p.($shape[0])) -gt 0.001){throw 'Shrunk/displaced proof capsule'}
+    }
+    $bodies=@($p.NativeCapsules)
+    if(-not $bodies.Count -or @($bodies.Instance|Select-Object -Unique).Count -ne $bodies.Count){throw 'Missing native physical body'}
+    foreach($body in $bodies){
+        if($body.Instance -eq 0 -or $body.Radius -ne 0.5 -or [Math]::Abs((Get-AvatarNumber $body.Height 'native capsule height')-1.8) -gt 0.001 -or
+            $body.Direction -ne 1 -or $body.Enabled -ne $true -or $body.Trigger -ne $false -or @($body.Scale).Count -ne 3){throw 'Unverified native/proof body dimensions'}
+        foreach($v in $body.Scale){if([Math]::Abs((Get-AvatarNumber $v 'native body scale')-1) -gt 0.001){throw 'Rescaled native body'}}
+        foreach($field in @('Center','A','B')){
+            if(@($body.$field).Count -ne 3){throw 'Missing actual native capsule geometry'}
+            foreach($v in $body.$field){$null=Get-AvatarNumber $v 'native capsule coordinate'}
+        }
+        if($body.Collider.Entity -ne $p.ActorNetId -or $body.Collider.Self -ne $true -or
+            [Math]::Abs((Get-AvatarNumber $body.WorldRadius 'native world radius')-0.5) -gt 0.001 -or
+            (Get-WorldDistance $body.A $p.CapsuleA) -gt 0.001 -or (Get-WorldDistance $body.B $p.CapsuleB) -gt 0.001){throw 'Native body is not bound to the actual proof capsule'}
+    }
+    $legacy=0;$seen=@{}
+    foreach($o in @($p.Overlaps)){
+        $c=$o.Collider
+        if($c.Instance -eq 0 -or $seen.ContainsKey([string]$c.Instance) -or -not $c.Type -or -not $c.Name -or
+            $null -eq $c.Layer -or $c.OwnerFlag -notin @('SELF','OWN','FOREIGN','NONE') -or
+            $o.Category -notin @('NPC_SELF','TERRAIN','FOUNDATION','DOORWAY','DOOR_OPEN','DOOR_CLOSED','TC','WALL_N','WALL_E','WALL_W','ROOF','ENVIRONMENT','FOREIGN') -or
+            $c.enabled -ne $true -or $c.isTrigger -ne $false){throw 'Missing/unknown collider identity or unsafe overlap set'}
+        $seen[[string]$c.Instance]=$true
+        foreach($field in @('Center','Extents')){
+            if(@($c.$field).Count -ne 3){throw 'Missing collider bounds'}
+            foreach($v in $c.$field){$null=Get-AvatarNumber $v 'collider bounds'}
+        }
+        $blocking=$o.Category -notin @('NPC_SELF','FOUNDATION')
+        $decision=if($o.Category -eq 'NPC_SELF'){'SELF'}elseif($blocking){'BLOCKING_BODY_CONTACT'}else{'LEGACY_FOUNDATION_EXCLUSION'}
+        if($o.LegacyBlocking -ne $blocking -or $o.Decision -ne $decision){throw 'Collider decision contradicts legacy guard'}
+        if($blocking){$legacy++}
+        if(@($o.Penetrations).Count -ne $bodies.Count){throw 'Missing actual native body penetration measurements'}
+        foreach($m in @($o.Penetrations)){
+            if($m.ActorCollider -notin $bodies.Instance -or $m.Intersects -notin @($true,$false) -or
+                (Get-AvatarNumber $m.Distance 'native penetration') -lt 0 -or @($m.Direction).Count -ne 3){throw 'Invalid native penetration receipt'}
+        }
+        if($RequireClear -and ($blocking -or $o.Category -eq 'FOUNDATION')){throw 'Body overlap is not proven benign support'}
+    }
+    if($p.LegacyClear -ne ($legacy -eq 0) -or $p.Clear -ne $p.LegacyClear){throw 'Clear contradicts actual overlapping colliders'}
+    if($RequireClear -and ($p.Clear -ne $true -or $p.Pending -ne $false -or $p.OnNavmesh -ne $true -or $p.Path -ne 'PathComplete' -or
+        $p.Calculated -ne $true -or $p.CalculatedPath -ne 'PathComplete' -or
+        ($p.Inside -and $p.OwnedFloor -ne $true))){throw 'Physical support/path not proven'}
+}
 function Assert-FirstHomeNavigation($n) {
     $h=$n.FirstHome;$p=$h.Portal;$door=@($h.Home.Entities|Where-Object Role -eq 'DOOR')
     if($door.Count -ne 1 -or $p.DoorNetId -ne $door[0].NetId -or $p.Radius -ne 0.5 -or $p.Height -ne 1.8){throw 'Missing native doorway/capsule dimensions'}
@@ -239,6 +294,8 @@ function Assert-FirstHomeNavigation($n) {
         foreach($sample in $segment|Select-Object -Skip 1){
             $physics=@($h.Navigation|Where-Object {$_.Event -eq 'PHYSICS' -and [Math]::Abs($_.Time-$sample.Time) -lt 0.01})
             if($physics.Count -ne 1 -or $physics[0].Clear -ne $true -or $physics[0].DoorOpen -ne $true -or (Get-WorldDistance $physics[0].Position $sample.Position) -gt 0.01 -or ($physics[0].Inside -and $physics[0].OwnedFloor -ne $true)){throw 'Home sample lacks actual collider/floor clearance'}
+            Assert-FirstHomePhysics $physics[0] -RequireClear
+            if($physics[0].ActorNetId -ne $sample.ActorNetId){throw 'Physics belongs to a different actor'}
         }
     }
     $tc=@($h.Navigation|Where-Object Event -eq 'TC_REACHED')
@@ -291,6 +348,7 @@ function Assert-FirstHomeHeldRestore($n) {
 function Assert-FirstHomeSmokeResult($n) {
     Assert-FirstHomeApproaches $n.FirstHome $n.Actor.NetId
     $h=$n.FirstHome
+    foreach($p in @($h.Navigation|Where-Object Event -eq PHYSICS)){Assert-FirstHomePhysics $p}
     if($n.Mode -ne 'BUILD_SMOKE' -or $h.DiagnosticOnly -ne $true -or $n.Status -notin @('PARTIAL','BLOCKED','FAILED') -or
         $n.Persistence.Saved -or $n.Persistence.Restored -or $h.SaveReady -or @($n.Harvests).Count -or $n.ManualPositionWrites -ne 0){throw 'Diagnostic smoke crossed natural/save boundary'}
     if($n.Conservation.EconomicFailure -and $n.Status -ne 'FAILED'){throw 'Smoke conservation failure cannot pass'}

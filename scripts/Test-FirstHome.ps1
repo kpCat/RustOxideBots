@@ -70,6 +70,26 @@ $events=@(
 foreach($sample in $samples|Select-Object -Skip 1){$events+=@{Event='PHYSICS';Time=$sample.Time;Position=$sample.Position;Clear=$true;Inside=$sample.Position[0] -gt 0;OwnedFloor=$true;DoorOpen=$true}}
 $nav=Copy-HomeFixture @{Samples=$samples;FirstHome=@{Home=@{Entities=@(@{Role='DOOR';NetId='107';Position=@(0,0,0);Rotation=@(0,0,0,1)})};
  Portal=@{DoorNetId='107';LocalCenter=@(0,1,0);LocalExtents=@(0.1,1.1,0.65);Scale=@(1,1,1);Center=@(0,1,0);Normal=@(1,0,0);Right=@(0,0,1);Up=@(0,1,0);Outside=@(-2,0,0);Inside=@(1,0,0);HalfWidth=0.65;HalfHeight=1.1;Radius=0.5;Height=1.8};Navigation=$events}}
+# 014: a naked Clear=true without the actual overlap set cannot prove clearance.
+Deny-HomeFixture {Assert-FirstHomeNavigation $nav}
+foreach($sample in $nav.FirstHome.Navigation|Where-Object Event -eq PHYSICS){
+    $sample|Add-Member NoteProperty Schema 2
+    $sample|Add-Member NoteProperty ActorNetId '19'
+    $sample|Add-Member NoteProperty LegacyClear $true
+    $sample|Add-Member NoteProperty OverlapCount 0
+    $sample|Add-Member NoteProperty Overlaps @()
+    $sample|Add-Member NoteProperty CapsuleA @($sample.Position[0],0.5,0)
+    $sample|Add-Member NoteProperty CapsuleB @($sample.Position[0],1.3,0)
+    $sample|Add-Member NoteProperty Radius 0.5
+    $sample|Add-Member NoteProperty Height 1.8
+    $sample|Add-Member NoteProperty Pending $false
+    $sample|Add-Member NoteProperty OnNavmesh $true
+    $sample|Add-Member NoteProperty Path 'PathComplete'
+    $sample|Add-Member NoteProperty Calculated $true
+    $sample|Add-Member NoteProperty CalculatedPath 'PathComplete'
+    $sample|Add-Member NoteProperty NativeCapsules @(@{Instance=10;Radius=0.5;Height=1.8;Direction=1;Enabled=$true;Trigger=$false;Scale=@(1,1,1);Center=@(0,0.9,0);
+        A=@($sample.Position[0],0.5,0);B=@($sample.Position[0],1.3,0);WorldRadius=0.5;Collider=@{Entity='19';Self=$true}})
+}
 Assert-FirstHomeNavigation $nav
 foreach($mutation in @(
  {param($x)($x.FirstHome.Navigation|Where-Object Event -eq CROSSED_IN).Position=@(9,0,0)},
@@ -218,3 +238,23 @@ foreach($mutation in @({param($x)$x.MinutesAfter=59.9},{param($x)$x.MinutesBefor
     $x=Copy-HomeFixture $upkeep;& $mutation $x;Deny-HomeFixture {Assert-FirstHomeUpkeep $x}
 }
 Write-Output 'PASS OFFLINE_ONLY 13: native fractional upkeep, >=60 actual minutes, exact UID conservation and no free credit'
+
+# Per-collider receipts stay diagnostic when the legacy guard rejects them.
+# These are not Unity simulations: the validator must deny unsupported clearance claims.
+$physics=Copy-HomeFixture ($nav.FirstHome.Navigation|Where-Object Event -eq PHYSICS|Select-Object -First 1)
+$contact=@{Collider=@{Instance=20;Type='BoxCollider';Name='synthetic';Layer=8;Entity='104';Prefab='assets/synthetic/door.prefab';OwnerFlag='OWN';Center=@(0,1,0);Extents=@(0.1,1,1);enabled=$true;isTrigger=$false};Category='DOOR_OPEN';LegacyBlocking=$true;Decision='BLOCKING_BODY_CONTACT';Penetrations=@(@{ActorCollider=10;Intersects=$true;Distance=0.04;Direction=@(0,0,1)})}
+foreach($category in @('DOOR_OPEN','DOORWAY','TC','FOREIGN','TERRAIN','ENVIRONMENT')){
+    $x=Copy-HomeFixture $physics;$x.OverlapCount=1;$x.Overlaps=@((Copy-HomeFixture $contact));$x.Overlaps[0].Category=$category
+    $x.LegacyClear=$false;$x.Clear=$false
+    Assert-FirstHomePhysics $x
+    $x.Clear=$true;Deny-HomeFixture {Assert-FirstHomePhysics $x -RequireClear}
+}
+foreach($mutation in @({param($x)$x.OverlapCount=1},{param($x)$x.NativeCapsules=@()},
+    {param($x)$x.CapsuleA[1]=0.6},{param($x)$x.Pending=$true},{param($x)$x.Path='PathPartial'},
+    {param($x)$x.NativeCapsules[0].Radius=0.4},{param($x)$x.OnNavmesh=$false},
+    {param($x)$x.Calculated=$false},{param($x)$x.CalculatedPath='PathPartial'},
+    {param($x)$x.NativeCapsules[0].A[0]+=0.1},{param($x)$x.NativeCapsules[0].B[1]+=0.2},
+    {param($x)$x.NativeCapsules[0].WorldRadius=0.6},{param($x)$x.NativeCapsules[0].Collider.Entity='99'})){
+    $x=Copy-HomeFixture $physics;& $mutation $x;Deny-HomeFixture {Assert-FirstHomePhysics $x -RequireClear}
+}
+Write-Output 'PASS OFFLINE_ONLY 14: full overlap evidence, native body dimensions and fail-closed collider/path claims'

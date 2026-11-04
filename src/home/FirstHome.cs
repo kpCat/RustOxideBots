@@ -518,8 +518,10 @@ namespace Oxide.Plugins
         }
         private object HomeCollider(Collider c) {
             var e=c.GetComponentInParent<BaseEntity>();
-            return new {Name=c.name,Type=c.GetType().Name,Layer=c.gameObject.layer,Entity=Id(e),Owner=e==null?null:e.OwnerID.ToString(),Prefab=e==null?null:e.PrefabName,
-                Self=e==npc,Own=e!=null && homeEntities.Values.Contains(e as DecayEntity),Center=Point(c.bounds.center),Extents=Point(c.bounds.extents),c.enabled,c.isTrigger};
+            return new {Instance=c.GetInstanceID(),Name=c.name,Type=c.GetType().FullName,Layer=c.gameObject.layer,LayerName=LayerMask.LayerToName(c.gameObject.layer),Entity=Id(e),Owner=e==null?null:e.OwnerID.ToString(),Prefab=e==null?null:e.PrefabName,
+                OwnerFlag=e==npc?"SELF":e==null?"NONE":e.OwnerID==npc.userID?"OWN":"FOREIGN",EntityType=e==null?null:e.GetType().FullName,
+                Self=e==npc,Own=e!=null && homeEntities.Values.Contains(e as DecayEntity),Center=Point(c.bounds.center),Extents=Point(c.bounds.extents),Position=Point(c.transform.position),
+                Rotation=new[] {c.transform.rotation.x,c.transform.rotation.y,c.transform.rotation.z,c.transform.rotation.w},Scale=Point(c.transform.lossyScale),c.enabled,c.isTrigger};
         }
         private void HomeLegacyApproach() {
             var input=homeSite+homeRotation*new Vector3(0,0,-3);input.y=TerrainMeta.HeightMap.GetHeight(input);NavHit hit;
@@ -654,16 +656,56 @@ namespace Oxide.Plugins
         }
         private void HomePhysicalSample(float now) {
             var p=npc.transform.position;var foundation=homeEntities["FOUNDATION"];
-            var collisions=Physics.OverlapCapsule(p+Vector3.up*0.5f,p+Vector3.up*1.3f,0.5f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore)
-                .Where(x=>x.GetComponentInParent<BaseEntity>()!=npc && x.GetComponentInParent<BaseEntity>()!=foundation).ToArray();
+            var a=p+Vector3.up*0.5f;var b=p+Vector3.up*1.3f;
+            var overlaps=Physics.OverlapCapsule(a,b,0.5f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).OrderBy(x=>x.GetInstanceID()).ToArray();
+            var collisions=overlaps.Where(x=>x.GetComponentInParent<BaseEntity>()!=npc && x.GetComponentInParent<BaseEntity>()!=foundation).ToArray();
             var local=foundation.transform.InverseTransformPoint(p);bool inside=Mathf.Abs(local.x)<1.4f && Mathf.Abs(local.z)<1.4f;
-            var hits=Physics.RaycastAll(p+Vector3.up*0.3f,Vector3.down,0.6f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore)
-                .Where(x=>x.collider.GetComponentInParent<BaseEntity>()==foundation && Mathf.Abs(x.point.y-p.y)<0.15f && x.normal.y>0.85f).ToArray();
-            var receipt=new {Event="PHYSICS",Time=now,Position=Point(p),Clear=collisions.Length==0,Inside=inside,OwnedFloor=hits.Length>0,Radius=0.5f,Height=1.8f,DoorOpen=((Door)homeEntities["DOOR"]).IsOpen()};
-            homeNav.Add(receipt);
+            var rays=Physics.RaycastAll(p+Vector3.up*0.3f,Vector3.down,0.6f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).OrderBy(x=>x.distance).ToArray();
+            var hits=rays.Where(x=>x.collider.GetComponentInParent<BaseEntity>()==foundation && Mathf.Abs(x.point.y-p.y)<0.15f && x.normal.y>0.85f).ToArray();
+            var bodies=npc.GetComponents<Collider>().OfType<CapsuleCollider>().ToArray();NavHit nav;Vector3 ground;
+            bool sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(p),out nav,new Vector3(0.25f,0.5f,0.25f),false);
+            bool grounded=Ground(p,out ground,false);var path=new RustNavMeshPath();bool calculated=agent.CalculatePath(target,path);
+            var receipt=new {Event="PHYSICS",Schema=2,Time=now,ActorNetId=Id(npc),Position=Point(p),Previous=Point(previous),Velocity=Point(agent.velocity.Value),
+                Clear=collisions.Length==0,LegacyClear=collisions.Length==0,Inside=inside,OwnedFloor=hits.Length>0,FoundationLocal=Point(local),
+                CapsuleA=Point(a),CapsuleB=Point(b),Radius=0.5f,Height=1.8f,Mask=Physics.DefaultRaycastLayers,Triggers="Ignore",OverlapCount=overlaps.Length,
+                Overlaps=overlaps.Select(c=>HomeContact(c,p,rays,bodies)).ToArray(),
+                FloorRays=rays.Select(x=>new {Collider=HomeCollider(x.collider),Position=Point(x.point),Normal=Point(x.normal),x.distance,FootDelta=p.y-x.point.y}).ToArray(),
+                WaterDepth=WaterLevel.GetWaterSurface(p,true,true,null)-p.y,TerrainHeight=TerrainMeta.HeightMap.GetHeight(p),Ground=grounded,GroundPoint=Point(ground),NativeGrounded=npc.IsOnGround(),
+                NavSampled=sampled,NavPosition=sampled?Point(nav.position.Value):null,Pending=RustNavigation.Instance.HasPendingTiles(),OnNavmesh=agent.isOnNavMesh,
+                Path=agent.pathStatus.ToString(),agent.hasPath,agent.pathPending,agent.remainingDistance,Calculated=calculated,CalculatedPath=calculated?path.status.ToString():"NOT_CALCULATED",Target=Point(target),
+                NativeRadius=BasePlayer.GetRadius(),NativeHeight=npc.GetHeight(),NativeCapsules=bodies.Select(HomeNativeCapsule).ToArray(),AgentHeight=agent.height,AgentBaseOffset=agent.baseOffset,
+                DoorOpen=((Door)homeEntities["DOOR"]).IsOpen(),DoorPosition=Point(homeEntities["DOOR"].transform.position),DoorColliders=DoorColliders(),Portal=homePortal,
+                Guard=collisions.Length!=0?"OVERLAP":inside && hits.Length==0?"OWNED_FLOOR":"ACCEPTED"};
+            homeNav.Add(receipt);Log("HOME_PHYSICS",receipt);
             if(collisions.Length!=0 || inside && hits.Length==0)throw new InvalidOperationException("HOME_NAV physical collider/support clearance failed");
         }
-        private void HomeCrossing(Vector3 from,Vector3 to,float now) {
+        private object HomeNativeCapsule(CapsuleCollider c) {
+            var axis=c.direction==0?Vector3.right:c.direction==1?Vector3.up:Vector3.forward;
+            float segment=Mathf.Max(0,c.height*0.5f-c.radius);var s=c.transform.lossyScale;
+            float radiusScale=c.direction==0?Mathf.Max(Mathf.Abs(s.y),Mathf.Abs(s.z)):c.direction==1?Mathf.Max(Mathf.Abs(s.x),Mathf.Abs(s.z)):Mathf.Max(Mathf.Abs(s.x),Mathf.Abs(s.y));
+            return new {Instance=c.GetInstanceID(),Radius=c.radius,Height=c.height,Direction=c.direction,Center=Point(c.center),Scale=Point(s),Enabled=c.enabled,Trigger=c.isTrigger,
+                A=Point(c.transform.TransformPoint(c.center-axis*segment)),B=Point(c.transform.TransformPoint(c.center+axis*segment)),WorldRadius=c.radius*radiusScale,Collider=HomeCollider(c)};
+        }
+        private object HomeContact(Collider c,Vector3 p,RaycastHit[] rays,CapsuleCollider[] bodies) {
+            var e=c.GetComponentInParent<BaseEntity>();var role=homeEntities.FirstOrDefault(x=>x.Value==e).Key;
+            string category=e==npc?"NPC_SELF":c is TerrainCollider?"TERRAIN":role=="DOOR"?(((Door)e).IsOpen()?"DOOR_OPEN":"DOOR_CLOSED"):role??(e==null?"ENVIRONMENT":"FOREIGN");
+            bool legacy=e!=npc && e!=homeEntities["FOUNDATION"];
+            bool closestSupported=c is BoxCollider || c is SphereCollider || c is CapsuleCollider || c is MeshCollider && ((MeshCollider)c).convex;
+            var measurements=new List<object>();
+            foreach(var body in bodies) {
+                Vector3 direction=Vector3.zero;float distance=0;bool intersects=false;string error=null;
+                if(body!=c) {
+                    try { intersects=Physics.ComputePenetration(body,body.transform.position,body.transform.rotation,c,c.transform.position,c.transform.rotation,out direction,out distance); }
+                    catch(Exception ex) { error=ex.GetType().Name; }
+                }
+                measurements.Add(new {ActorCollider=body.GetInstanceID(),Intersects=intersects,Distance=distance,Direction=Point(direction),Error=error});
+            }
+            return new {Collider=HomeCollider(c),Category=category,LegacyBlocking=legacy,Decision=e==npc?"SELF":legacy?"BLOCKING_BODY_CONTACT":"LEGACY_FOUNDATION_EXCLUSION",
+                RelativeToActor=Point(c.bounds.center-p),RelativeToDoor=Point(c.bounds.center-homeEntities["DOOR"].transform.position),
+                ClosestSupported=closestSupported,Closest=closestSupported?Point(c.ClosestPoint(p+Vector3.up*0.9f)):null,BoundsClosest=Point(c.ClosestPointOnBounds(p+Vector3.up*0.9f)),
+                FloorHits=rays.Where(x=>x.collider==c).Select(x=>new {Position=Point(x.point),Normal=Point(x.normal),FootDelta=p.y-x.point.y}).ToArray(),Penetrations=measurements};
+        }
+        private void HomeCrossing(Vector3 from,Vector3 to,float now,bool accept) {
             var door=(Door)homeEntities["DOOR"];Bounds aperture;Matrix4x4 matrix;
             if(!door.TryGetNavDoorwayVolume(out aperture,out matrix))throw new InvalidOperationException("Native doorway aperture unavailable");
             var obb=new OBB(door.transform,aperture);Vector3 normal=obb.extents.x<=obb.extents.z?obb.right:obb.forward;
@@ -673,6 +715,11 @@ namespace Oxide.Plugins
             if(!enter && !leave)return;
             var crossing=Vector3.Lerp(from,to,Mathf.Abs(a)/(Mathf.Abs(a)+Mathf.Abs(b)));
             var local=matrix.inverse.MultiplyPoint3x4(crossing+Vector3.up*0.9f);
+            if(!accept) {
+                homeNav.Add(new {Event="CROSSING_CANDIDATE",Direction=enter?"IN":"OUT",Time=now,From=Point(from),To=Point(to),Position=Point(crossing),A=a,B=b,Open=door.IsOpen(),Local=Point(local),
+                    ApertureContains=aperture.Contains(local),RequiredHalfWidth=Mathf.Abs(obb.extents.x<=obb.extents.z?local.z-aperture.center.z:local.x-aperture.center.x)+0.5f,
+                    RequiredHalfHeight=Mathf.Abs(local.y-aperture.center.y)+0.9f,Accepted=false});return;
+            }
             if(!door.IsOpen() || !aperture.Contains(local))throw new InvalidOperationException("Home crossing outside native open aperture");
             if(enter)homeCrossedIn=true;if(leave)homeCrossedOut=true;
             homeNav.Add(new {Event=enter?"CROSSED_IN":"CROSSED_OUT",Time=now,Position=Point(crossing),A=a,B=b,Open=door.IsOpen(),Local=Point(local)});
@@ -745,7 +792,7 @@ namespace Oxide.Plugins
                 }
             }
             if(dt<=0 || dt>1.5f || step>5 || step>6*dt+1)throw new InvalidOperationException("Discontinuous HOME_NAV trace");
-            if(homePhase=="NAV"){HomePhysicalSample(now);HomeCrossing(previous,position,now);}
+            if(homePhase=="NAV"){HomeCrossing(previous,position,now,false);HomePhysicalSample(now);HomeCrossing(previous,position,now,true);}
             total+=step;previous=position;previousTime=now;Sample(now);
             if(now>deadline)throw new InvalidOperationException("Bounded FirstHome deadline");
             if(homePhase=="SITE_SEARCH"){HomeSearchBatch();return true;}
