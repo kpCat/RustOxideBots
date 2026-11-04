@@ -10,7 +10,7 @@ using UnityEngine.AI;
 
 namespace Oxide.Plugins
 {
-    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.5")]
+    [Info("RustBotsAvatarSurvival", "RustOxideBots", "0.1.6")]
     [Description("Isolated single native player-avatar survival and exact inventory restart probe.")]
     public class RustBotsAvatarSurvival : RustPlugin
     {
@@ -331,15 +331,39 @@ namespace Oxide.Plugins
             }Finish("PARTIAL","Natural reachable "+need+" unavailable");
         }
         private void StartLeg() {
-            var path=new RustNavMeshPath();if(!agent.CalculatePath(goal,path) || path.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("Incomplete natural-source route");
-            Vector3 cursor=npc.transform.position,candidate=goal;float remaining=30;
-            foreach(var corner in path.corners){float d=Vector3.Distance(cursor,corner.Value);if(d>remaining){candidate=Vector3.Lerp(cursor,corner.Value,remaining/d);break;}remaining-=d;cursor=corner.Value;}
-            NavMeshHit hit;Vector3 foot;var local=new RustNavMeshPath();
-            if(!agent.SamplePosition(candidate,out hit,1,false)||!Ground(hit.position,out foot)||!agent.CalculatePath(foot,local)||local.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("Local natural route unavailable");
+            var path=new RustNavMeshPath();if(!agent.CalculatePath(goal,path) || path.status!=NavMeshPathStatus.PathComplete) {
+                if(economy){RejectRoute("GOAL_PATH",new {Status=path.status.ToString()});return;}
+                throw new InvalidOperationException("Incomplete natural-source route");
+            }
+            // WorldRoam's bounded 36/24/12 m progress candidates avoid rejecting an entire
+            // complete route because one interpolated waypoint has no safe ground.
+            Vector3 foot=Vector3.zero;bool chosen=false;string reason=null;object detail=null;
+            foreach(float length in economy?new[] {36f,24f,12f}:new[] {30f}) {
+                Vector3 cursor=npc.transform.position,candidate=goal;float remaining=length;
+                foreach(var corner in path.corners){float d=Vector3.Distance(cursor,corner.Value);if(d>remaining){candidate=Vector3.Lerp(cursor,corner.Value,remaining/d);break;}remaining-=d;cursor=corner.Value;}
+                NavMeshHit hit;var local=new RustNavMeshPath();
+                bool sampled=agent.SamplePosition(candidate,out hit,economy?2.5f:1f,false);
+                bool grounded=sampled && Ground(hit.position,out foot);
+                bool complete=grounded && agent.CalculatePath(foot,local) && local.status==NavMeshPathStatus.PathComplete && (!economy || local.GetPathLength()<=80);
+                if(complete){chosen=true;break;}
+                reason=!sampled?"NAV_SAMPLE":!grounded?"GROUND":"LOCAL_PATH";
+                detail=new {Candidate=Point(candidate),Length=length,Sampled=sampled,Grounded=grounded,LocalStatus=local.status.ToString()};
+                if(economy)Log("WAYPOINT_REJECT",new {SourceId=sourceId,Reason=reason,Detail=detail});
+            }
+            if(!chosen) {
+                if(economy){RejectRoute(reason,detail);return;}
+                throw new InvalidOperationException("Local natural route unavailable");
+            }
             legStart=progress=npc.transform.position;target=foot;legTime=progressTime=Time.realtimeSinceStartup;repaths=0;
             speedBefore=agent.speed;agent.isStopped=false;if(!agent.SetDestination(target))throw new InvalidOperationException("SetDestination rejected");
             // Installed native ResetPath clears speed; re-arm AFTER every SetDestination.
             agent.speed=3;issuedSpeed=agent.speed;navigating=true;
+        }
+        private void RejectRoute(string reason,object detail) {
+            // Reuse Survival's bounded source rejection; never debit an unreachable source.
+            Log("ROUTE_REJECT",new {SourceId=sourceId,Reason=reason,Detail=detail,Discoveries=discoveries});
+            rejected.Add(sourceId);navigating=false;agent.isStopped=true;
+            source=null;dispenser=null;pool=null;state.Goal="NEED_RESOURCE";Discover();
         }
         private void Sample(float time) { samples.Add(new {Time=time,Position=Point(npc.transform.position),ActorNetId=Id(npc),ActiveUid=npc.GetActiveItem()==null?null:npc.GetActiveItem().uid.Value.ToString(),Speed=agent.speed,PathStatus=agent.pathStatus.ToString(),HasPath=agent.hasPath}); }
         private void Tick() {

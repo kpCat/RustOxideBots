@@ -1,28 +1,33 @@
 # RUST-BOTS-009 — результат 04.11.2026
 
-Итог: **PARTIAL**. Durable journal, консервативное восстановление source и идемпотентный accounted craft реализованы в изолированном сценарии и проверены offline. Основная цель — сохранение истощения природных узлов через независимый restart вместе с предметами и личностью — **не доказана**. Ни GREEN_WORLD_DEPLETION, ни GREEN_CRASH_SAFE не заявляются.
+Итог: **GREEN_WORLD_DEPLETION** — bounded graceful-restart durability доказана для двух NATURAL узлов и одного player-derived NPC. Native добыча, оплаченный accounted craft, исходные Item UID/condition/личность, восстановление depleted pools и повторный NOOP проверены в двух независимых RustDedicated. Первые две попытки остаются PARTIAL; raw evidence не переписывался.
 
-**WORLD_DEPLETION=NOT_PROVEN; CRASH_ATOMIC=NOT_PROVEN; CRASH_RECOVERY=OFFLINE_ONLY.** Два live старта, оба PARTIAL; RESTORE не запускался. Успешный native quit не считается доказательством crash recovery.
+**CRASH_ATOMIC=NOT_PROVEN; CRASH_RECOVERY=OFFLINE_ONLY; MULTI_MAP_E2E=NOT_CONDUCTED.** GREEN_CRASH_SAFE не заявляется. Native quit/save и offline fault fixtures не доказывают interrupted-process crash reconciliation.
 
 ## State matrix
 
-| Контракт | Фактический уровень | Результат |
+| Требование | Уровень | Факт |
 |---|---|---|
-| Native actor, held rock, физический подход и gather | LIVE, первый запуск | 34.127420672 м, 11 hits, 63 wood, source debit 126, native wear |
-| Native stone gather / оплаченный stonehatchet в 009 | NOT_PROVEN | 0 stones, 0 craft, 0 produced Item |
-| Journal ordering/integrity | LIVE записи + OFFLINE проверки | 11 подтверждённых gather actions; последнее PREPARED блокируется как IN_DOUBT |
-| Stable source incarnation | STATIC_IL + OFFLINE fail-closed policy | Exact world/save binding и native disk-loaded object witness реализованы; matching между процессами не выполнен |
-| Depletion apply / второй replay NOOP / соседние pools | OFFLINE_ONLY | Реальных RESTORE receipts нет |
-| Craft duplicate / interrupted stages | OFFLINE_ONLY | PREPARED, DEBITTING, DEBITED, OUTPUT_CREATED, COMMITTED; recovered intent не повторяется |
-| UID/held/personality restore 009 | NOT_PROVEN | 008 lifecycle переиспользован, но новый completed JOURNEY отсутствует |
-| Safety / owner / history | Проверено после двух запусков | Owner changes=0; processes/ports/rules/open leases/occupied locks=0; historical raw changes=0 |
-| Code / scope | OFFLINE, исторический LIVE load | Test-All exit 0, C# 7.3 compile; v0.1.3/4 live loaded, итоговый v0.1.5 только offline; allowlist 18 файлов |
+| Native actor / движение | LIVE | ScientistNPC : BasePlayer, RustNav, 201.842964966 м, 291 samples, 7 completed legs |
+| NATURAL source / payment | LIVE | 53 hits, credit200 wood+107 stones, debit400+214, wear, adapters0 |
+| Journal / save binding | LIVE+OFFLINE | 165 sequenced/checksummed records; exact journal/state/actor/inventory/.sav/generation proof |
+| Stable source incarnation | LIVE, bounded | Actual fromDisk object witness, unique geometry, prefab/type/profile, exact map/wipe/save |
+| Independent depletion restore | LIVE | Tree500→100, ore750→536, native DestroyFraction, expected fractions |
+| Replay / соседи | LIVE | Второй apply NOOP/NOOP, 38/3 соседних pools/fractions unchanged, credits0 |
+| Craft / identity / inventory | LIVE | Один paid hatchet UID106675; тот же actor, rock, 7stones, axe; harvest/craft/kit replay0 |
+| Wrong world/source/journal/recipe/UID | OFFLINE_ONLY | Реальный helper и независимый validator, fail closed/no reward retry |
+| Map/wipe isolation | LIVE same-world+OFFLINE multi-map | Stable WorldKey при смене .sav; procedural/custom/map/seed/size/format/wipe negatives |
+| Crash / repeated restart chain | Не доказаны LIVE | Fixtures OFFLINE_ONLY; ещё один restart из нового checkpoint не запускался |
+| Safety / owner / history | Проверено после4 запусков | Owner changes0, processes/ports/rules/open leases/occupied locks0, historical changes0 |
+| Code / delivery | OFFLINE+LIVE load | Test-All exit0, C#7.3 compile, реальный Oxide v0.1.6, cumulative allowlist18 |
 
-## Baseline и установленный runtime
+## Baseline, разрешения и бюджет
 
-До правок local HEAD, tracking origin/master и настоящий публичный HTTPS master совпали с **58d384e23a8200387d2574f935273c3056ab5b0a**, ветка master. В дереве были только восемь распакованных документов 009. SSH и sandbox network были недоступны; публичный ref проверен обычным HTTPS без изменения remote config. Не выполнялись reset/rebase/force/clean/stash.
+До правок local HEAD, tracking origin/master и публичный HTTPS master совпали с **58d384e23a8200387d2574f935273c3056ab5b0a**, ветка master; дерево содержало только восемь supplied docs009. SSH/sandbox network недоступны; использован HTTPS без изменения remote config.
 
-Rust protocol **2635.289.1**, Unity **6000.3.15x1-13**, Oxide.Rust **2.0.7839**. Установка не обновлялась. Факты API и ограничения изложены в [API_DECISION.md](API_DECISION.md).
+Исходный TASK ограничивал запуски максимумом3. После двух PARTIAL владелец явно ответил о подготовленном исправлении: **«Разрешить ещё 2 старта, общий лимит 4»**. Выполнены ровно4 старта, последние2 — corrected JOURNEY+RESTORE. Пятого старта, второй карты, owner launch/update и controlled crash не было. Обязательное дополнение о любых совместимых картах выполнено в том же scope; оно не разрешает owner writes.
+
+Rust protocol **2635.289.1**, Unity **6000.3.15x1-13**, Oxide.Rust **2.0.7839**, Changeset168909. Runtime не обновлялся. API/IL и UNKNOWNs — [API_DECISION.md](API_DECISION.md).
 
 | Installed artifact | SHA-256 |
 |---|---|
@@ -31,83 +36,115 @@ Rust protocol **2635.289.1**, Unity **6000.3.15x1-13**, Oxide.Rust **2.0.7839**.
 | Oxide.Rust.dll | 2128121E34B55BB1550D43E62842B87EA3720059F13DC84F97D8C7DD465C3423 |
 | RustDedicated.exe | EFAC429DB737EB4B32A2BFC48029B4BE6FF475336958F4557F891F17255FFD38 |
 
-## LIVE — фактические попытки
+## Все LIVE попытки
 
-Все времена в таблице — UTC. Raw receipts не переписывались; дополнительно захвачены закрытые журналы неуспешных runs. Полные логи, пути firewall leases, секреты и owner inventory остаются только ignored в `.local/`.
+Времена UTC. Полные immutable receipts, логи, credentials, owner hashes и firewall paths только ignored в .local/runtime/run-id и .local/audit/economy009.
 
-| Run / source version | PID / старт | Readiness | Результат |
+| № / run | Version / PID / старт | Readiness | Outcome |
 |---|---|---:|---|
-| 35d435c481484edd9682260d30d11ac7 / v0.1.3 | 44744 / 11:36:59 | 268.8367123 с | PARTIAL: Native debit without inventory yield; no adapter retry |
-| eeb1767d19084083a92f5778fa914b4d / v0.1.4 | 57920 / 11:47:53 | 271.7154622 с | PARTIAL: Setup: Local natural route unavailable; до первого hit |
+| 1 / 35d435c481484edd9682260d30d11ac7 | v0.1.3 / 44744 / 11:36:59 | 268.8367123с | PARTIAL: low-health tree исчерпан; следующий hit без yield, no adapter retry |
+| 2 / eeb1767d19084083a92f5778fa914b4d | v0.1.4 / 57920 / 11:47:53 | 271.7154622с | PARTIAL: Local natural route unavailable до первого hit |
+| 3 / 3f85a956a2d54c4c8bdd7450997e0b9e | v0.1.6 / 68816 / 12:22:45 | 272.9718907с | GREEN JOURNEY: native gather, paid craft/held, completed save/proof |
+| 4 / 19dec76c099647dca062731daee4cd55 | v0.1.6 / 66012 / 12:31:10 | 269.861585с | GREEN RESTORE: exact identity/items, depleted sources, replay NOOP |
 
-Оба процесса unelevated, с собственным kill-on-close Job Object, проверенными inbound/outbound block rules для всех test EXE, отдельными plugin/config/data, случайными test secrets и loopback ports 28965–28968. В обоих логах реально присутствуют compilation/load RustBotsAvatarSurvival, полная readiness, RustNav, shutdown ACK и завершённый native save. GRACEFUL quit дал наблюдаемый native exit **−1**, как предусмотрено существующим runner; owned processes завершены.
+Оба последних лога подтверждают реальную compilation/load v0.1.6 и readiness. RustNav fully built35344 tiles, из cache loaded13027 tiles. Все4 процесса unelevated, под собственным kill-on-close Job Object; ActiveStore/COM проверили inbound/outbound block rules всех test EXE. Отдельные physical runtime/plugin/config/data, случайные secrets, loopback28965–28968. GRACEFUL/ACK/native save подтверждены, наблюдаемый native quit exit **−1** обработан явно. Последние cache promotions успешны.
 
-WARM compatibility key: `b37a93c03ae490a52662af2f167343eda017ce450d373f43abced8fb91b58b23`. RustNav полностью built: 35344 tiles; из cache загружены 13027 tiles. Успешное сохранение test world и cache promotion не создаёт actor/journal save-proof для PARTIAL run.
+Первая попытка:63wood против debit126, rock UID92220 condition100→96.326004, wood UID94209. NATURAL tiny birch6982: pool375→249, fraction1→0.664, health196.799911→−4.800089. Pool-only admission не учитывал сохранённый низкий health при reset pool. После11 committed hits последний PREPARED остался IN_DOUBT:35records, SHA **5AB44FD8348F5BFB422F138BF4CDA0F9DC8A226BAD3007CF45B7D87746B3121E**. Никакой компенсации/recovery этого intent; test inventory удалён штатным cleanup. Untouched discovery6975 не объявляется depleted source. Raw PARTIAL сохранён.
 
-| Run | Loaded generation | Loaded .sav SHA-256 |
+v0.1.4 добавил admission по pool/health, destroyFraction, rounding и maximum gatherScale×3; source record создаётся перед actual hit. Второй run выбрал healthy beech, но остановился до добычи на local waypoint: travel/hits/craft/source records0. Физический подтип старого отказа UNKNOWN: лог не разделял sample/ground/path gates. v0.1.5 отделил map/wipe identity от save proof. v0.1.6 переиспользовал WorldRoam36/24/12м safe progress candidates, native radius2.5, Ground и complete local path≤80м, затем Survival bounded source rejection. Другие режимы сохраняют прежние параметры; teleport/позиционного обхода нет. Prelive independent review clear; третья попытка завершила физический маршрут и экономику. Старые failed receipts не стирались ради GREEN.
+
+## Источники, identity и добыча
+
+Динамическое обнаружение текущего мира; координаты ниже — измерения, не runtime constants. NetID используется вместе с exact saved-incarnation proof; incarnation UUID — только journal key.
+
+| Поле | NATURAL tree | NATURAL ore |
 |---|---|---|
-| Первый | world-9a4d0e6491464cd8b192d479a87aef54 | D0E4B8BBFCE5B1E2D2C9128C034BC22DB78B3BF277C1EB81C009953200FA9945 |
-| Второй | world-5d6302e4983046e58b2caf88a3ee12f2 | A6966D7265AC7535AE2BBEAB627FC14FCB75883A45B72526F0F310ED037F3EF5 |
+| Saved UID / incarnation | 7210 / 98249089ba074db599dc2e60c15041fc | 2823 / 53c3ee83011a445c9b9e4497bfb2b468 |
+| Prefab | assets/bundled/prefabs/autospawn/resource/v3_temp_forest/american_beech_a.prefab | assets/bundled/prefabs/autospawn/resource/ores/stone-ore.prefab |
+| Type / population | TreeEntity / procmap_v3_temp_forest_deciduous | OreResourceEntity / ores |
+| Position | [24.4471684,8.436977,−222.981354] | [98.274086,16.4595833,−136.832077] |
+| Rotation | [0,0.933167458,0,−0.359442025] | [0.09528102,−0.9324042,0.0462934859,0.345544368] |
+| Scale | [0.8196248,0.8196248,0.8196248] | [0.524594367,0.524594367,0.524594367] |
+| Hits / credit | 40 / 200wood | 13 / 107stones |
+| Pool initial→depleted | 500→100 | 750→536 |
+| Fraction initial→depleted | 1→0.2 | 1→0.714666665 |
+| Native debit / destruction | 400 / 200 | 214 / 107 |
+| Saved post-gather health | 199.999664 | 357.333466 |
 
-Первый эпизод выявил реальный дефект admission: native pool после reload reset, но ранее повреждённый tree health сохранился. Pool-only guard 007 не гарантировал возможность собрать рецепт и оставить узел живым. NATURAL TreeEntity 6982, `assets/bundled/prefabs/autospawn/resource/v3_temp_field/birch_tiny_temp.prefab`, position `[-35.088, 7.152832, -304.476074]`, population `procmap_v3_temp_field_small`, rotation `[0, 0.8458856, 0, 0.5333645]`, scale `[0.6742678, 0.6742678, 0.6742678]`. Transient netID не объявлен постоянной identity. Journal incarnation `3b4b5dc5293d412f9e08f9281a8f7a6f` — ключ записи, а не доказательство engine identity.
+Итого debit614 = credit307 + native destruction307; adapters0,new drops0. Owned held rock UID98288 condition **100→82.29802**. Native initiator/weapon, reach/LOS/ground, item chains и source pool проверены независимо. Движение **201.842964966м**,291samples,7completed legs, max step1.699037349м, max gap0.591125с; manual position writes0.
 
-| Измерение первого эпизода | До | После |
-|---|---:|---:|
-| Native pool wood | 375 | 249 |
-| fractionRemaining | 1 | 0.664 |
-| Native source health | 196.799911 | −4.800089 |
-| Rock condition, UID 92220 | 100 | 96.326004 |
-| Native wood, UID 94209 | 0 | 63 |
+## Крафт, личность и предметы
 
-Native расход 126 = 63 credited wood + 63 native destruction; adapter credit=0, new drops=0. Последующий hit по закончившемуся дереву не дал yield; автоматического retry/компенсации не было. Дерево не подходит для доказательства same-node restart. Неповреждённое сопоставление/накладывание depletion после restart не выполнялось.
+Loaded stonehatchet blueprint: **200wood+100stones→1output**. Roam native ItemCrafter unavailable; честный **SERVER_ACCOUNTED_CRAFT**, без fake timed queue. Native UseItem consumed wood UID100299×200 и stones UID106659×100, затем создан один stonehatchet UID106675 condition/max100/100.
 
-Логический actor первого эпизода: `avatar-007-7450dda36ea6446f8584243bcbf9290c`. 60 фактических samples, 2 legs; независимая сумма пути 34.127420672 м, max step 1.534252469 м, max gap 0.503579 с. Inventory перед cleanup — один исходный rock и 63 wood, без product. NPC и его test inventory штатно удалены owned cleanup; эти предметы не заявляются сохранёнными между рестартами.
+Личность **avatar-007-6f3b4acb0e2e4764a4fc92098e6ff22a**, intent **avatar007-3f85a956a2d54c4c8bdd7450997e0b9e**, Goal COMPLETE/CraftStatus CRAFTED сохранены. Concrete actor net96421→106986 — новая native оболочка той же личности, без connection/Steam impersonation.
 
-После дополнительного native IL исследования v0.1.4 учитывает health/pool capacity, native destroyFraction, rounding reserve и maximum gatherScale ×3. Focused regression на фактическом классе ошибки и ore bonus counterexample прошёл RED → GREEN. Source journal теперь включает только действительно затронутые узлы: untouched discovery не считается depletion.
+| Original UID | После JOURNEY и RESTORE |
+|---|---|
+| 98288 | rock×1, condition82.29802/max100, BELT slot0 |
+| 106659 | stones×7, MAIN slot1 |
+| 106675 | stonehatchet×1, condition100/max100, BELT slot1, active |
 
-Во втором запуске выбран NATURAL beech 7210, prefab `assets/bundled/prefabs/autospawn/resource/v3_temp_forest/american_beech_a.prefab`, position `[24.4471684, 8.436977, -222.981354]`, pool 500. Существующий StartLeg не нашёл допустимую локальную точку маршрута и остановился до hit: travel=0, harvests=0, source records=0, craft=null. Нет оснований объявлять admission исправленным LIVE до завершения игрового эпизода.
+008 lifecycle сохранён: strict incoming UID/container/binary gate, sanitation только ephemeral heldEntity в проверенной protobuf-копии, native Load и два parent passes. Axe held net106676→108785, GetItem UID106675, owner/parent106986, held flag=true. Source/foreign item/entity checks passed. RESTORE: starter kit=[],harvests=[],craft=null,movement legs0. Duplicate intent denied, inventory unchanged; новых Item/оплаты нет.
 
-Третий старт **не использован**. Первый дефект обосновывал исключительный бюджет на новую пару JOURNEY + RESTORE, но второй маршрутный отказ оставил только один старт и ни одного допустимого completed JOURNEY. Обходить provenance gate, восстанавливать незавершённый intent или запускать заведомо недоказательную серию серверов не стали. Navigation fix и новая полная пара E2E остаются необходимыми для достижения основного outcome; следующий Goal не начинался.
+## Depletion restore и NOOP
 
-## Journal / recovery / negatives
+По одному geometric candidate на source; оба — actual ResourceEntity instances из native OnEntityLoaded(fromDisk=true). Проверены UID/prefab/type, position1мм, rotation/scale/bounds, population, item definition/startAmount, saved health и native load policy. Новый respawn/map-only объект не получает старый witness. Все планы валидированы до debit.
 
-Первый реальный journal: **35 entries** = header + 11 × (PREPARED/APPLIED/COMMITTED) + последнее PREPARED. SHA-256 **5AB44FD8348F5BFB422F138BF4CDA0F9DC8A226BAD3007CF45B7D87746B3121E**. Actual helper и независимый parser классифицируют его **IN_DOUBT** и отказывают completed recovery. Аудит не изменил bytes/hash. Это quarantined evidence, а не завершённая recoverable economy.
+| Source | Native reload | Apply | Итог | Второй pass | Соседи |
+|---|---|---:|---|---|---:|
+| Tree7210 | pool500/fraction1 | debit400 | pool100/fraction0.2 | NOOP100→100 | 38unchanged |
+| Ore2823 | pool750/fraction1 | debit214 | pool536/fraction0.714666665 | NOOP536→536 | 3unchanged |
 
-Schema/sequence/hash chain, exclusive writer, Flush(true), complete-tail и world/actor/recipe binding реально используются плагином. COMMITTED записывается после проверенного source debit/credit/wear или exact craft payment/output. Любой recovered incomplete intent и любой повтор committed intent блокируются; restore не создаёт предмет по намерению. Native source/inventory/save и journal остаются разными системами, общей crash-atomic transaction нет.
+Native DestroyFraction с одной положительной категорией, actual result проверен; replay credits0. Tree health199.999664 сохранён; ore saved357.333466→current500 — установленный StagedResourceEntity.Load reset, не новый source. InputSnapshotHealth отдельно от output checkpoint; original economics не переписаны.
 
-Focused OFFLINE_ONLY проверки используют настоящий helper и durable files: five craft interruption checkpoints, duplicate intent, concurrent writer, empty/truncated/corrupt journal, wrong world/generation/actor/recipe, reset/NOOP, missing/ambiguous/new-respawn witness, unexpected lower/partial pool, wrong source prefab/position, wrong output UID, geometry/health mismatch и nonfinite telemetry. Отказы защищают нулевое исполнение/retry в этих contracts; они не являются живыми Rust Item/payment fault experiments. Не было реального interrupted-process recovery, live craft, live replay или физической проверки соседних pools.
+## Map identity и snapshot binding
 
-Независимое prelive code review закрыло staged ore health reset и Windows writer/read sharing; дополнительно усилены finite measurements и source geometry receipts. Reviewer воспроизвёл NaN gap в PowerShell 7; исходный PS5.1 вариант не объявлен наблюдённым RED. После первого live root cause reviewer дал конкретный ore ×3 counterexample; он наблюдался RED и закрыт до второго запуска. Финальное независимое raw-ledger review подтвердило PARTIAL, conservation, actual source hash и отсутствие необъяснимых awards/cleanup anomalies.
+Native World getters и SHA actual .map дают kind/level/seed/size/format/MapKey; плюс persistent SaveRestore.WipeId дают WorldKey. Cache key/generation, SHA .sav, URL и transient Entity ID не являются постоянной identity мира. WorldKey directories изолируют старые данные при map/seed/size/version/wipe change; unknown identity блокирует Load/debit. Discovery/навигация не содержат resource/NPC/road coordinates или test seed;424242/2000 только безопасный test fixture.
 
-## Проверки и сохранность
+Фактический мир: PROCEDURAL,Procedural Map,seed424242,size2000,format289, map SHA **1F09D94EC8DA9DAC4E32908817A16BCC167D7B5A654E90DB19042E1501F17A47**, wipe **d8209fc56a19464b8b042fa872751434**.
 
-`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1` — **exit 0** после v0.1.4 admission исправления, до второго live; повторён после обязательного map-identity дополнения v0.1.5. Включены прежние regression suites, focused economy/map contracts и C# 7.3 compile всех пяти plugins против installed DLL. Live captured v0.1.4 — source + реально подключённый BCL helper — SHA **305CE45592CCBC2CB3219B94CA6BBFD83C713729FB8F605913660E9C52DBB354**. v0.1.3 capture первого run: **09EADBC7F7D1DC6ED6E8686077DB55D65E82F3F57AC2482AB1FBBF49DC651CB4**. Итоговый v0.1.5 изменён после этих запусков по обязательному дополнению владельца; совпадение с live capture и live compilation для него не заявляются.
+- MapKey **4F644EE04C9A774971FEEE0B64222CB25F51AD05EE3A45330C36FF704ACD2D46**.
+- WorldKey **50D9C07452A0FF03ABBCE2AB6493EF75581D3B82D30D0F3CB74481C6E887C8CE**, неизменен в обеих proofs.
+- Compatibility **b37a93c03ae490a52662af2f167343eda017ce450d373f43abced8fb91b58b23**, отдельный installed-runtime gate.
 
-Финальный safety audit 11:53:40 UTC: Rust/SteamCMD/helper processes=0, TCP/UDP test endpoints=0, firewall rules=0, live brokers=0, open leases=0, occupied locks=0; все 17 исторических/new leases закрыты. Owner **Server/: 3086 файлов, SHA/length changes=0**. 22 исторических raw-файла 007–008 unchanged; source 001/003/004/006 unchanged. SteamCMD, updater, BAT, обновление Rust/Oxide и owner runtime не запускались и не изменялись.
+| Checkpoint | JOURNEY output / RESTORE input | RESTORE output |
+|---|---|---|
+| Generation | world-4f082a1c535d471989ee22a20dc31e9e | world-cee320627654459188b50c7f24a92658 |
+| .sav SHA | 8AFC1A78360B44725F0B5A1D49D2C1053EE310A1EE252FDEB26CBC647A7B7D58 | 40E83E047124ACD14BE6AD809A8C94E4F10802C815518AF9DDF891CCB536A7A9 |
+| Inventory SHA | BAE10634AFAC3E64566CD61F71E4D610314E5D03B2968F03E01D1CFFBAA78A79 | 29B37665F8325FAB18267E6DAA1EFD76B9DE8D255A4FA579AB30FE5CC6B8A815 |
+| Actor SHA | 5792D1E38087902D65045E0771AF09F0E6A5251DF3B2EA2ACDDBE1ECD38B3C73 | DB50755F75C0C995E7879627929A6E5352D9ECC843B4F77D1C929DFD6A1DDE12 |
+| Economy state SHA | 3C301E3C01240E7615562D79A44293A433323CA9F561D7C287787AB81A994FDC | 6D5E51C0F85C0779E929CF5994AC91D14E37D203E99291A8829C5E39956FDDB7 |
+
+Actor/inventory hashes меняются из-за новых ephemeral owners/held, economy state — из-за output health checkpoint. Exact economic rows и immutable source/payment records сохранены. Оба proofs независимо валидны. Ещё один native RESTORE из нового checkpoint не проводился.
+
+## Journal, negatives и review
+
+165records = header+53×(PREPARED/APPLIED/COMMITTED)+craft(PREPARED/DEBITTING/DEBITED/OUTPUT_CREATED/COMMITTED). Journal byte-identical в двух процессах: **792E60CC18695193A410F13A3B7BAEDEBE8BDB8DA0EBAC70FA4BEC9000245641**. Before-hit и before-debit стадии durable Flush(true); completion только после actual payment/result. Recovery не создаёт output из неподтверждённого intent. Checksums/proof hashes защищают integrity, не hostile administrator, переписывающего все артефакты.
+
+OFFLINE_ONLY tests: реальный helper/files и independent parser/validator; duplicate intent/concurrent writer, пять interruption checkpoints, partial payment/output uncertainty, empty/torn/corrupt journal, wrong world/generation/actor/recipe/output UID, missing/ambiguous/new-respawn witness, wrong prefab/position/geometry, lower/partial pool, staged-health input/output, nonfinite receipts. Cross-world отказы не меняют journal SHA. Same map/wipe reopens paid intent при другом отдельном save proof; procedural/custom/map hash/level/seed/size/format/wipe changes отказывают и изолируют namespaces. Другая карта не запускалась: это contracts, не multi-map gameplay E2E.
+
+Independent review закрыл staged-ore semantics, Windows writer/read sharing, finite telemetry (NaN reviewer воспроизвёл PS7; исходный PS5.1 RED не заявляется), ore×3 counterexample, input/output health boundary. Focused RED→GREEN сохранены локально. Финальный reviewer независимо проверил successful raw pair/journal/proofs, native debit/credit, original UID/intent, apply/NOOP; ledger anomalies не найдено. Fixtures/review не заменяют LIVE.
+
+## Проверки, сохранность и ограничения
+
+Финальный `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-All.ps1` — **exit0** после v0.1.6 route refinement, до последних2 live. Старые regression suites, economy/map contracts и C#7.3 compile пяти plugins passed. Итоговый/captured v0.1.6 source+helper SHA **CD5DCEF7C5AEA12E43572353DE27D2C281FC2E0B2F5C001A053138BAEEFEF1CD**, одинаков в обеих LIVE; код после запусков не менялся.
+
+Safety audit **12:36:37UTC**: Rust/SteamCMD/helper processes0,TCP/UDP test endpoints0,firewall rules0,live brokers/open leases/occupied locks0; все19leases closed. Owner **Server/:3086 файлов, SHA/length changes0**. 22historical raw-файла007–008 unchanged; source001/003/004/006 unchanged. SteamCMD/update/validate/BAT не запускались; Rust/Oxide, owner configs/mods/saves не менялись.
 
 - mojibake-маркеры в изменённых файлах проверены;
 - escaped Cyrillic в изменённых файлах проверены.
 
-Отдельный public audit проверяет strict UTF-8/NUL, обе encoding-проверки, owner values, credentials/Steam IDs, RCON secrets обоих runs и non-loopback IP. Server/, .local/ и artifacts/ остаются ignored, Server/ tracked files=0. Raw/секреты не входят в public allowlist.
+Public audit: все18paths, strict UTF-8/NUL, обе encoding checks, owner values, credentials/Steam IDs, RCON secrets всех4runs, non-loopback IP. Server/,.local/,artifacts/ ignored; Server tracked0. Raw/секреты не публикуются.
 
-## Обязательное дополнение: любые совместимые карты
+GREEN ограничен graceful парой. Не доказаны production crash atomicity/live interrupted payment recovery, arbitrary map-only incarnation/законный respawn continuation, длительная restart chain, custom-map gameplay/все карты,50–100NPC,timed native craft queue/client animations. Map-independent architecture и fail-closed contracts реализованы; это не всемирный E2E. Новый Goal/Slice не начинался.
 
-После первого PARTIAL delivery владелец уточнил обязательную map-independent архитектуру. v0.1.5 разделяет стабильную identity карты/мира и состояние save. Динамические World.Name/Procedural/Seed/Size, native map file и numeric format берутся из подтверждённого API; содержимое реальной .map хешируется один раз. MapKey включает kind/level/seed/size/format/map SHA, WorldKey — MapKey + persistent native wipe GUID. Изменяющийся SHA .sav, cache key/generation, URL и transient Entity ID не используются как постоянная identity мира.
+## Scope и Git
 
-Journal/state разделены по WorldKey directories. При новой карте, seed/size/version или wipe прежние данные остаются изолированными; автоматического переноса/replay нет. Неизвестная identity останавливает работу до Load/debit. Strict exact save/generation/hash proof остаётся отдельным gate состояния. Runtime discovery ресурсов/навигации не содержит координат или seed тестовой карты; фиксированные 424242/2000 остаются только параметрами существующего безопасного test runner.
+Cumulative allowlist **18public paths**: supplied8docs009+PLAN/API_DECISION/RESULT; src/economy/EconomyJournal.cs,src/plugins/RustBotsAvatarSurvival.cs; scripts/Invoke-NavigationProbe.ps1,EconomyValidation.ps1,Test-Economy.ps1,Test-PluginCompile.ps1,Test-All.ps1. Bounded exception/approval — [PLAN.md](PLAN.md). Старые результаты007–008 задним числом не изменялись.
 
-Для последовательных обычных RESTORE разрешён новый completed checkpoint без повторного craft. Original source/payment journal не меняется; native health следующего save хранится отдельно от health входного checkpoint, особенно для staged ore. Независимое review поймало смешение входного и выходного health в receipts; реалистичный regression 80 → native 100 → output checkpoint 100 наблюдался RED и закрыт до финального Test-All.
+Git прямо разрешён TASK/пользователем. Inspection: `git branch --show-current`, `git rev-parse HEAD`, `git rev-parse origin/master`, `git rev-parse HEAD origin/master`, `git status --short`, `git status --short --untracked-files=all`, `git remote -v`, `git ls-remote origin refs/heads/master`, `git ls-files Server`, `git ls-files -- Server/`, `git check-ignore Server/ .local/ artifacts/`; HTTPS `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: ls-remote origin refs/heads/master`. Exact review `git diff --stat -- <exact paths>`, `git diff --no-ext-diff -- src/plugins/RustBotsAvatarSurvival.cs`, `git diff --check`; reviewer only разрешённые diff. Cumulative `git diff --name-only 58d384e23a8200387d2574f935273c3056ab5b0a` и baseline+HEAD.
 
-OFFLINE tests реально проверяют committed-intent reopen для той же карты/wipe при другом отдельном save proof, отказ при изменении level/map hash/seed/size/format/kind/wipe, различие namespaces и неизменный SHA старого журнала после cross-world отказов. Проверены procedural и custom descriptors, включая смену содержимого custom map. **MULTI_MAP_E2E=NOT_CONDUCTED; v0.1.5 LIVE=NOT_PROVEN; повторная цепочка native RESTORE=NOT_PROVEN.** Дополнительных live запусков или генерации второй карты не было. Эти архитектурные проверки не меняют общий PARTIAL и не доказывают работу игры на всех картах.
+Delivery: `git add -n -- $paths`, `git add -- $paths` exact arrays; `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --no-ext-diff -- $paths`; commits `feat: add guarded world economy journal and recovery probe`(a5f7413),`fix: separate map identity from economy save checkpoints`(2b58704), финальный `fix: complete bounded world economy restart proof`. Обычный `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master`, затем local/tracking/public SHA и clean-tree checks. Force/broad add/reset/rebase/stash/clean/history rewrite не применялись.
 
-Итоговый v0.1.5 source + helper SHA-256: **7E02414624A3D8FC14FD3F8BE1FDC3CB927707D2A4DEBD40033FB6D3A711FBE6**. Финальный Test-All после input/output checkpoint исправления — exit 0; public audit повторно проверил все 18 файлов и оба live RCON secrets, исторический capture сохранён. Runtime .map hashing выполняется однократно перед созданием actor.
-
-## Scope и Git delivery
-
-Bounded exception: **18 exact public paths** из [PLAN.md](PLAN.md): восемь supplied docs 009, PLAN/API_DECISION/RESULT, helper/plugin и пять scripts. Никаких старых task-результатов задним числом не изменено. No new dependency/project/UI/updater/owner file.
-
-Git прямо разрешён TASK и пользователем. Использованы inspection: `git branch --show-current`, `git rev-parse HEAD`, `git rev-parse origin/master`, `git status --short`, `git remote -v`, `git ls-remote origin refs/heads/master`, `git ls-files Server`, `git check-ignore Server/ .local/ artifacts/`; HTTPS fallback `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: ls-remote origin refs/heads/master`. Exact review: `git diff --stat -- <exact code paths>`, `git diff --check`; reviewer использовал только `git diff --stat` и `git diff --no-ext-diff --unified=6` для разрешённых code paths.
-
-Final scope/delivery commands: `git status --short --untracked-files=all`, `git add -n -- $paths`, `git add -- $paths` с массивом ровно 18 allowlist paths; `git diff --cached --name-only`, `git diff --cached --check`, `git diff --cached --stat`, `git diff --cached --no-ext-diff -- $paths`; `git commit -m 'feat: add guarded world economy journal and recovery probe'`; обычный `git -c credential.interactive=false -c url.https://github.com/.insteadOf=git@github.com: push origin master`; затем HTTPS ls-remote, `git rev-parse HEAD origin/master`, `git status --short`, `git ls-files -- Server/`. Ни force, ни broad add, ни history rewrite не используются.
-
-Первый PARTIAL commit **a5f7413ae9440b99072576c8a006d88f209286a9** обычным push опубликован в master; HEAD/tracking/public ref перед map-дополнением совпали. Дополнение коммитится тем же exact-path процессом, message `fix: separate map identity from economy save checkpoints`; bounded diff выполняется против a5f7413 для review и против исходного 58d384e для cumulative 18-path guard. Финальный commit/ref SHA и remote equality записываются после commit в ignored `.local/audit/economy009/delivery.json` и сообщаются в финальном ответе: commit не может содержать собственный SHA. Доставка PARTIAL означает публикацию честного bounded результата; она не меняет outcome на GREEN.
+Финальный SHA/public equality/clean receipt после commit — ignored .local/audit/economy009/delivery.json и финальный ответ. Commit не может содержать собственный SHA. GREEN_WORLD_DEPLETION следует из raw proof, не из факта доставки.
