@@ -1,4 +1,4 @@
-# DECISION017 — нужен выбор физического mover
+# DECISION017 — выбран вариант C
 
 **Выбран C.** 05.11.2026 владелец ответил: «C — собственный local controller (рекомендовано)». Универсальность и настоящий ScientistNPC/BasePlayer также согласованы. Основание обсуждения: TASK017 раздел1, DECISION_GATE.md и PHYSICS_CONTRACT.md пункт4. API_DECISION.md содержит установленные signatures/IL и отделяет STATIC_IL от live.
 
@@ -18,7 +18,7 @@ A сохраняет текущую fail-closed остановку и может
 
 Согласованное решение владельца — C: собственный collision-aware local controller исходного ScientistNPC поверх RustNav route planning, включая ограниченное физическое применение проверенных перемещений исходного тела, при запрете teleport/unchecked transform/Warp, collider/scale/layer изменений и при обязательных continuous witnesses.
 
-Решение не отменяет максимум3 isolated live starts, independent review, physical up/down/building/outdoor/negative proof, original inventory/economy и честный PARTIAL при неуспехе. Ответ получен до реализации. Все3 starts использованы; physical gate не пройден. Кандидат остаётся bench-only, обычный native runtime сохранён; limits и unsafe raw не переименовываются в PASS. Commit/push поставляют честный PARTIAL, не promotion.
+Первоначальный предел3 isolated live starts был исчерпан без physical PASS. После поставки честного PARTIAL владелец отдельно разрешил исправление physics-clock и ещё до2 starts: «Разрешаю исправление и ещё до 2 starts». Общий предел017 равен5, использованы все5 после offline-проверок и независимого review. BENCH4/5 подтвердили новый fixed horizon на коротких acquisition fragments, но оба остановились по независимому wall guard; universal physical gate не пройден. Шестой PID не разрешён. Исходная постановка и unsafe raw сохраняются; это изменение бюджета, а не physical acceptance или смена выбранного C. Кандидат остаётся bench-only. Original inventory/economy, independent review и physical up/down/building/outdoor/negative proof обязательны.
 
 ## Ответ владельца
 

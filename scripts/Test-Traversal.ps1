@@ -65,6 +65,87 @@ foreach($mutation in @(
     @{Name='pre-sweep only witness';Change={param($x)$x[1].Sweeps[0].To=$x[1].From}}
 )){$x=Copy-TraversalFixture $frames;& $mutation.Change $x;Deny-TraversalFixture {Assert-TraversalFrames $x '19' 'synthetic-world'} $mutation.Name}
 Write-Output 'PASS OFFLINE_ONLY 1: identity/world/body, native result, bounded continuity, actual after sweep and support receipts'
+function Set-TraversalClock($f,[double]$wall,[double]$fixed,[int]$sequence){
+    $f.Schema=2;$f.Time=$wall
+    $f|Add-Member NoteProperty Clock @{Schema=2;WallTime=$wall;FixedTime=$fixed;FixedUnscaledTime=$fixed;Delta=0.05;UnscaledDelta=0.05;TimeScale=1.0;InFixedStep=$true;PhysicsMode='FixedUpdate';Sequence=$sequence;Frame=300} -Force
+    $f|Add-Member NoteProperty FixedDt 0.05 -Force;$f|Add-Member NoteProperty WallDt 0.0 -Force
+    $f|Add-Member NoteProperty PreviousClock $null -Force
+    $f.Body|Add-Member NoteProperty Velocity @(0,0,0) -Force
+}
+function New-FixedClockFrames {
+    $result=@(New-TraversalFrames);$baseline=New-TraversalFrame 'CLOCK_BASELINE' 0 10 @(0,0,0) @(0,0,0) 0
+    $baseline.NativeResult='CLOCK_BASELINE';$baseline.Classification='CLEAR';Set-TraversalClock $baseline 10 1 100;$baseline.FixedDt=0
+    $baseline|Add-Member NoteProperty PosePrevious @(0,0,0);$baseline|Add-Member NoteProperty PosePreviousTime 9.99;$baseline|Add-Member NoteProperty ObservedVelocity @(0,0,0)
+    $walls=@(10.03,10.08,10.08,10.081);$fixed=@(1.05,1.10,1.10,1.15);$sequences=@(101,102,102,103);$priorWall=10.0;$priorVelocity=@(0,0,0);$issued=$null
+    $lastCallback=$baseline.Clock;$previousCallback=$null
+    for($i=0;$i -lt $result.Count;$i++){
+        $f=$result[$i];Set-TraversalClock $f $walls[$i] $fixed[$i] $sequences[$i]
+        if($f.Clock.Sequence -ne $lastCallback.Sequence){$previousCallback=$lastCallback;$lastCallback=$f.Clock}
+        $f.PreviousClock=Copy-TraversalFixture $previousCallback;$f.WallDt=$walls[$i]-$previousCallback.WallTime;$f.Dt=0.05;$velocity=@(for($j=0;$j -lt 3;$j++){($f.Requested[$j]-$f.From[$j])/0.05})
+        $f.Acceleration=(Get-WorldDistance $velocity $priorVelocity)/0.05;$f.Speed=(Get-WorldDistance $f.Requested $f.From)/0.05
+        if($f.Event -eq 'MOVE_DECISION'){
+            $f.Distance=Get-WorldDistance $f.Requested $f.From;$f.Body.Velocity=$priorVelocity;$issued=$f.Clock;$f.PreviousTime=$priorWall
+        }else{$f.Body.Velocity=$velocity;$f.PreviousTime=$issued.WallTime;$priorVelocity=$velocity;$f|Add-Member NoteProperty NativeVelocityMatches $true;$f|Add-Member NoteProperty NativeVelocityError 0.0}
+        $f|Add-Member NoteProperty IssuedClock (Copy-TraversalFixture $issued) -Force
+        $priorWall=$walls[$i]
+    }
+    @($baseline)+@($result)
+}
+$clockFrames=New-FixedClockFrames
+Assert-TraversalFrames $clockFrames '19' 'synthetic-world'
+$catchup=Copy-TraversalFixture $clockFrames;$catchup[-1].Clock.WallTime=10.08;$catchup[-1].Time=10.08;$catchup[-1].WallDt=0
+Assert-TraversalFrames $catchup '19' 'synthetic-world'
+foreach($mutation in @(
+    @{Name='missing explicit fixed clock';Change={param($x)$x[2].PSObject.Properties.Remove('Clock')}},
+    @{Name='skipped driver fixed update';Change={param($x)$x[2].Clock.Sequence=103}},
+    @{Name='fixed time failed to advance';Change={param($x)$x[2].Clock.FixedTime=$x[1].Clock.FixedTime}},
+    @{Name='changed issued fixed timestep';Change={param($x)$x[2].Clock.Delta=0.04}},
+    @{Name='changed engine time scale';Change={param($x)$x[2].Clock.TimeScale=0.5}},
+    @{Name='not a fixed callback';Change={param($x)$x[2].Clock.InFixedStep=$false}},
+    @{Name='script-driven physics is unproven';Change={param($x)$x[2].Clock.PhysicsMode='Script'}},
+    @{Name='update-driven physics is unproven';Change={param($x)$x[2].Clock.PhysicsMode='Update'}},
+    @{Name='wrong issued clock';Change={param($x)$x[2].IssuedClock.Sequence=99}},
+    @{Name='unsafe wall gap';Change={param($x)$x[2].Clock.WallTime=10.2;$x[2].Time=10.2}},
+    @{Name='wall regressed';Change={param($x)$x[2].Clock.WallTime=10.01;$x[2].Time=10.01}},
+    @{Name='wall dt used for physical motion';Change={param($x)$x[4].Dt=0.001}},
+    @{Name='false planned decision speed';Change={param($x)$x[1].Speed=0}},
+    @{Name='false planned decision acceleration';Change={param($x)$x[1].Acceleration=0}},
+    @{Name='native velocity disagrees';Change={param($x)$x[2].Body.Velocity=@(0,0,0)}}
+)){$x=Copy-TraversalFixture $clockFrames;& $mutation.Change $x;Deny-TraversalFixture {Assert-TraversalFrames $x '19' 'synthetic-world'} $mutation.Name}
+$overAcceleration=@(Copy-TraversalFixture $clockFrames[0])
+foreach($index in @(1,2)){
+    $template=$clockFrames[$index];$f=New-TraversalFrame $template.Event 1 $template.Time @(0,0,0) @(0.01002,0,0) 0.2004
+    $f.Schema=2;$f.Classification='CLEAR'
+    foreach($name in @('Clock','PreviousClock','IssuedClock','FixedDt','WallDt')){$f|Add-Member NoteProperty $name $template.$name -Force}
+    $f.Dt=0.05;$f.Acceleration=4.008;$f.Distance=0.01002;$f.PreviousTime=$template.PreviousTime;$f.Body|Add-Member NoteProperty Velocity @(0,0,0)
+    if($f.Event -eq 'MOVE_DECISION'){$f.Support.Origin=@(0,0.77,0);$f.Support.Center=@(0,0.5,0);$f.Support.Point=@(0,0,0);$f.Support.Hits[0].Point=@(0,0,0)}else{$f.Body.Velocity=@(0.2004,0,0);$f|Add-Member NoteProperty NativeVelocityMatches $true;$f|Add-Member NoteProperty NativeVelocityError 0.0}
+    $overAcceleration+=,$f
+}
+Deny-TraversalFixture {Assert-TraversalFrames $overAcceleration '19' 'synthetic-world'} 'Schema2 acceleration 4.008 exceeds unchanged core limit 4.001'
+# Literal native float coordinates, not a tolerance increase: JSON double subtraction
+# differs by 3.36e-6 m/s from the original Vector3 float computation.
+$from=@(0,5.44947529,-299.999939);$target=@(0,5.441663,-299.999939)
+$floatBaseline=New-TraversalFrame 'CLOCK_BASELINE' 0 10 $from $from 0
+Set-TraversalClock $floatBaseline 10 1 100;$floatBaseline.Clock.Delta=0.0625;$floatBaseline.Clock.UnscaledDelta=0.0625
+$floatBaseline.NativeResult='CLOCK_BASELINE';$floatBaseline.Classification='CLEAR'
+$floatBaseline|Add-Member NoteProperty PosePrevious $from;$floatBaseline|Add-Member NoteProperty PosePreviousTime 9.99;$floatBaseline|Add-Member NoteProperty ObservedVelocity @(0,0,0)
+$floatFrames=@($floatBaseline);$issued=$null
+foreach($event in @('MOVE_DECISION','MOTION_WITNESS')){
+    $f=New-TraversalFrame $event 1 $(if($event -eq 'MOVE_DECISION'){10.03}else{10.08}) $from $target 0.125
+    Set-TraversalClock $f $f.Time $(if($event -eq 'MOVE_DECISION'){1.0625}else{1.125}) $(if($event -eq 'MOVE_DECISION'){101}else{102})
+    $f.Clock.Delta=0.0625;$f.Clock.UnscaledDelta=0.0625;$f.FixedDt=0.0625;$f.Dt=0.0625;$f.Classification='STEP_DOWN';$f.Acceleration=2;$f.Distance=0.0078125
+    if($event -eq 'MOVE_DECISION'){
+        $f.PreviousClock=$floatBaseline.Clock;$f.WallDt=0.03;$issued=$f.Clock
+        $f.Support.Origin=@(0,($from[1]+0.77),$from[2]);$f.Support.Center=@(0,($from[1]+0.5),$from[2]);$f.Support.Point=$from;$f.Support.FootY=$from[1];$f.Support.Hits[0].Point=$from
+    }else{$f.PreviousClock=$issued;$f.WallDt=0.05;$f.PreviousTime=10.03;$f.Body.Velocity=@(0,-0.125,0);$f|Add-Member NoteProperty NativeVelocityMatches $true;$f|Add-Member NoteProperty NativeVelocityError 0.0}
+    $f|Add-Member NoteProperty IssuedClock $issued;$floatFrames+=,$f
+}
+Assert-TraversalFrames $floatFrames '19' 'synthetic-world'
+$wrongFloat=Copy-TraversalFixture $floatFrames;$wrongFloat[-1].Body.Velocity[1]=-0.12601
+Deny-TraversalFixture {Assert-TraversalFrames $wrongFloat '19' 'synthetic-world'} 'native velocity error above .001 remains unsafe'
+$wrongNative=Copy-TraversalFixture $floatFrames;$wrongNative[-1].Body.Velocity[1]=-0.123999;$wrongNative[-1].NativeVelocityError=0.001001
+Deny-TraversalFixture {Assert-TraversalFrames $wrongNative '19' 'synthetic-world'} 'native float limit cannot be bypassed by JSON double rounding'
+Write-Output 'PASS OFFLINE_ONLY clock: fixed issue/witness interval, unequal and catch-up wall intervals, strict native clock and velocity binding'
 function Set-AcquisitionFloor($support,$position){
     $support.Origin=@($position[0],($position[1]+0.77),$position[2]);$support.Point=@($position[0],0,$position[2]);$support.Center=@($position[0],0.5,$position[2])
     $support.Distance=$position[1]+0.27;$support.FootY=0;$support.Gap=$position[1];$support.PlaneClearance=$position[1]
@@ -102,6 +183,27 @@ function New-AcquisitionFrames([double]$startGap=0.1) {
 }
 $acquisition=New-AcquisitionFrames
 Assert-TraversalFrames $acquisition '19' 'synthetic-world'
+$clockAcquisition=Copy-TraversalFixture $acquisition
+$acqBaseline=New-TraversalFrame 'CLOCK_BASELINE' 0 0.99 @(0,0.1,0) @(0,0.1,0) 0
+$acqBaseline.NativeResult='CLOCK_BASELINE';$acqBaseline.Classification='CLEAR';Set-TraversalClock $acqBaseline 0.99 0.9 90
+$acqBaseline.Clock.Delta=0.1;$acqBaseline.Clock.UnscaledDelta=0.1
+$acqBaseline|Add-Member NoteProperty PosePrevious @(0,0.1,0);$acqBaseline|Add-Member NoteProperty PosePreviousTime 0.98;$acqBaseline|Add-Member NoteProperty ObservedVelocity @(0,0,0)
+$active=$acqBaseline.Clock;$prior=$null;$issued=$null;$priorVelocity=@(0,0,0);$observationClock=$null
+foreach($f in $clockAcquisition){
+    $physics=[double]$f.Time;$sequence=90+[int][Math]::Round(($physics-0.9)/0.1);$wall=1.0+($sequence-91)*0.001
+    Set-TraversalClock $f $wall $physics $sequence;$f.Clock.Delta=0.1;$f.Clock.UnscaledDelta=0.1;$f.FixedDt=0.1
+    if($active.Sequence -ne $sequence){$prior=$active;$active=$f.Clock};$f.PreviousClock=Copy-TraversalFixture $prior;$f.WallDt=$wall-$prior.WallTime
+    if($f.Event -eq 'FLOOR_ACQUISITION_OBSERVE'){$observationClock=$f.Clock;$f.PosePreviousTime=0.99}
+    if($f.Event -eq 'MOVE_DECISION'){$issued=$f.Clock;$f|Add-Member NoteProperty IssuedClock (Copy-TraversalFixture $issued);$f.Body.Velocity=$priorVelocity;$f.Distance=Get-WorldDistance $f.From $f.Requested}
+    if($f.Event -in @('MOTION_WITNESS','FLOOR_ACQUIRED')){
+        $f.PreviousTime=$issued.WallTime;$f|Add-Member NoteProperty IssuedClock (Copy-TraversalFixture $issued) -Force
+        $velocity=@(for($j=0;$j -lt 3;$j++){($f.Actual[$j]-$f.From[$j])/0.1});$f.Body.Velocity=$velocity;$priorVelocity=$velocity
+        $f|Add-Member NoteProperty NativeVelocityMatches $true -Force;$f|Add-Member NoteProperty NativeVelocityError 0.0 -Force
+    }
+    $f.Acquisition|Add-Member NoteProperty RestObservationClock (Copy-TraversalFixture $observationClock)
+}
+Assert-TraversalFrames (@($acqBaseline)+@($clockAcquisition)) '19' 'synthetic-world'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $clockAcquisition;$x[1].Acquisition.RestObservationClock.Sequence=90;Assert-TraversalFrames (@($acqBaseline)+@($x)) '19' 'synthetic-world'} 'acquisition rest native clock changed'
 Deny-TraversalFixture {Assert-TraversalFrames (New-AcquisitionFrames 0.21) '19' 'synthetic-world'} 'measured initial native floor gap exceeds MaxDrop'
 foreach($mutation in @(
     @{Name='acquisition dynamic floor';Change={param($x)$x[0].Support.Collider.RigidbodyInstance=77}},
@@ -291,6 +393,11 @@ $observation=Copy-TraversalFixture $acquisition[0];$observation.World=$keys.Worl
 $stopped=Copy-TraversalFixture $observation;$stopped.Event='BLOCKED';$stopped.NativeResult='NOT_ISSUED';$stopped.Classification='UNKNOWN';$stopped.Reason='ACQUISITION_FLOOR_CHANGED_BEFORE_COMMAND'
 $captureRefusal.Traversal.Frames=@($observation,$stopped)
 Assert-TraversalResult $captureRefusal
+$clockRefusal=Copy-TraversalFixture $refusal
+$clockObservation=Copy-TraversalFixture $clockFrames[0];$clockObservation.World=$keys.WorldKey
+$clockStopped=Copy-TraversalFixture $clockObservation;$clockStopped.Event='BLOCKED';$clockStopped.NativeResult='STOPPED';$clockStopped.Classification='UNKNOWN';$clockStopped.Clock=$null;$clockStopped.PreviousClock=$null
+$clockRefusal.Traversal.Frames=@($clockObservation,$clockStopped)
+Assert-TraversalResult $clockRefusal
 foreach($mutation in @(
     @{Name='blocked body changed';Change={param($x)$x.Traversal.Frames[0].Body.Radius=0.3}},
     @{Name='blocked wrong inventory body';Change={param($x)$x.Traversal.Components[0].Instance=99}},

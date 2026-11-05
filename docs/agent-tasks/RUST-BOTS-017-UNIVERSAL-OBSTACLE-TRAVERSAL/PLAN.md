@@ -12,11 +12,13 @@
 
 ## Execution ledger
 
+- Продолжение05.11.2026: владелец разрешил physics-clock fix и до2 дополнительных isolated starts после offline checks/review. Общий предел5; первые3 остаются учтены. Текущий опубликованный master `e3b303b62ce3c4b6a8ead25997fa44948f4e0e4c`. Перед новым start: явный future physics horizon, отдельный wall clock, focused regression, installed compile/Test-All и независимое review. Старые unsafe receipts не переклассифицировать.
+
 - [x] Read-first/native audit, Test-All baseline, независимое source/raw/API review.
 - [x] Владелец согласовал C в ответе 05.11.2026.
 - [x] Task1: shared ObstacleTraversal + controller safety receipts; installed C#7.3 compile; focused offline negative contracts.
 - [x] Task2: outdoor/FirstHome callers и test-only bench; combined source runner; independent pre-live review, pre-live Test-All exit0.
-- [x] Task3: выполнены3 isolated live starts, бюджет исчерпан; actual результаты в RESULT. Это выполнение bounded test work, не physical gate PASS.
+- [x] Task3: выполнены первоначальные3 и явно разрешённые дополнительные2 isolated starts, всего5/5. Actual результаты в RESULT. Это выполнение bounded test work, не physical gate PASS; шестого PID нет.
 - Task4: final Test-All/installed compile/review/SHA/safety пройдены; exact privacy/encoding/scope и commit/push выполняются последними, факт поставки фиксируется в delivery ledger и финальном ответе.
 
 Review focus: same shallow wall/step penetration; own foundation side; initial overlap and after-pose sweep; two writers/nav drift; unsupported drop и delayed physics actuation. Ни один contact-only receipt не даёт STEP_RESOLVED.
@@ -85,15 +87,15 @@ TraversalBench — отдельная test-only partial integration; constructio
 1. Записать ответ в DECISION/RESULT и актуализировать точный design/allowlist. Затем implementation plan с focused RED→GREEN contract groups: obstacle geometry; bounded state/repeated collisions; identity/world/native-failure/continuity negatives. Никаких фиктивных native fixtures.
 2. Реализовать shared core и оба caller: outdoor resource approach и FirstHome. Все изменения C#7.3, existing economy/actor сохранены. Installed compile + Test-All + independent source review до game PID.
 3. BENCH1 в одной физической test copy: discovered outdoor height/slope; paid TEST_FIXTURE native foundation/doorway/door/TC; genuine wall/closed-door negative. Сохранить full actual runtime component inventory и непрерывные before/during/after witnesses. Не фармить3760wood и не выполнять HOME_RESTORE.
-4. BENCH2 только для другого класса либо конкретного установленного дефекта; BENCH3 только с обоснованием и review. Общий максимум3 starts017, использовано3/3, бюджет исчерпан. На unsafe outcome немедленный STOP, не следующая сцена ради GREEN.
+4. BENCH2 только для другого класса либо конкретного установленного дефекта; BENCH3 только с обоснованием и review. Первоначальные3 starts использованы. По последующему явному разрешению владельца допускаются BENCH4–5 после physics-clock fix/offline/review, общий максимум5. На unsafe outcome немедленный STOP, не следующая сцена ради GREEN.
 5. Финальный независимый source/raw review, Test-All/compile, owner/protected SHA, safety cleanup, UTF-8/NUL, отдельные mojibake и escaped Cyrillic, secret exact-path audit. Exact-path staging/commit и обычный git push origin master; public SHA/clean tree. До закрытия архитектурного gate не начинать эту поставку.
 
 ## Пока не проверено
 
-Shared core, callers, bench и focused validators созданы в exact scope. Declared custom limits ограничены installed BuildParams/body, не выдаются за native capability. BENCH3 наблюдал один native descent0.01558876m, но actual acceleration нарушила unchanged limit; acquisition не завершён. Up/down/building/outdoor/negative physical proof остаётся NOT_PROVEN. Исторический013 outbound collider и after-contact resolution016 остаются UNKNOWN. GREEN_TRAVERSAL_CORE не заявляется.
+Shared core, callers, bench и focused validators созданы в exact scope. Declared custom limits ограничены installed BuildParams/body, не выдаются за native capability. BENCH3 нарушил acceleration limit. Новый clock в BENCH4/5 подтвердил соответственно5 и2 accepted acquisition witnesses, native velocity matches и delta0.0625; оба остановлены по wall gap выше0.1. Acquisition не завершён. Up/down/building/outdoor/negative physical proof остаётся NOT_PROVEN. BENCH5 warmup прошёл, затем home-first paid craft/first travel; placements0. Исторический013 outbound collider и after-contact resolution016 остаются UNKNOWN. GREEN_TRAVERSAL_CORE не заявляется.
 
 ## Final nonpromotion и следующий технический шаг
 
 После failed physical gate кандидат активируется только явным isolated -TraversalBench. Обычные outdoor/FirstHome маршруты сохраняют прежние native SetDestination/rearm/path/physical guards. Это post-live OFFLINE_ONLY integration guard; core SHA и frozen live evidence не переписаны. Universal product objective остаётся незавершённым, физический gate REQUIRED.
 
-Timing defect: previous observed interval0.08828735s использовался как future command horizon, actual следующий interval0.062194824s. Требуется отдельный physics-step/time contract с измерением fixedTime/fixedDeltaTime и native velocity; нельзя исправлять это подгонкой acceleration epsilon. Три разрешённых starts уже использованы. Новая физическая приёмка требует нового явного live budget;018 не начинается.
+Timing defect BENCH3 исправлен явным physics-step contract: driver без wall throttle снимает каждый FixedUpdate с sequence, double fixed/unscaled/wall times, actual future delta, mode и timeScale. Core/validator требуют exact next step, native velocity и независимый wall gap/deadline. Unknown/skip/change останавливают движение; stale-velocity replan запрещён до actuation. Single JSON reconstruction исправлена без расширения velocity limits. BENCH4/5 actual timing прошёл на коротких fragments, но wall gaps0.1031844/0.125893 остановили приёмку. Bench5 stationary warmup2s/20s и home-first sequencing этого не устранили. Лимиты не увеличены; neutral terminal after-geometry не принимает late command. Бюджет5/5 исчерпан. Следующий технический вопрос — доказуемая политика scheduler lateness и безопасного hold/recovery в выбранном C; реализация/новые live не объявлены разрешёнными.018 не начинается.

@@ -14,8 +14,19 @@ namespace RustBots.Navigation
     // until the following physics tick supplies an independent actual witness.
     public sealed class ObstacleTraversal
     {
+        public struct TraversalClock
+        {
+            public double WallTime, FixedTime, FixedUnscaledTime;
+            public float Delta, UnscaledDelta, TimeScale;
+            public bool InFixedStep;
+            public string PhysicsMode;
+            public long Sequence;
+            public int Frame;
+        }
+
         private const int Mask = -1, MaxEvidence = 16384, MaxCasts = 64;
         private const float Numerical = 0.001f, MaxTick = 0.1f, MaxAcceleration = 4f;
+        private const double ClockPrecision = 0.000001;
         private readonly ScientistNPC npc;
         private readonly RustNavMeshAgent agent;
         private readonly string world, actor;
@@ -33,7 +44,10 @@ namespace RustBots.Navigation
         private readonly Stopwatch queryClock = new Stopwatch();
         private readonly List<object> evidence = new List<object>();
         private int routeIndex, ticks, casts, command, retries, actuations, heightWitnesses, unchangedWitnesses;
-        private float lastTime, startTime, commandTime;
+        private float lastTime, commandTime;
+        private double startWallTime;
+        private TraversalClock currentClock, previousClock, commandClock, acquisitionRestClock;
+        private bool clockReady, clockContext;
         private Vector3 destination, lastPosition, lastVelocity, commanded, commandFrom;
         private Vector3 routeFrom;
         private RustNavmesh routeMesh;
@@ -148,7 +162,8 @@ namespace RustBots.Navigation
             if (lastVelocity.magnitude > Numerical) { Stop("DESTINATION_CHANGE_BEFORE_OBSERVED_REST"); return false; }
             this.destination = destination; this.stage = stage ?? "UNSPECIFIED";
             active = true; arrived = blocked = false; reason = "ROUTE"; retries = 0; heightWitnesses = 0; unchangedWitnesses = 0;
-            lastTime = startTime = Time.realtimeSinceStartup; lastPosition = npc.transform.position;
+            startWallTime = Time.realtimeSinceStartupAsDouble; lastTime = (float)startWallTime; lastPosition = npc.transform.position;
+            clockReady = false; // A destination can be issued outside a physics callback.
             if (!Finite(destination) || BodyProblem() != null || !Plan(destination))
             { Stop("UNKNOWN_ROUTE_OR_BODY"); return false; }
             supportDirection = Horizontal(route[routeIndex] - lastPosition).normalized;
@@ -160,35 +175,68 @@ namespace RustBots.Navigation
             agent.isStopped = true; agent.updatePosition = false; agent.updateRotation = false;
             if (pending) { reason = "UNOBSERVED_COMMAND:" + reason; unobservedTerminal = true; }
             active = false; arrived = false; blocked = true; this.reason = reason;
-            var frame = pendingFrame == null ? Frame(Time.realtimeSinceStartup, npc.transform.position) : Copy(pendingFrame);
+            var frame = Frame(clockContext ? (float)currentClock.WallTime : (float)Time.realtimeSinceStartupAsDouble, npc.transform.position);
+            if (pending) { frame["IssuedClock"] = ClockRow(commandClock); frame["PendingDecision"] = pendingFrame; }
             frame["Actual"] = P(npc.transform.position); frame["Reason"] = reason;
             frame["NativeResult"] = pending ? "UNOBSERVED" : "STOPPED";
             Emit("BLOCKED", frame);
             pending = false; pendingFrame = null;
         }
 
-        public void Tick(float now)
+        public void Tick(TraversalClock clock)
         {
             if (!active) return; // No physics sensor work at idle.
+            currentClock = clock; clockContext = true;
             casts = 0; queryClock.Restart(); ticks++;
-            try { TickCore(now); }
+            try
+            {
+                string wallProblem = WallProblem(clock), physicsProblem = PhysicsClockProblem(clock);
+                if (wallProblem != null || physicsProblem != null)
+                {
+                    if (wallProblem == "WALL_GAP" && physicsProblem == null && pending) ObserveLatePending();
+                    Stop("CLOCK_CONTRACT:" + (wallProblem ?? physicsProblem) +
+                        (wallProblem != null && physicsProblem != null ? ";PHYSICS:" + physicsProblem : ""));
+                    return;
+                }
+                if (!clockReady)
+                {
+                    var actual = npc.transform.position;
+                    var frame = Frame((float)clock.WallTime, actual);
+                    string problem = BodyProblem();
+                    if (problem != null || (actual - lastPosition).sqrMagnitude != 0 || lastVelocity.sqrMagnitude != 0 || body.linearVelocity.sqrMagnitude != 0)
+                    { Block(frame, "UNKNOWN", problem ?? "CLOCK_BASELINE_NOT_STATIONARY"); return; }
+                    frame["Classification"] = "CLEAR"; frame["NativeResult"] = "CLOCK_BASELINE";
+                    frame["PosePrevious"] = P(lastPosition); frame["PosePreviousTime"] = lastTime; frame["ObservedVelocity"] = P(Vector3.zero);
+                    Emit("CLOCK_BASELINE", frame);
+                    lastPosition = actual; lastTime = (float)clock.WallTime; clockReady = true; return;
+                }
+                TickCore((float)clock.WallTime);
+            }
             catch (Exception ex)
             {
                 Stop("UNKNOWN_NATIVE_FAILURE:" + ex.GetType().Name + ":" + ex.Message);
             }
-            finally { queryClock.Stop(); }
+            finally { previousClock = clock; clockContext = false; queryClock.Stop(); }
         }
 
         private void TickCore(float now)
         {
             Vector3 actual = npc.transform.position;
-            float dt = now - lastTime;
+            // Current declared future physics step; never the prior wall gap.
+            float dt = currentClock.Delta;
             var frame = Frame(now, actual);
             string invalid = BodyProblem();
-            if (invalid != null || !Finite(now) || dt <= 0 || dt > MaxTick || now - startTime > 120f || ticks > 6000)
+            if (invalid != null || !Finite(now) || dt <= 0 || dt > MaxTick || currentClock.WallTime - startWallTime > 120.0 || ticks > 6000)
             { Block(frame, "UNKNOWN", invalid ?? "TIME_OR_TICK_BUDGET"); return; }
             if (!pending && Vector3.Distance(actual, lastPosition) > Numerical)
             { Block(frame, "UNKNOWN", "COMPETING_WRITER"); return; }
+            if (!pending && lastVelocity.sqrMagnitude != 0)
+            {
+                // A recovery callback that issued no target must not carry a
+                // previous moving velocity over an unobserved physics hold.
+                frame["ObservedVelocity"] = P((actual - lastPosition) / (float)(currentClock.FixedTime - previousClock.FixedTime));
+                Block(frame, "UNKNOWN", "CLOCK_UNOBSERVED_ACTIVE_HOLD"); return;
+            }
             supportDirection = pending ? Horizontal(commanded - commandFrom).normalized : routeIndex < route.Count ? Horizontal(route[routeIndex] - actual).normalized : Horizontal(destination - actual).normalized;
             var support = Support(actual);
             frame["Support"] = SupportRow(support);
@@ -208,12 +256,13 @@ namespace RustBots.Navigation
             {
                 acquiring = true; acquisitionEligible = false; acquisitionStart = actual; acquisitionStartTime = now;
                 acquisitionRestTime = now; acquisitionStartGap = support.Gap; acquisitionFloor = support.Collider;
+                acquisitionRestClock = currentClock;
                 acquisitionFloorY = support.FootY; acquisitionNormal = support.Normal; acquisitionPoint = support.Point;
                 frame["SupportPhase"] = "FLOOR_ACQUISITION"; frame["Acquisition"] = AcquisitionRow(actual, support);
                 frame["MotionMode"] = "FLOOR_ACQUISITION"; frame["NativeResult"] = "STATIONARY_OBSERVATION";
                 frame["Classification"] = "CLEAR"; // Obstacle-clear observation; SupportAccepted remains false.
                 frame["PosePrevious"] = P(lastPosition); frame["PosePreviousTime"] = lastTime;
-                frame["ObservedVelocity"] = P((actual - lastPosition) / dt);
+                frame["ObservedVelocity"] = P((actual - lastPosition) / (float)(currentClock.FixedTime - previousClock.FixedTime));
                 Emit("FLOOR_ACQUISITION_OBSERVE", frame);
                 lastPosition = actual; lastTime = now; return; // No command on the observation tick.
             }
@@ -227,23 +276,32 @@ namespace RustBots.Navigation
             {
                 var observedSweeps = new List<object>();
                 bool clear = Sweep(commandFrom, actual, support, observedSweeps);
-                float elapsed = now - commandTime;
+                float elapsed = (float)(currentClock.FixedTime - commandClock.FixedTime);
                 Vector3 velocity = (actual - commandFrom) / elapsed;
                 float speed = velocity.magnitude, acceleration = (velocity - lastVelocity).magnitude / elapsed;
                 frame["Command"] = command; frame["From"] = P(commandFrom); frame["Requested"] = P(commanded);
                 frame["PreviousTime"] = commandTime; frame["Dt"] = elapsed;
+                frame["FixedDt"] = currentClock.FixedTime - commandClock.FixedTime;
+                frame["WallDt"] = currentClock.WallTime - commandClock.WallTime;
+                frame["IssuedClock"] = ClockRow(commandClock);
                 frame["Distance"] = Vector3.Distance(commandFrom, actual); frame["Speed"] = speed; frame["Acceleration"] = acceleration;
                 frame["Sweeps"] = observedSweeps.ToArray(); frame["Classification"] = commandClass;
                 frame["NativeResult"] = "OBSERVED";
                 frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
                 frame["ObservedVelocity"] = P(velocity);
+                float nativeVelocityError = Vector3.Distance(body.linearVelocity, velocity);
+                bool nativeVelocityMatches = Finite(body.linearVelocity) && nativeVelocityError <= Numerical;
+                frame["NativeVelocityError"] = nativeVelocityError; frame["NativeVelocityMatches"] = nativeVelocityMatches;
                 if (!currentSafe || !clear || elapsed <= 0 || elapsed > MaxTick || Vector3.Distance(actual, commanded) > Numerical ||
                     !Finite(speed) || speed > maxSpeed + Numerical || acceleration > MaxAcceleration + Numerical ||
+                    !nativeVelocityMatches || currentClock.Sequence != commandClock.Sequence + 1 ||
+                    Math.Abs(currentClock.FixedTime - commandClock.FixedTime - commandClock.Delta) > ClockPrecision ||
                     commandAcquisition && (actual.x != commandFrom.x || actual.z != commandFrom.z || actual.y > commandFrom.y))
                 {
                     pending = false; pendingFrame = null; frame["NativeResult"] = "OBSERVED_UNSAFE";
                     Emit("MOTION_WITNESS", frame); Emit("PHYSICAL_CONTACT", frame);
-                    Block(frame, "UNKNOWN", !clear || !overlapClear ? "KINEMATIC_CLIP" : !currentSafe ? "ACTUAL_SUPPORT_OR_PERMISSION_LOST" : "ACTUATOR_DIVERGENCE_OR_CONTINUITY"); return;
+                    Block(frame, "UNKNOWN", !clear || !overlapClear ? "KINEMATIC_CLIP" : !currentSafe ? "ACTUAL_SUPPORT_OR_PERMISSION_LOST" :
+                        !nativeVelocityMatches ? "NATIVE_VELOCITY_HORIZON_MISMATCH" : "ACTUATOR_DIVERGENCE_OR_CONTINUITY"); return;
                 }
                 pending = false; pendingFrame = null;
                 Emit("MOTION_WITNESS", frame);
@@ -380,11 +438,17 @@ namespace RustBots.Navigation
             if (classification != "CLEAR") Emit("STEP_ATTEMPT", frame);
             if (evidence.Count >= MaxEvidence - 8) { Block(frame, "UNKNOWN", "EVIDENCE_BUDGET"); return; }
             if (!NavEpochMatches()) { Block(frame, "UNKNOWN", "NAV_EPOCH_CHANGED_DURING_PROBE"); return; }
+            string issueClockProblem = ClockProblem(currentClock);
+            if (issueClockProblem != null) { Block(frame, "UNKNOWN", "CLOCK_BEFORE_ISSUE:" + issueClockProblem); return; }
+            if (!Finite(body.linearVelocity) || Vector3.Distance(body.linearVelocity, lastVelocity) > Numerical)
+            { Block(frame, "UNKNOWN", "NATIVE_VELOCITY_BEFORE_ISSUE"); return; }
             frame["NativeResult"] = "PRECHECKED";
+            frame["IssuedClock"] = ClockRow(currentClock);
             frame["MotionMode"] = hold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
             Emit("MOVE_DECISION", frame);
             if (!active) return; // Receipt/cast budgets fail closed before actuation.
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = classification; commandHold = hold; commandAcquisition = false;
+            commandClock = currentClock;
             pendingFrame = Copy(frame); pending = true;
             // This is the sole position actuator. No native collision response is
             // assumed; full pre-query and next-tick actual geometry are mandatory.
@@ -415,7 +479,8 @@ namespace RustBots.Navigation
             return new { Start = P(acquisitionStart), StartTime = acquisitionStartTime, StartGap = acquisitionStartGap,
                 TotalDrop = acquisitionStart.y - actual.y, FloorId = acquisitionFloor == null ? 0 : acquisitionFloor.GetInstanceID(),
                 InitialFloorY = acquisitionFloorY, InitialNormal = P(acquisitionNormal), InitialPoint = P(acquisitionPoint),
-                Remaining = Mathf.Max(0, s.Gap - skin), RestObservationTime = acquisitionRestTime, RestObservationPose = P(acquisitionStart) };
+                Remaining = Mathf.Max(0, s.Gap - skin), RestObservationTime = acquisitionRestTime, RestObservationPose = P(acquisitionStart),
+                RestObservationClock = ClockRow(acquisitionRestClock) };
         }
 
         private void Conditions(Dictionary<string, object> frame, Vector3 actual, SupportResult support, bool overlapClear, bool permission, float waterDepth)
@@ -431,7 +496,8 @@ namespace RustBots.Navigation
             var frame = Frame(now, actual);
             frame["Support"] = SupportRow(support); frame["Overlaps"] = overlaps.ToArray();
             Conditions(frame, actual, support, true, permission, waterDepth);
-            if (now <= acquisitionRestTime || !AcquisitionSupported(actual, support) || lastVelocity.x != 0 || lastVelocity.z != 0 || lastVelocity.y > 0)
+            if (currentClock.Sequence <= acquisitionRestClock.Sequence || currentClock.FixedTime <= acquisitionRestClock.FixedTime ||
+                !AcquisitionSupported(actual, support) || lastVelocity.x != 0 || lastVelocity.z != 0 || lastVelocity.y > 0)
             { Block(frame, "UNKNOWN", "ACQUISITION_REST_OR_FLOOR_LOST"); return; }
             float remaining = Mathf.Max(0, support.Gap - skin);
             float acceleration = MaxAcceleration * 0.5f;
@@ -461,12 +527,107 @@ namespace RustBots.Navigation
             { Emit("PHYSICAL_CONTACT", frame); Block(frame, "UNKNOWN", "ACQUISITION_TRAJECTORY_UNSAFE"); return; }
             if (!NavEpochMatches() || evidence.Count >= MaxEvidence - 8)
             { Block(frame, "UNKNOWN", "ACQUISITION_NAV_OR_EVIDENCE_BUDGET"); return; }
-            frame["NativeResult"] = "PRECHECKED"; Emit("MOVE_DECISION", frame);
+            string issueClockProblem = ClockProblem(currentClock);
+            if (issueClockProblem != null) { Block(frame, "UNKNOWN", "CLOCK_BEFORE_ACQUISITION_ISSUE:" + issueClockProblem); return; }
+            if (!Finite(body.linearVelocity) || Vector3.Distance(body.linearVelocity, lastVelocity) > Numerical)
+            { Block(frame, "UNKNOWN", "NATIVE_VELOCITY_BEFORE_ACQUISITION_ISSUE"); return; }
+            frame["NativeResult"] = "PRECHECKED"; frame["IssuedClock"] = ClockRow(currentClock); Emit("MOVE_DECISION", frame);
             if (!active) return;
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = "CLEAR";
+            commandClock = currentClock;
             commandHold = hold; commandAcquisition = true; pendingFrame = Copy(frame); pending = true;
             body.MovePosition(body.position + requested - actual); actuations++;
             lastPosition = actual; lastTime = now;
+        }
+
+        private string ClockProblem(TraversalClock c)
+        {
+            return WallProblem(c) ?? PhysicsClockProblem(c);
+        }
+
+        private void ObserveLatePending()
+        {
+            // Diagnostic evidence only. A valid next physics step cannot repair
+            // the independently failed wall-gap gate or complete this command.
+            if (!pending || !clockReady || BodyProblem() != null || currentClock.Sequence != commandClock.Sequence + 1 ||
+                Math.Abs(currentClock.FixedTime - commandClock.FixedTime - commandClock.Delta) > ClockPrecision) return;
+            Vector3 actual = npc.transform.position;
+            var frame = Frame((float)currentClock.WallTime, actual);
+            frame["IssuedClock"] = ClockRow(commandClock); frame["From"] = P(commandFrom);
+            frame["Requested"] = P(commanded); frame["Classification"] = "UNKNOWN";
+            frame["Reason"] = "WALL_GAP_DIAGNOSTIC"; frame["TerminalOnly"] = true; frame["UnobservedCommand"] = true;
+            frame["NativeResult"] = "OBSERVATION_FAILED";
+            try
+            {
+                var support = Support(actual); var overlaps = new List<object>(); var sweeps = new List<object>();
+                bool overlapClear = Overlaps(actual, support, overlaps);
+                bool sweepClear = Sweep(commandFrom, actual, support, sweeps);
+                bool permission = Permission(actual);
+                float waterDepth = WaterLevel.GetWaterSurface(actual, true, true, null) - actual.y;
+                frame["Support"] = SupportRow(support); frame["Overlaps"] = overlaps.ToArray(); frame["Sweeps"] = sweeps.ToArray();
+                Conditions(frame, actual, support, overlapClear, permission, waterDepth);
+                double fixedElapsed = currentClock.FixedTime - commandClock.FixedTime;
+                Vector3 velocity = (actual - commandFrom) / (float)fixedElapsed;
+                frame["PreviousTime"] = commandTime; frame["Dt"] = (float)fixedElapsed; frame["FixedDt"] = fixedElapsed;
+                frame["WallDt"] = currentClock.WallTime - commandClock.WallTime;
+                frame["Distance"] = Vector3.Distance(commandFrom, actual); frame["Speed"] = velocity.magnitude;
+                frame["Acceleration"] = (velocity - lastVelocity).magnitude / (float)fixedElapsed;
+                frame["ObservedVelocity"] = P(velocity); frame["TargetError"] = Vector3.Distance(actual, commanded);
+                float error = Vector3.Distance(body.linearVelocity, velocity);
+                frame["NativeVelocityError"] = error; frame["NativeVelocityMatches"] = Finite(body.linearVelocity) && error <= Numerical;
+                frame["SweepClear"] = sweepClear;
+                frame["TerminalSupportValid"] = acquiring ? AcquisitionSupported(actual, support) : Supported(support);
+                frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
+                frame["NativeResult"] = "OBSERVED_WALL_LATE";
+            }
+            catch (Exception ex) { frame["ObservationError"] = ex.GetType().Name + ":" + ex.Message; }
+            Emit("TERMINAL_OBSERVATION", frame);
+            // Deliberately do not clear pending or update velocity, pose, arrival,
+            // acquisition, retries or any accepted-motion counters here.
+        }
+
+        private string WallProblem(TraversalClock c)
+        {
+            double wallNow = Time.realtimeSinceStartupAsDouble;
+            if (!Finite(c.WallTime) || !Finite(wallNow)) return "INVALID_WALL_CLOCK";
+            if (c.WallTime < startWallTime || wallNow < c.WallTime || clockReady && c.WallTime < previousClock.WallTime)
+                return "WALL_REGRESSION";
+            if (c.WallTime - startWallTime > 120.0) return "WALL_DEADLINE";
+            if (wallNow - c.WallTime > MaxTick + ClockPrecision || clockReady && c.WallTime - previousClock.WallTime > MaxTick + ClockPrecision)
+                return "WALL_GAP";
+            return null;
+        }
+
+        private string PhysicsClockProblem(TraversalClock c)
+        {
+            if (!Finite(c.FixedTime) || !Finite(c.FixedUnscaledTime) || !Finite(c.Delta) || !Finite(c.UnscaledDelta) || !Finite(c.TimeScale) ||
+                c.FixedTime < 0 || c.FixedUnscaledTime < 0 || c.Delta <= 0 || c.Delta > MaxTick || c.UnscaledDelta <= 0 || c.UnscaledDelta > MaxTick ||
+                c.TimeScale != 1f || Math.Abs(c.Delta - c.UnscaledDelta) > ClockPrecision || !c.InFixedStep || c.Sequence <= 0 || c.Frame < 0 ||
+                c.PhysicsMode != "FixedUpdate") return "INVALID_DECLARED_PHYSICS_CLOCK";
+            // The driver reports the native callback; independently bind its
+            // immutable step values to this actual invocation, not an arbitrary
+            // synthetic clock or an OnTick/render callback.
+            if (!Time.inFixedTimeStep || c.InFixedStep != Time.inFixedTimeStep ||
+                Math.Abs(c.FixedTime - Time.fixedTimeAsDouble) > ClockPrecision ||
+                Math.Abs(c.FixedUnscaledTime - Time.fixedUnscaledTimeAsDouble) > ClockPrecision ||
+                c.Delta != Time.fixedDeltaTime || c.UnscaledDelta != Time.fixedUnscaledDeltaTime || c.TimeScale != Time.timeScale ||
+                c.Frame != Time.frameCount || c.PhysicsMode != Physics.simulationMode.ToString()) return "NATIVE_CLOCK_BINDING";
+            if (!clockReady) return null;
+            if (previousClock.Sequence == long.MaxValue || c.Sequence != previousClock.Sequence + 1 || c.Frame < previousClock.Frame ||
+                c.Delta != previousClock.Delta || c.UnscaledDelta != previousClock.UnscaledDelta || c.TimeScale != previousClock.TimeScale ||
+                c.PhysicsMode != previousClock.PhysicsMode ||
+                c.FixedTime <= previousClock.FixedTime || c.FixedUnscaledTime <= previousClock.FixedUnscaledTime ||
+                Math.Abs(c.FixedTime - previousClock.FixedTime - previousClock.Delta) > ClockPrecision ||
+                Math.Abs(c.FixedUnscaledTime - previousClock.FixedUnscaledTime - previousClock.UnscaledDelta) > ClockPrecision)
+                return "SKIPPED_CHANGED_OR_NONADVANCING_PHYSICS_STEP";
+            return null;
+        }
+
+        private object ClockRow(TraversalClock c)
+        {
+            return new { Schema = 2, WallTime = c.WallTime, FixedTime = c.FixedTime, FixedUnscaledTime = c.FixedUnscaledTime,
+                Delta = c.Delta, UnscaledDelta = c.UnscaledDelta, TimeScale = c.TimeScale, InFixedStep = c.InFixedStep,
+                Sequence = c.Sequence, Frame = c.Frame, PhysicsMode = c.PhysicsMode };
         }
 
         private bool Plan(Vector3 end)
@@ -718,9 +879,12 @@ namespace RustBots.Navigation
         }
         private Dictionary<string, object> Frame(float now, Vector3 actual)
         {
-            return new Dictionary<string, object> { { "Schema", 1 }, { "Actor", actor }, { "World", world }, { "Stage", stage }, { "Time", now }, { "Tick", ticks },
+            return new Dictionary<string, object> { { "Schema", 2 }, { "Actor", actor }, { "World", world }, { "Stage", stage }, { "Time", now }, { "Tick", ticks },
                 { "Command", command }, { "Classification", "UNKNOWN" }, { "Reason", reason }, { "Body", BodyRow() }, { "Profile", profile },
-                { "From", P(actual) }, { "Requested", P(actual) }, { "Actual", P(actual) }, { "PreviousTime", lastTime }, { "Dt", now - lastTime },
+                { "From", P(actual) }, { "Requested", P(actual) }, { "Actual", P(actual) }, { "PreviousTime", lastTime },
+                { "Dt", clockContext ? (object)currentClock.Delta : null }, { "FixedDt", clockContext ? (object)(double)currentClock.Delta : null },
+                { "WallDt", clockContext ? (object)(currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime)) : null },
+                { "Clock", clockContext ? ClockRow(currentClock) : null }, { "PreviousClock", clockContext && clockReady ? ClockRow(previousClock) : null }, { "IssuedClock", null },
                 { "Support", null }, { "Sweeps", new object[0] }, { "Overlaps", new object[0] }, { "Mask", Mask }, { "Triggers", "Ignore" },
                 { "Permission", null }, { "WaterDepth", null }, { "SupportAccepted", null }, { "OverlapClear", null },
                 { "SupportPhase", acquiring ? "FLOOR_ACQUISITION" : "NORMAL" }, { "Acquisition", null },
@@ -744,6 +908,7 @@ namespace RustBots.Navigation
         private static Vector3 Horizontal(Vector3 v) { v.y = 0; return v; }
         private static float[] P(Vector3 v) { return new[] { v.x, v.y, v.z }; }
         private static bool Finite(float v) { return !float.IsNaN(v) && !float.IsInfinity(v); }
+        private static bool Finite(double v) { return !double.IsNaN(v) && !double.IsInfinity(v); }
         private static bool Finite(Vector3 v) { return Finite(v.x) && Finite(v.y) && Finite(v.z); }
     }
 }
