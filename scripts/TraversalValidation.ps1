@@ -266,12 +266,40 @@ function Assert-TraversalClockSame($actual,$expected){
         if($actual.$name -cne $expected.$name){throw ('Native clock snapshot changed '+$name)}
     }
     foreach($name in @('WallTime','FixedTime','FixedUnscaledTime')){Assert-TraversalNear $actual.$name $expected.$name ('bound clock '+$name) 0.000001}
+    if($null -ne $actual.MaximumDelta -or $null -ne $expected.MaximumDelta){Assert-TraversalNear $actual.MaximumDelta $expected.MaximumDelta 'immutable native watchdog' 0.000001}
+}
+function Assert-TraversalWallTelemetry($f,$previous){
+    $limit=Get-TraversalNumber $f.Profile.MaxWallStall 'native maximumDeltaTime watchdog'
+    if($limit -lt $f.Clock.Delta -or $limit -gt 120){throw 'Invalid native wall watchdog'}
+    $native=if($null -ne $f.Profile.NativeMaximumDelta){Get-TraversalNumber $f.Profile.NativeMaximumDelta 'native simulation catch-up cap'}else{$limit}
+    if($native -lt $f.Clock.Delta){throw 'Invalid native maximum physics delta'}
+    if($null -ne $f.Profile.NativeMaximumDelta){Assert-TraversalNear $limit 1.5 'existing event-loop watchdog policy' 0.000001}
+    Assert-TraversalNear $f.Clock.MaximumDelta $native 'captured native simulation cap' 0.000001
+    if($null -ne $previous){Assert-TraversalNear $previous.MaximumDelta $native 'unchanged native simulation cap' 0.000001}
+    $w=$f.WallTelemetry
+    $gap=Get-TraversalNumber $w.CallbackGap 'wall callback gap';$delay=Get-TraversalNumber $w.ReadDelay 'wall read delay'
+    Assert-TraversalNear $w.MaxWallStall $limit 'wall telemetry watchdog' 0.000001
+    Assert-TraversalNear $gap $f.WallDt 'wall telemetry interval' 0.000001
+    if($null -ne $f.Profile.NativeMaximumDelta){
+        Assert-TraversalNear $w.NativeMaximumDelta $native 'wall telemetry native catch-up cap' 0.000001
+        if($w.NativeCatchupExceeded -isnot [bool] -or $w.NativeCatchupExceeded -ne ($gap -gt $native+0.000001)){throw 'False native catch-up wall comparison'}
+    }
+    if($gap -lt 0 -or $gap -gt $limit+0.000001 -or $delay -lt 0 -or $delay -gt $f.Profile.MaxTick+0.000001){throw 'Long wall stall or stale callback execution'}
+    $state=if($gap -gt $f.Profile.MaxTick+0.000001){'PHYSICS_CONTIGUOUS_WITH_WALL_LAG'}else{'ON_TIME'}
+    if($w.State -cne $state){throw 'False wall/physics classification'}
 }
 function Assert-TraversalNativeVelocity($body,$expected){
     Assert-TraversalVector $body.Velocity
     $error=Get-WorldDistance $body.Velocity $expected
     if($error -gt 0.001){throw 'Native Rigidbody velocity disagrees with physical fixed-step displacement'}
     return $error
+}
+function Get-TraversalPhysicsVelocity($to,$from,[double]$dt){
+    # Native Vector3 stores coordinates, subtraction and division as Singles.
+    # Restore those operands; JSON's short decimal spellings are not exact reals.
+    Assert-TraversalVector $to;Assert-TraversalVector $from
+    if($dt -le 0){throw 'Nonpositive native physics velocity interval'}
+    @(for($j=0;$j -lt 3;$j++){[single]([single]([single]$to[$j]-[single]$from[$j])/[single]$dt)})
 }
 function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
     Assert-AvatarUid $expectedActor
@@ -298,6 +326,7 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
                 if($null -ne $lastWitness){Assert-TraversalSamePoint $f.Actual $lastWitness.Actual 'clock baseline physical continuity'}
                 $clockStartWall=Get-TraversalNumber $f.PosePreviousTime 'clock baseline destination wall time'
                 if($clockStartWall -gt $f.Clock.WallTime -or $f.Clock.WallTime-$clockStartWall -gt 120){throw 'Invalid native clock baseline deadline'}
+                if($null -ne $f.Profile.MaxWallStall){Assert-TraversalWallTelemetry $f $null}
                 $activeClock=$f.Clock;$previousClock=$null;$clockBaselinePose=$f.Actual
                 continue
             }
@@ -309,12 +338,14 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
                 Assert-TraversalNear ($f.Clock.FixedTime-$activeClock.FixedTime) $activeClock.Delta 'consecutive native fixed time' 0.000001
                 Assert-TraversalNear ($f.Clock.FixedUnscaledTime-$activeClock.FixedUnscaledTime) $activeClock.UnscaledDelta 'consecutive native unscaled fixed time' 0.000001
                 $wallGap=$f.Clock.WallTime-$activeClock.WallTime
-                if($wallGap -lt 0 -or $wallGap -gt $f.Profile.MaxTick+0.000001){throw 'Native wall clock regressed or exceeded independent safety gap'}
+                $wallLimit=if($null -ne $f.Profile.MaxWallStall){$f.Profile.MaxWallStall}else{$f.Profile.MaxTick}
+                if($wallGap -lt 0 -or $wallGap -gt $wallLimit+0.000001){throw 'Native wall clock regressed or exceeded independent safety gap'}
                 $previousClock=$activeClock;$activeClock=$f.Clock
             }
             Assert-TraversalClockSame $f.PreviousClock $previousClock
             Assert-TraversalNear $f.WallDt ($f.Clock.WallTime-$previousClock.WallTime) 'independent callback wall interval' 0.000001
             if($f.Clock.WallTime-$clockStartWall -gt 120){throw 'Native wall deadline exceeded'}
+            if($null -ne $f.Profile.MaxWallStall){Assert-TraversalWallTelemetry $f $previousClock}
         }elseif($fixedProtocol -and $f.Event -in @('CLOCK_BASELINE','MOVE_DECISION','MOTION_WITNESS','FLOOR_ACQUISITION_OBSERVE','FLOOR_ACQUIRED','STEP_RESOLVED','ARRIVED','REPATH')){throw 'Physical proof is missing its explicit native fixed clock'}
         $phase=if($null -eq $f.SupportPhase){'NORMAL'}else{[string]$f.SupportPhase}
         if($phase -notin @('NORMAL','FLOOR_ACQUISITION')){throw 'Unknown native support phase'}
@@ -403,8 +434,8 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
             if($fixedProtocol){
                 Assert-TraversalClockSame $f.IssuedClock $f.Clock
                 $plannedDt=[double]$f.Clock.Delta;Assert-TraversalNear $f.Dt $plannedDt 'planned physics interval' 0.000001;Assert-TraversalNear $f.FixedDt $plannedDt 'planned double physics interval' 0.000001
-                $plannedVelocity=@(for($j=0;$j -lt 3;$j++){($f.Requested[$j]-$f.From[$j])/$plannedDt})
-                $prior=if($null -ne $lastWitness){@(for($j=0;$j -lt 3;$j++){($lastWitness.Actual[$j]-$lastWitness.From[$j])/$lastWitness.Dt})}else{@(0,0,0)}
+                $plannedVelocity=Get-TraversalPhysicsVelocity $f.Requested $f.From $plannedDt
+                $prior=if($null -ne $lastWitness){Get-TraversalPhysicsVelocity $lastWitness.Actual $lastWitness.From $lastWitness.Dt}else{@(0,0,0)}
                 if($null -eq $lastWitness){Assert-TraversalSamePoint $f.From $clockBaselinePose 'initial fixed command baseline pose'}
                 $null=Assert-TraversalNativeVelocity $f.Body $prior
                 $plannedSpeed=Get-WorldDistance $plannedVelocity @(0,0,0);$plannedAcceleration=(Get-WorldDistance $plannedVelocity $prior)/$plannedDt
@@ -426,21 +457,22 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
             if([single](Get-TraversalNumber $f.PreviousTime 'previous issue wall alias') -ne [single]$pending.Clock.WallTime){throw 'Witness previous wall timestamp does not bind the issued command'}
         }else{$dt=$time-$pending.Time;Assert-TraversalNear $f.PreviousTime $pending.Time 'previous actual time';Assert-TraversalNear $f.Dt $dt 'actual dt'}
         if($dt -le 0 -or $dt -gt $f.Profile.MaxTick+0.001){throw 'Unbounded actuation interval'}
-        $distance=Get-WorldDistance $f.From $f.Actual;$speed=$distance/$dt
+        $distance=Get-WorldDistance $f.From $f.Actual
+        $velocity=if($fixedProtocol){Get-TraversalPhysicsVelocity $f.Actual $f.From $dt}else{@(for($j=0;$j -lt 3;$j++){($f.Actual[$j]-$f.From[$j])/$dt})}
+        $speed=if($fixedProtocol){Get-WorldDistance $velocity @(0,0,0)}else{$distance/$dt}
         Assert-TraversalNear $f.Distance $distance 'actual displacement';Assert-TraversalNear $f.Speed $speed 'actual speed'
-        $velocity=@(for($j=0;$j -lt 3;$j++){($f.Actual[$j]-$f.From[$j])/$dt})
         if($fixedProtocol){
             # Keep the independent physical .001 m/s gate. The reported native
             # error itself comes from Vector3 float arithmetic, whose inputs
             # must be restored after JSON parsed the short decimals as doubles.
             $null=Assert-TraversalNativeVelocity $f.Body $velocity
-            $nativeVelocity=@(for($j=0;$j -lt 3;$j++){[single]([single]([single]$f.Actual[$j]-[single]$f.From[$j])/[single]$dt)})
+            $nativeVelocity=$velocity
             $nativeError=Get-WorldDistance $f.Body.Velocity $nativeVelocity
             if($nativeError -gt 0.001){throw 'Native float velocity error exceeds the unchanged physical limit'}
             if($f.NativeVelocityMatches -isnot [bool] -or -not $f.NativeVelocityMatches){throw 'Native physics velocity mismatch was not accepted'}
             Assert-TraversalNear $f.NativeVelocityError $nativeError 'native fixed-step velocity error' 0.000001
         }
-        $priorVelocity=if($null -ne $lastWitness){@(for($j=0;$j -lt 3;$j++){($lastWitness.Actual[$j]-$lastWitness.From[$j])/$lastWitness.Dt})}else{@(0,0,0)}
+        $priorVelocity=if($null -eq $lastWitness){@(0,0,0)}elseif($fixedProtocol){Get-TraversalPhysicsVelocity $lastWitness.Actual $lastWitness.From $lastWitness.Dt}else{@(for($j=0;$j -lt 3;$j++){($lastWitness.Actual[$j]-$lastWitness.From[$j])/$lastWitness.Dt})}
         $acceleration=(Get-WorldDistance $velocity $priorVelocity)/$dt;$accelerationTolerance=if($fixedProtocol){0.001}else{0.01}
         Assert-TraversalNear $f.Acceleration $acceleration 'actual acceleration' $accelerationTolerance
         if($speed -gt $f.Profile.MaxSpeed+0.001 -or $acceleration -gt $f.Profile.MaxAcceleration+$accelerationTolerance){throw 'Unsafe actual speed/acceleration'}
@@ -522,6 +554,32 @@ function Assert-TraversalPortal($nav,$witnesses){
     }
     if(-not $changed){throw 'Native door hinge motion is not measured'}
 }
+function Assert-TraversalDetourContact($d,$frames){
+    $matched=$false
+    foreach($f in @($frames|Where-Object {$_.Event -eq 'PHYSICAL_CONTACT' -and $_.Classification -eq 'DOOR_CLOSED'})){
+        foreach($s in @($f.Sweeps)){foreach($h in @($s.Hits)){
+            if($h.Blocking -eq $true -and $h.Collider.DoorOpen -is [bool] -and -not $h.Collider.DoorOpen -and
+                [string]$h.Collider.Entity -ceq [string]$d.Door -and $h.Collider.Instance -eq $d.Collider){
+                Assert-TraversalSamePoint $d.PlanePoint $h.Point 'detour measured door contact'
+                Assert-TraversalSamePoint $d.PlaneNormal $h.Normal 'detour measured door normal'
+                Assert-TraversalSamePoint $d.BoundsCenter $h.Collider.BoundsCenter 'detour measured door bounds'
+                Assert-TraversalSamePoint $d.BoundsSize $h.Collider.BoundsSize 'detour measured door size'
+                $matched=$true
+            }
+        }}
+    }
+    if(-not $matched){throw 'Detour plane/volume lacks preceding native closed-door contact binding'}
+}
+function Assert-TraversalOutdoorOrder($scenes){
+    $proven=@{};$end=0.0
+    foreach($s in @($scenes)){
+        $start=Get-TraversalNumber $s.StartTime 'ordered scene start';$next=Get-TraversalNumber $s.EndTime 'ordered scene end'
+        if($start -lt $end-0.001 -or $next -lt $start){throw 'Outdoor scene order regressed'};$end=$next
+        $required=if($s.Kind -eq 'SLOPE_DOWN'){@('OUTDOOR_STEP')}elseif($s.Kind -in @('SOLID_WALL','DOOR_CLOSED')){@('OUTDOOR_STEP','SLOPE_DOWN')}elseif($s.Kind -eq 'SAFE_DETOUR'){@('OUTDOOR_STEP','SLOPE_DOWN','SOLID_WALL','DOOR_CLOSED')}elseif($s.Kind -eq 'NATIVE_BUILDING_STEP'){@('OUTDOOR_STEP','SLOPE_DOWN','SOLID_WALL','DOOR_CLOSED','SAFE_DETOUR')}else{@()}
+        foreach($kind in $required){if(-not $proven.ContainsKey($kind)){throw ('Outdoor-first prerequisite missing: '+$kind)}}
+        if($s.Status -eq 'PASSED' -or ($s.Status -eq 'BLOCKED' -and $s.Kind -in @('SOLID_WALL','DOOR_CLOSED'))){$proven[$s.Kind]=$true}
+    }
+}
 function Assert-TraversalSceneResult($nav){
     $t=$nav.Traversal
     if($t.Schema -ne 1 -or $t.Mode -cne 'TRAVERSAL_BENCH' -or $nav.Status -notin @('GREEN','PARTIAL','BLOCKED','FAILED')){throw 'Missing traversal bench result'}
@@ -529,12 +587,13 @@ function Assert-TraversalSceneResult($nav){
     if(@($t.Frames).Count){Assert-AvatarActor $nav;Assert-TraversalFrames $t.Frames $nav.Actor.NetId $t.World}
     elseif($nav.Status -eq 'GREEN' -or $t.Completed -eq $true -or $t.Actuations -ne 0){throw 'Complete traversal has no native frames'}
     $frames=@($t.Frames);$scenes=@($t.Scenes);$passed=@{}
+    if($t.Order -ceq 'OUTDOOR_FIRST'){Assert-TraversalOutdoorOrder $scenes}
     $actuations=Get-TraversalNumber $t.Actuations 'actuation count'
     if($actuations -ne @($frames|Where-Object Event -eq 'MOTION_WITNESS').Count){throw 'Unobserved or unaccounted native actuation'}
     foreach($s in $scenes){
         $from=Get-TraversalNumber $s.FramesFrom 'scene first index';$to=Get-TraversalNumber $s.FramesTo 'scene exclusive end index'
         if($from -lt 0 -or $to -gt $frames.Count -or $to -lt $from -or ($to -eq $from -and $s.Status -ne 'NOT_PROVEN') -or $from -ne [Math]::Floor($from) -or $to -ne [Math]::Floor($to) -or
-            $s.Kind -notin @('OUTDOOR_STEP','SLOPE_DOWN','NATIVE_BUILDING_STEP','SOLID_WALL','DOOR_CLOSED') -or $s.Status -notin @('PASSED','BLOCKED','NOT_PROVEN')){throw 'Invalid traversal scene boundary/status'}
+            $s.Kind -notin @('OUTDOOR_STEP','SLOPE_DOWN','NATIVE_BUILDING_STEP','SOLID_WALL','DOOR_CLOSED','SAFE_DETOUR') -or $s.Status -notin @('PASSED','BLOCKED','NOT_PROVEN')){throw 'Invalid traversal scene boundary/status'}
         Assert-TraversalVector $s.Start;Assert-TraversalVector $s.End
         $startTime=Get-TraversalNumber $s.StartTime 'scene start time';$endTime=Get-TraversalNumber $s.EndTime 'scene end time'
         if($startTime -lt 0 -or $endTime -lt $startTime){throw 'Invalid traversal scene time boundaries'}
@@ -545,6 +604,26 @@ function Assert-TraversalSceneResult($nav){
         if($s.Status -eq 'PASSED'){
             if($s.Kind -in @('SOLID_WALL','DOOR_CLOSED') -or $w.Count -lt 2){throw 'Missing distinct physical scene witnesses'}
             Assert-TraversalSamePoint $s.Start $allWitnesses[0].From 'scene actual start';Assert-TraversalSamePoint $s.End $allWitnesses[-1].Actual 'scene actual end'
+            if($s.Kind -eq 'SAFE_DETOUR'){
+                if((Get-WorldDistance $s.Start $s.End) -lt 1 -or $w[-1].Speed -ne 0){throw 'Detour lacks actual distance and observed rest'}
+                $door=$null
+                $binding=$null
+                foreach($f in $w){
+                    $d=$f.DetourDoorWitness;Assert-AvatarUid $d.Door;if($d.Open -isnot [bool] -or $d.Open){throw 'Detour lacks closed-door native witness'}
+                    foreach($key in @('Position','PlanePoint','PlaneNormal','BoundsCenter','BoundsSize')){Assert-TraversalVector $d.$key}
+                    Assert-TraversalNear (Get-TraversalDot $d.PlaneNormal $d.PlaneNormal) 1 'detour native plane normal'
+                    if([Math]::Abs($d.PlaneNormal[1]) -ge 0.1){throw 'Detour plane is not a measured door side'}
+                    $encoded=$d|ConvertTo-Json -Compress -Depth 8
+                    if($null -ne $binding -and $encoded -cne $binding){throw 'Detour door plane/volume changed'};$binding=$encoded
+                    if($null -ne $door -and $door -cne $d.Door){throw 'Detour door changed'};$door=$d.Door
+                }
+                Assert-TraversalDetourContact $d @($frames|Select-Object -First $from)
+                $a=@(for($i=0;$i -lt 3;$i++){$s.Start[$i]-$d.BoundsCenter[$i]});$b=@(for($i=0;$i -lt 3;$i++){$s.End[$i]-$d.BoundsCenter[$i]})
+                $near=Get-TraversalDot $a $d.PlaneNormal;$far=Get-TraversalDot $b $d.PlaneNormal
+                $extent=0.0;for($i=0;$i -lt 3;$i++){$extent+=[Math]::Abs($d.PlaneNormal[$i])*$d.BoundsSize[$i]*0.5}
+                if($near*$far -ge 0 -or [Math]::Abs($near) -lt 0.5+$extent -or [Math]::Abs($far) -lt 0.5+$extent){throw 'Detour did not reach opposite sides of actual closed-door volume'}
+                $passed[$s.Kind]=$s;continue
+            }
             $dy=[double]$s.End[1]-$s.Start[1]
             $height=@($w|Where-Object {if($s.Kind -eq 'SLOPE_DOWN'){[double]$_.Actual[1]-$_.From[1] -lt -0.001}else{[double]$_.Actual[1]-$_.From[1] -gt 0.001}})
             if(($s.Kind -eq 'SLOPE_DOWN' -and $dy -ge -0.001) -or $height.Count -lt 2 -or
@@ -574,6 +653,7 @@ function Assert-TraversalSceneResult($nav){
     }
     if($nav.Status -eq 'GREEN' -or $t.Completed -eq $true){
         foreach($kind in @('OUTDOOR_STEP','SLOPE_DOWN','NATIVE_BUILDING_STEP','SOLID_WALL','DOOR_CLOSED')){if(-not $passed.ContainsKey($kind)){throw ('GREEN traversal lacks '+$kind)}}
+        if($t.Order -ceq 'OUTDOOR_FIRST' -and -not $passed.ContainsKey('SAFE_DETOUR')){throw 'Outdoor-first completion lacks actual safe detour'}
         if($t.Completed -isnot [bool] -or -not $t.Completed -or $passed.OUTDOOR_STEP.Stage -eq $passed.NATIVE_BUILDING_STEP.Stage){throw 'GREEN traversal lacks separate outdoor/building contexts'}
     }
 }

@@ -141,6 +141,54 @@ foreach($event in @('MOVE_DECISION','MOTION_WITNESS')){
     $f|Add-Member NoteProperty IssuedClock $issued;$floatFrames+=,$f
 }
 Assert-TraversalFrames $floatFrames '19' 'synthetic-world'
+#018: independent receipt contracts; these synthetic poses never claim live PhysX.
+foreach($gap in @(0.1031844,0.125893,0.1289451)){
+    $late=Copy-TraversalFixture $floatFrames
+    foreach($f in $late){
+        $f.Profile|Add-Member NoteProperty MaxWallStall 1.5
+        $f.Profile|Add-Member NoteProperty NativeMaximumDelta 0.125
+        $f.Clock|Add-Member NoteProperty MaximumDelta 0.125
+        if($null -ne $f.PreviousClock){$f.PreviousClock|Add-Member NoteProperty MaximumDelta 0.125}
+        if($null -ne $f.IssuedClock){$f.IssuedClock|Add-Member NoteProperty MaximumDelta 0.125}
+    }
+    $late[-1].Time=10.03+$gap;$late[-1].Clock.WallTime=$late[-1].Time;$late[-1].WallDt=$gap
+    foreach($f in $late){$f|Add-Member NoteProperty WallTelemetry @{CallbackGap=$f.WallDt;ReadDelay=0.0001;MaxWallStall=1.5;NativeMaximumDelta=0.125;NativeCatchupExceeded=($f.WallDt -gt 0.125001);State=$(if($f.WallDt -gt 0.100001){'PHYSICS_CONTIGUOUS_WITH_WALL_LAG'}else{'ON_TIME'})}}
+    Assert-TraversalFrames $late '19' 'synthetic-world'
+    $catchupLate=Copy-TraversalFixture $late;$catchupLate[-1].Clock.WallTime=10.03;$catchupLate[-1].Time=10.03;$catchupLate[-1].WallDt=0
+    $catchupLate[-1].WallTelemetry.CallbackGap=0;$catchupLate[-1].WallTelemetry.State='ON_TIME';$catchupLate[-1].WallTelemetry.NativeCatchupExceeded=$false
+    Assert-TraversalFrames $catchupLate '19' 'synthetic-world'
+    foreach($mutation in @(
+        @{Name='late skipped physics';Change={param($x)$x[-1].Clock.Sequence++}},
+        @{Name='late duplicate physics';Change={param($x)$x[-1].Clock.Sequence=$x[1].Clock.Sequence}},
+        @{Name='late wrong physics time';Change={param($x)$x[-1].Clock.FixedTime+=0.0625}},
+        @{Name='late native velocity';Change={param($x)$x[-1].Body.Velocity=@(0,0,0)}},
+        @{Name='late collision';Change={param($x)$x[-1].Overlaps=@(@{Collider=$x[-1].Support.Collider;Intersects=$true;Distance=0.001;Direction=@(1,0,0);Error=$null})}},
+        @{Name='late lost support';Change={param($x)$x[-1].Support.Found=$false}},
+        @{Name='late changed mode';Change={param($x)$x[-1].Clock.PhysicsMode='Script'}},
+        @{Name='late changed time scale';Change={param($x)$x[-1].Clock.TimeScale=0.5}},
+        @{Name='late changed watchdog';Change={param($x)$x[-1].Clock.MaximumDelta=1}},
+        @{Name='long stall';Change={param($x)$x[-1].Clock.WallTime=11.53001;$x[-1].Time=11.53001;$x[-1].WallDt=1.50001;$x[-1].WallTelemetry.CallbackGap=1.50001}},
+        @{Name='slow callback execution';Change={param($x)$x[-1].WallTelemetry.ReadDelay=0.101}},
+        @{Name='false wall telemetry';Change={param($x)$x[-1].WallTelemetry.CallbackGap=0.01}},
+        @{Name='terminal cannot be witness';Change={param($x)$x[-1].Event='TERMINAL_OBSERVATION';$x[-1].NativeResult='OBSERVED_WALL_LATE'}}
+    )){$x=Copy-TraversalFixture $late;& $mutation.Change $x;Deny-TraversalFixture {Assert-TraversalFrames $x '19' 'synthetic-world'} $mutation.Name}
+}
+Write-Output 'PASS OFFLINE_ONLY018: exact BENCH4/5 lateness with .0625 fixed witness; unsafe late/long/stale/replay rejected'
+# Start2 command12: short JSON decimals must restore original Single operands.
+$plannedNative=Get-TraversalPhysicsVelocity @(0.07545927,5.37603664,-299.9797) @(0.0452700481,5.37408257,-299.9878) 0.0625
+$priorNative=Get-TraversalPhysicsVelocity @(0.0452700481,5.37408257,-299.9878) @(0.02263693,5.372616,-299.9939) 0.0625
+Assert-TraversalNear ((Get-WorldDistance $plannedNative $priorNative)/0.0625) 2.00379562 'Start2 command12 native planned acceleration' 0.000001
+# Actual command110 stays unsafe, independently of JSON metric repair.
+$unsafeNative=Get-TraversalPhysicsVelocity @(5.29136467,5.80301476,-298.582031) @(5.23763275,5.800331,-298.596436) 0.0625
+if((Get-WorldDistance $unsafeNative @(0,0,0)) -le [single]([single]0.89+[single]0.001)){throw 'Start2 genuine speed overshoot was hidden'}
+$ordered=@(
+    @{Kind='OUTDOOR_STEP';Status='PASSED';StartTime=1;EndTime=2},@{Kind='SLOPE_DOWN';Status='PASSED';StartTime=3;EndTime=4},
+    @{Kind='SOLID_WALL';Status='BLOCKED';StartTime=5;EndTime=6},@{Kind='DOOR_CLOSED';Status='BLOCKED';StartTime=7;EndTime=8},
+    @{Kind='SAFE_DETOUR';Status='PASSED';StartTime=9;EndTime=10},@{Kind='NATIVE_BUILDING_STEP';Status='NOT_PROVEN';StartTime=11;EndTime=12})
+Assert-TraversalOutdoorOrder $ordered
+Deny-TraversalFixture {Assert-TraversalOutdoorOrder @($ordered[-1])} 'home attempted before outdoor'
+Deny-TraversalFixture {Assert-TraversalOutdoorOrder @($ordered[0],$ordered[1],$ordered[3],$ordered[4])} 'detour attempted without solid refusal'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $ordered;$x[1].Status='NOT_PROVEN';Assert-TraversalOutdoorOrder $x} 'acquisition cannot unlock negative/home'
 $wrongFloat=Copy-TraversalFixture $floatFrames;$wrongFloat[-1].Body.Velocity[1]=-0.12601
 Deny-TraversalFixture {Assert-TraversalFrames $wrongFloat '19' 'synthetic-world'} 'native velocity error above .001 remains unsafe'
 $wrongNative=Copy-TraversalFixture $floatFrames;$wrongNative[-1].Body.Velocity[1]=-0.123999;$wrongNative[-1].NativeVelocityError=0.001001
@@ -341,6 +389,11 @@ function New-TraversalBenchFixture {
         Traversal=@{Schema=1;Mode='TRAVERSAL_BENCH';World='synthetic-world';Frames=$all;Scenes=$scenes;Completed=$true;Actuations=12}}
 }
 $bench=New-TraversalBenchFixture
+$nativeContact=@($bench.Traversal.Frames|Where-Object {$_.Event -eq 'PHYSICAL_CONTACT' -and $_.Stage -eq 'DOOR_CLOSED'})
+$h=$nativeContact[0].Sweeps[0].Hits[0]
+$detourBinding=[pscustomobject]@{Door=$h.Collider.Entity;Collider=$h.Collider.Instance;PlanePoint=$h.Point;PlaneNormal=$h.Normal;BoundsCenter=$h.Collider.BoundsCenter;BoundsSize=$h.Collider.BoundsSize}
+Assert-TraversalDetourContact $detourBinding $nativeContact
+Deny-TraversalFixture {$x=Copy-TraversalFixture $detourBinding;$x.PlanePoint[0]+=1;Assert-TraversalDetourContact $x $nativeContact} 'consistent fabricated detour plane not bound to native negative contact'
 # Geometry fixtures intentionally lack an economy ledger and cannot pass the full result gate.
 Assert-TraversalSceneResult $bench
 Deny-TraversalFixture {Assert-TraversalResult $bench} 'synthetic geometry is not a paid native diagnostic run'

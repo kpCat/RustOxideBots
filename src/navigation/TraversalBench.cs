@@ -12,7 +12,7 @@ namespace RustBots.Navigation
             Step(new ObstacleTraversal.TraversalClock {
                 WallTime=Time.realtimeSinceStartupAsDouble,FixedTime=Time.fixedTimeAsDouble,
                 FixedUnscaledTime=Time.fixedUnscaledTimeAsDouble,Delta=Time.fixedDeltaTime,
-                UnscaledDelta=Time.fixedUnscaledDeltaTime,TimeScale=Time.timeScale,
+                UnscaledDelta=Time.fixedUnscaledDeltaTime,TimeScale=Time.timeScale,MaximumDelta=Time.maximumDeltaTime,
                 InFixedStep=Time.inFixedTimeStep,PhysicsMode=Physics.simulationMode.ToString(),Sequence=++sequence,Frame=Time.frameCount
             });
         }
@@ -39,18 +39,41 @@ namespace Oxide.Plugins
         private float traversalOutdoorWait;
         private int traversalSceneFrom;
         private double traversalWarmupStart,traversalStableSince,traversalMaxGap;
-        private int traversalWarmupSamples,traversalWarmupResets;
+        private int traversalWarmupSamples,traversalDoorCollider;
         private Vector3 traversalWarmupPose;
         private RustBots.Navigation.ObstacleTraversal.TraversalClock? traversalWarmupClock;
         private object traversalWarmupReceipt;
         private readonly List<object> traversalScenes=new List<object>();
         private readonly List<object> traversalComponents=new List<object>();
+        private readonly List<object> traversalSpawnSupport=new List<object>();
+        private Door traversalOutdoorDoor;
+        private Vector3 traversalDetourGoal;
+        private Vector3 traversalDoorPlanePoint,traversalDoorPlaneNormal,traversalDoorBoundsCenter,traversalDoorBoundsSize;
+
+        private void TraversalSpawnSupport(string phase,Vector3 position,CapsuleCollider c,bool actual) {
+            if(c==null)throw new InvalidOperationException("Original spawn capsule missing");
+            var lower=actual?c.transform.TransformPoint(c.center-Vector3.up*(c.height*0.5f-c.radius)):
+                position+c.center-Vector3.up*(c.height*0.5f-c.radius);
+            var origin=lower+Vector3.up*0.57f;
+            var hits=Physics.SphereCastAll(origin,c.radius,Vector3.down,1.14f,-1,QueryTriggerInteraction.Ignore)
+                .Where(h=>npc==null || h.collider.GetComponentInParent<BaseEntity>()!=npc).OrderBy(h=>h.distance).ToArray();
+            var rayOrigin=position+Vector3.up*4f;
+            var rays=Physics.RaycastAll(rayOrigin,Vector3.down,8f,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore)
+                .Where(h=>npc==null || h.collider.GetComponentInParent<BaseEntity>()!=npc).OrderBy(h=>h.distance).ToArray();
+            var row=new {Phase=phase,Time=Time.realtimeSinceStartupAsDouble,ActualBody=actual,Position=Point(position),
+                Radius=c.radius,Height=c.height,Center=Point(c.center),Lower=Point(lower),SphereOrigin=Point(origin),
+                RayOrigin=Point(rayOrigin),RayHits=rays.Select(h=>new {Collider=h.collider.GetInstanceID(),Type=h.collider.GetType().Name,Point=Point(h.point),Normal=Point(h.normal),Distance=h.distance}).ToArray(),
+                SphereHits=hits.Select(h=>new {Collider=h.collider.GetInstanceID(),Type=h.collider.GetType().Name,Point=Point(h.point),Normal=Point(h.normal),Distance=h.distance,
+                    FullSphereGap=lower.y-(origin.y-h.distance)}).ToArray()};
+            traversalSpawnSupport.Add(row);Log("TRAVERSAL_SPAWN_SUPPORT",row);
+        }
 
         private void EnsureTraversal() {
             if(localMotion!=null)return;
             if(!traversalBench)throw new InvalidOperationException("Candidate traversal requires its explicit isolated bench until physical promotion");
             var scientist=npc as ScientistNPC;
             if(scientist==null)throw new InvalidOperationException("Traversal requires the original ScientistNPC");
+            TraversalSpawnSupport("BEFORE_CONTROLLER_BIND",npc.transform.position,npc.GetComponent<CapsuleCollider>(),true);
             var navigator=npc.GetComponent<NPCPlayerNavigator>();
             if(navigator!=null)navigator.enabled=false;
             var world=currentWorld??ReadCurrentWorld();
@@ -71,6 +94,12 @@ namespace Oxide.Plugins
         }
         private void TraversalWitness(object row) {
             var frame=row as Dictionary<string,object>;
+            if(frame!=null && (string)frame["Event"]=="MOTION_WITNESS" && traversalPhase=="OUTDOOR_DETOUR") {
+                var door=traversalOutdoorDoor;
+                frame["DetourDoorWitness"]=door==null?null:new {Door=Id(door),Open=door.IsOpen(),Position=Point(door.transform.position),
+                    Collider=traversalDoorCollider,PlanePoint=Point(traversalDoorPlanePoint),PlaneNormal=Point(traversalDoorPlaneNormal),
+                    BoundsCenter=Point(traversalDoorBoundsCenter),BoundsSize=Point(traversalDoorBoundsSize)};
+            }
             if(frame!=null && (string)frame["Event"]=="MOTION_WITNESS" && (string)frame["NativeResult"]=="OBSERVED" &&
                 traversalPhase=="HOME" && traversalSceneKind=="NATIVE_BUILDING_STEP" && homePhase=="NAV" && homePortal!=null) {
                 var door=(Door)homeEntities["DOOR"];
@@ -98,25 +127,26 @@ namespace Oxide.Plugins
                 clock.WallTime<traversalWarmupStart || clock.FixedTime<0 || clock.FixedUnscaledTime<0 || clock.Sequence<=0 || clock.Frame<0 ||
                 clock.WallTime-traversalWarmupStart>20 || Vector3.Distance(npc.transform.position,traversalWarmupPose)>0.001f ||
                 npc.GetComponent<Rigidbody>().linearVelocity.sqrMagnitude!=0 || !clock.InFixedStep || clock.PhysicsMode!="FixedUpdate" ||
-                clock.TimeScale!=1 || clock.Delta<=0 || clock.Delta>0.1f || clock.UnscaledDelta!=clock.Delta) {
+                clock.TimeScale!=1 || clock.Delta<=0 || clock.Delta>0.1f || clock.UnscaledDelta!=clock.Delta ||
+                !HomeFinite(clock.MaximumDelta) || clock.MaximumDelta<clock.Delta || clock.MaximumDelta!=Time.maximumDeltaTime) {
                 TraversalStopScene("Stationary physics warmup unavailable");return;
             }
             traversalWarmupSamples++;
             if(traversalWarmupClock.HasValue) {
                 var before=traversalWarmupClock.Value;double gap=clock.WallTime-before.WallTime;
                 traversalMaxGap=Math.Max(traversalMaxGap,gap);
-                if(gap<0 || gap>0.100001 || clock.Sequence!=before.Sequence+1 || clock.Frame<before.Frame ||
+                if(gap<0 || gap>1.500001 || clock.MaximumDelta!=before.MaximumDelta || clock.Sequence!=before.Sequence+1 || clock.Frame<before.Frame ||
                     clock.Delta!=before.Delta || Math.Abs(clock.FixedTime-before.FixedTime-before.Delta)>0.000001 ||
                     Math.Abs(clock.FixedUnscaledTime-before.FixedUnscaledTime-before.UnscaledDelta)>0.000001) {
-                    traversalStableSince=clock.WallTime;traversalWarmupResets++;
+                    TraversalStopScene("Stationary warmup native clock discontinuity/long stall");return;
                 }
             }else traversalStableSince=clock.WallTime;
             traversalWarmupClock=clock;
             if(clock.WallTime-traversalStableSince<2)return;
             traversalWarmupReceipt=new {Mode="STATIONARY_READ_ONLY",Start=traversalWarmupStart,End=clock.WallTime,
-                StableSince=traversalStableSince,Samples=traversalWarmupSamples,Resets=traversalWarmupResets,
+                StableSince=traversalStableSince,Samples=traversalWarmupSamples,Resets=0,
                 MaxWallGap=traversalMaxGap,Position=Point(traversalWarmupPose),LastClock=clock};
-            Log("TRAVERSAL_WARMUP",traversalWarmupReceipt);traversalPhase="HOME_START";
+            Log("TRAVERSAL_WARMUP",traversalWarmupReceipt);traversalPhase="OUTDOOR_WAIT";traversalOutdoorWait=Time.realtimeSinceStartup+30f;
         }
         private void TraversalOutdoorBegin() {
             traversalOrigin=npc.transform.position;Vector3 destination;
@@ -163,7 +193,7 @@ namespace Oxide.Plugins
             if(traversalPhase=="HOME_START"){TraversalIdleSample();traversalPhase="HOME";StartCraft();return true;}
             if(traversalPhase=="OUTDOOR_WAIT") {
                 TraversalIdleSample();
-                if(Time.realtimeSinceStartup>traversalOutdoorWait){TraversalStopScene("Outdoor nav readiness after native door close timed out");return true;}
+                if(Time.realtimeSinceStartup>traversalOutdoorWait){TraversalStopScene("Initial outdoor nav readiness timed out");return true;}
                 var nav=RustNavigation.Instance;
                 if(nav==null || !nav.IsDefaultNavmeshBuilt() || nav.HasPendingTiles())return true;
                 TraversalOutdoorBegin();return true;
@@ -171,13 +201,19 @@ namespace Oxide.Plugins
             if(localMotion!=null && localMotion.Blocked && navigating && traversalPhase=="HOME") {
                 TraversalStopScene(localMotion.Reason);return true;
             }
-            if(traversalPhase!="OUTDOOR_UP" && traversalPhase!="OUTDOOR_DOWN")return false;
+            if(traversalPhase!="OUTDOOR_UP" && traversalPhase!="OUTDOOR_DOWN" && traversalPhase!="NEGATIVE_APPROACH" && traversalPhase!="OUTDOOR_DETOUR")return false;
             float now=Time.realtimeSinceStartup;var p=npc.transform.position;float dt=now-previousTime,step=Vector3.Distance(previous,p);
             if(dt<=0 || dt>1.5f || step>6*dt+0.01f)throw new InvalidOperationException("Discontinuous traversal bench trace");
             total+=step;previous=p;previousTime=now;Sample(now);
             if(now>deadline){TraversalStopScene("Outdoor scene deadline");return true;}
             if(localMotion.Blocked){TraversalStopScene(localMotion.Reason);return true;}
             if(!localMotion.Arrived)return true;
+            if(traversalPhase=="NEGATIVE_APPROACH") { TraversalOutdoorRefusals();return true; }
+            if(traversalPhase=="OUTDOOR_DETOUR") {
+                if(Vector3.Distance(npc.transform.position,traversalSceneStart)<BasePlayer.GetRadius()*2 || traversalOutdoorDoor==null || traversalOutdoorDoor.IsOpen())
+                {TraversalStopScene("Closed-door detour lacks physical distance/unchanged door");return true;}
+                TraversalSceneEnd("PASSED","Observed supported detour around discovered closed geometry");traversalPhase="HOME_START";return true;
+            }
             bool up=traversalPhase=="OUTDOOR_UP";
             float delta=npc.transform.position.y-traversalSceneStart.y;
             if(up?delta<=0:delta>=0){TraversalStopScene("Observed outdoor height transition absent");return true;}
@@ -185,8 +221,59 @@ namespace Oxide.Plugins
             if(up) {
                 traversalPhase="OUTDOOR_DOWN";TraversalSceneBegin("SLOPE_DOWN","OUTDOOR_DOWN");
                 if(!IssueTraversal(traversalOrigin,"OUTDOOR_DOWN"))TraversalStopScene(localMotion.Reason);
-            }else{traversalComplete=true;Finish("PARTIAL","TRAVERSAL_BENCH_COMPLETE / independent validator decides physical acceptance");}
+            }else TraversalOutdoorNegativeBegin();
             return true;
+        }
+        private void TraversalOutdoorNegativeBegin() {
+            // Discover real native geometry; never construct the house merely to unlock outdoor tests.
+            var start=npc.transform.position;float r=BasePlayer.GetRadius();
+            foreach(var door in BaseNetworkable.serverEntities.OfType<Door>().Where(d=>!d.IsDestroyed && !d.IsOpen() &&
+                d.OwnerID!=npc.userID && Vector3.Distance(start,d.transform.position)<=48f).OrderBy(d=>Vector3.Distance(start,d.transform.position)).Take(16)) {
+                for(int sign=-1;sign<=1;sign+=2) {
+                    Vector3 stand,goal;var axis=door.transform.forward;axis.y=0;axis.Normalize();
+                    if(!NavSample(door.transform.position+axis*sign*r*3,out stand) || !NavSample(door.transform.position-axis*sign*r*3,out goal))continue;
+                    var a=new RustNavMeshPath();var b=new RustNavMeshPath();
+                    if(!CalculateRoute(stand,a) || a.status!=NavMeshPathStatus.PathComplete || a.GetPathLength()>60 ||
+                        !agent.CalculatePath(new NavVector3(stand),new NavVector3(goal),b) || b.status!=NavMeshPathStatus.PathComplete || b.GetPathLength()>24)continue;
+                    traversalOutdoorDoor=door;traversalDetourGoal=goal;traversalPhase="NEGATIVE_APPROACH";
+                    Log("TRAVERSAL_DISCOVERED_OBSTACLE",new {Door=Id(door),door.PrefabName,Owner=door.OwnerID.ToString(),Position=Point(door.transform.position),Stand=Point(stand),Goal=Point(goal),PathLength=b.GetPathLength(),Source="EXISTING_ISOLATED_WORLD"});
+                    if(!IssueTraversal(stand,"NEGATIVE_APPROACH"))TraversalStopScene(localMotion.Reason);return;
+                }
+            }
+            TraversalStopScene("Outdoor up/down completed; no safe bounded discovered closed-door and detour site. Home not started.");
+        }
+        private void TraversalOutdoorRefusals() {
+            var door=traversalOutdoorDoor;if(door==null || door.IsDestroyed || door.IsOpen()){TraversalStopScene("Discovered door changed");return;}
+            float r=BasePlayer.GetRadius();var position=npc.transform.position;
+            var wall=Physics.OverlapCapsule(position+Vector3.up*0.5f,position+Vector3.up*1.3f,r*4,-1,QueryTriggerInteraction.Ignore)
+                .Where(c=>c.GetComponentInParent<BaseEntity>()!=npc && c.GetComponentInParent<Door>()==null && !(c is TerrainCollider) && c.attachedRigidbody==null)
+                .OrderBy(c=>Vector3.Distance(c.bounds.ClosestPoint(position+Vector3.up*0.9f),position+Vector3.up*0.9f)).FirstOrDefault();
+            if(wall==null){TraversalStopScene("Discovered closed-door site has no nearby static wall");return;}
+            var direction=wall.bounds.ClosestPoint(position+Vector3.up*0.9f)-position;direction.y=0;
+            TraversalSceneBegin("SOLID_WALL","OUTDOOR_FOREIGN_WALL");
+            bool clear=localMotion.ProbeDisplacement(direction.normalized*r*4,"OUTDOOR_FOREIGN_WALL");
+            TraversalSceneEnd(clear?"NOT_PROVEN":"BLOCKED","Discovered foreign/world solid geometry full-body refusal");
+            if(clear){TraversalStopScene("Outdoor wall refusal not proven");return;}
+            var wallHits=Physics.CapsuleCastAll(position+Vector3.up*0.5f,position+Vector3.up*1.3f,r,direction.normalized,r*4,-1,QueryTriggerInteraction.Ignore);
+            if(!wallHits.Any(h=>h.collider==wall && Mathf.Abs(h.normal.y)<Mathf.Cos(60*Mathf.Deg2Rad)) || localMotion.Reason!="READ_ONLY_REFUSED")
+            {TraversalStopScene("Outdoor refusal lacks target-wall side contact");return;}
+            var delta=door.transform.position-position;delta.y=0;
+            if(delta.magnitude>r*4){TraversalStopScene("Discovered closed door beyond bounded probe");return;}
+            TraversalSceneBegin("DOOR_CLOSED","OUTDOOR_CLOSED_DOOR");clear=localMotion.ProbeDisplacement(delta,"OUTDOOR_CLOSED_DOOR");
+            TraversalSceneEnd(clear?"NOT_PROVEN":"BLOCKED","Discovered native closed-door full-body refusal");
+            if(clear){TraversalStopScene("Outdoor closed-door refusal not proven");return;}
+            var contacts=Physics.CapsuleCastAll(position+Vector3.up*0.5f,position+Vector3.up*1.3f,r,delta.normalized,delta.magnitude,-1,QueryTriggerInteraction.Ignore)
+                .Where(h=>h.collider.GetComponentInParent<Door>()==door && Mathf.Abs(h.normal.y)<0.1f).OrderBy(h=>h.distance).ToArray();
+            if(contacts.Length==0){TraversalStopScene("Closed-door refusal lacks target-door physical contact");return;}
+            var hit=contacts[0];traversalDoorPlanePoint=hit.point;traversalDoorPlaneNormal=hit.normal;
+            traversalDoorCollider=hit.collider.GetInstanceID();
+            traversalDoorBoundsCenter=hit.collider.bounds.center;traversalDoorBoundsSize=hit.collider.bounds.size;
+            float side=Vector3.Dot(position-traversalDoorBoundsCenter,hit.normal),other=Vector3.Dot(traversalDetourGoal-traversalDoorBoundsCenter,hit.normal);
+            float extent=Vector3.Dot(new Vector3(Mathf.Abs(hit.normal.x),Mathf.Abs(hit.normal.y),Mathf.Abs(hit.normal.z)),traversalDoorBoundsSize)*0.5f;
+            if(side*other>=0 || Mathf.Abs(side)<r+extent || Mathf.Abs(other)<r+extent)
+            {TraversalStopScene("Discovered detour endpoints do not clear opposite sides of actual closed-door volume");return;}
+            traversalPhase="OUTDOOR_DETOUR";TraversalSceneBegin("SAFE_DETOUR","OUTDOOR_DETOUR");
+            if(!IssueTraversal(traversalDetourGoal,"OUTDOOR_DETOUR"))TraversalStopScene(localMotion.Reason);
         }
         private bool TraversalDoorNegative() {
             if(!traversalBench)return true;
@@ -220,11 +307,11 @@ namespace Oxide.Plugins
         private bool TraversalHomeComplete() {
             if(!traversalBench)return false;
             TraversalSceneEnd("PASSED","Observed native doorway in/out with original body");
-            homePhase="TRAVERSAL_COMPLETE";traversalPhase="OUTDOOR_WAIT";traversalOutdoorWait=Time.realtimeSinceStartup+30f;return true;
+            homePhase="TRAVERSAL_COMPLETE";traversalComplete=true;Finish("PARTIAL","TRAVERSAL_BENCH_COMPLETE / independent validator decides physical acceptance");return true;
         }
         private object TraversalResult() {
             return localMotion==null?null:new {Schema=1,Mode=traversalBench?"TRAVERSAL_BENCH":"SHARED_RUNTIME",World=(currentWorld??ReadCurrentWorld()).WorldKey(),
-                Frames=localMotion.Evidence,Scenes=traversalScenes,Actuations=localMotion.Actuations,Components=traversalComponents,Warmup=traversalWarmupReceipt,SharedOutdoor=traversalOutdoor,SharedHome=traversalHome,Completed=traversalComplete};
+                Frames=localMotion.Evidence,Scenes=traversalScenes,Actuations=localMotion.Actuations,Components=traversalComponents,Warmup=traversalWarmupReceipt,SpawnSupport=traversalSpawnSupport,Order="OUTDOOR_FIRST",SharedOutdoor=traversalOutdoor,SharedHome=traversalHome,Completed=traversalComplete};
         }
         private void StopTraversal(string reason) {
             if(motionDriver!=null)motionDriver.Step=null;

@@ -238,9 +238,13 @@ namespace Oxide.Plugins
             var obj=prefab==null?null:GameManager.server.FindPrefab(prefab);
             if(obj==null || obj.GetComponent<ScientistNPC>()==null || obj.GetComponent<PlayerInventory>()==null){Finish("BLOCKED","Installed Roam avatar absent");return;}
             Vector3 spawn;if(!FindSpawn(out spawn)){Finish("BLOCKED","No safe RustNav spawn");return;}
+            if(traversalBench)TraversalSpawnSupport("SELECTED_POINT_RAY_SPAWN",spawn,obj.GetComponent<CapsuleCollider>(),false);
             npc=GameManager.server.CreateEntity(prefab,spawn,Quaternion.identity,true) as NPCPlayer;
             if(npc==null){Finish("BLOCKED","Roam creation failed");return;}
-            spawns++;npc.enableSaving=false;npc.Spawn();timer.Once(1f,()=>{try{Setup();}catch(Exception ex){PrintError(ex.ToString());Finish(economicFailure?"FAILED":"PARTIAL","Setup: "+ex.Message);}});
+            if(traversalBench)TraversalSpawnSupport("AFTER_CREATE_ON_ENABLE",npc.transform.position,npc.GetComponent<CapsuleCollider>(),true);
+            spawns++;npc.enableSaving=false;npc.Spawn();
+            if(traversalBench)TraversalSpawnSupport("AFTER_NATIVE_SPAWN",npc.transform.position,npc.GetComponent<CapsuleCollider>(),true);
+            timer.Once(1f,()=>{try{Setup();}catch(Exception ex){PrintError(ex.ToString());Finish(economicFailure?"FAILED":"PARTIAL","Setup: "+ex.Message);}});
         }
         private void Setup() {
             agent=npc.GetComponent<RustNavMeshAgent>();var fsm=npc.GetComponent<FSMComponent>();var brain=npc.GetComponent<BaseAIBrain>();

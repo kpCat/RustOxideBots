@@ -17,7 +17,7 @@ namespace RustBots.Navigation
         public struct TraversalClock
         {
             public double WallTime, FixedTime, FixedUnscaledTime;
-            public float Delta, UnscaledDelta, TimeScale;
+            public float Delta, UnscaledDelta, TimeScale, MaximumDelta;
             public bool InFixedStep;
             public string PhysicsMode;
             public long Sequence;
@@ -35,6 +35,10 @@ namespace RustBots.Navigation
         private readonly Rigidbody body;
         private readonly Vector3 originalCenter, originalScale;
         private readonly float radius, height, maxStep, maxDrop, maxSlope, maxSpeed, skin, supportTolerance;
+        // Same operational event-loop bound as the existing caller trace. It is
+        // never a physics horizon or an automatic acceptance of delayed motion.
+        private const float maxWallStall = 1.5f;
+        private readonly float nativeMaximumDelta;
         private readonly float navClimb, navSlope, navRadius, navHeight;
         private readonly bool originalKinematic, originalGravity;
         private readonly string originalCollisionMode;
@@ -98,16 +102,18 @@ namespace RustBots.Navigation
             maxDrop = maxStep; maxSlope = Mathf.Min(build.agentMaxSlope, 60f);
             maxSpeed = Mathf.Min(1.2f, agent.walkSpeed);
             skin = Physics.defaultContactOffset * 2f;
+            nativeMaximumDelta = Time.maximumDeltaTime;
             supportTolerance = skin + 0.05f; // Initial terrain spawn may be 5 cm above ground.
             profile = new { MaxStep = maxStep, MaxDrop = maxDrop, MaxSlope = maxSlope, MaxSpeed = maxSpeed,
-                MaxAcceleration = MaxAcceleration, MaxTick = MaxTick, Skin = skin, SupportTolerance = supportTolerance,
+                MaxAcceleration = MaxAcceleration, MaxTick = MaxTick, MaxWallStall = maxWallStall, NativeMaximumDelta = nativeMaximumDelta, Skin = skin, SupportTolerance = supportTolerance,
                 NavClimb = build.agentMaxClimb, NavSlope = build.agentMaxSlope, NavRadius = build.agentRadius,
                 NavHeight = build.agentHeight, NativeStepCeiling = BaseNavigator.maxStepUpDistance,
                 Capability = "CUSTOM_CHECKED_CONTROLLER_NOT_NATIVE_STEP_PROOF" };
             agent.isStopped = true; agent.updatePosition = false; agent.updateRotation = false; agent.ResetPath();
             string invalid = BodyProblem();
             if (invalid != null || !Finite(maxStep) || maxStep <= 0 || !Finite(maxSlope) || maxSlope <= 0 ||
-                !Finite(maxSpeed) || maxSpeed <= 0 || !Finite(skin) || skin <= 0 || skin > 0.05f)
+                !Finite(maxSpeed) || maxSpeed <= 0 || !Finite(skin) || skin <= 0 || skin > 0.05f ||
+                !Finite(nativeMaximumDelta) || nativeMaximumDelta < Time.fixedDeltaTime || nativeMaximumDelta > 120f)
                 throw new InvalidOperationException("Traversal profile UNKNOWN: " + (invalid ?? "INVALID_NATIVE_LIMITS"));
         }
 
@@ -193,7 +199,7 @@ namespace RustBots.Navigation
                 string wallProblem = WallProblem(clock), physicsProblem = PhysicsClockProblem(clock);
                 if (wallProblem != null || physicsProblem != null)
                 {
-                    if (wallProblem == "WALL_GAP" && physicsProblem == null && pending) ObserveLatePending();
+                    if (physicsProblem == null && pending) ObserveLatePending();
                     Stop("CLOCK_CONTRACT:" + (wallProblem ?? physicsProblem) +
                         (wallProblem != null && physicsProblem != null ? ";PHYSICS:" + physicsProblem : ""));
                     return;
@@ -303,8 +309,12 @@ namespace RustBots.Navigation
                     Block(frame, "UNKNOWN", !clear || !overlapClear ? "KINEMATIC_CLIP" : !currentSafe ? "ACTUAL_SUPPORT_OR_PERMISSION_LOST" :
                         !nativeVelocityMatches ? "NATIVE_VELOCITY_HORIZON_MISMATCH" : "ACTUATOR_DIVERGENCE_OR_CONTINUITY"); return;
                 }
+                string witnessClockProblem = ClockProblem(currentClock);
+                if (witnessClockProblem != null) { Stop("CLOCK_BEFORE_WITNESS_ACCEPT:" + witnessClockProblem); return; }
                 pending = false; pendingFrame = null;
                 Emit("MOTION_WITNESS", frame);
+                if (currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision)
+                    Emit("SCHEDULER_LAG_ACCEPTED_PHYSICS_WITNESS", frame);
                 unchangedWitnesses = !commandHold && Vector3.Distance(actual, commandFrom) <= 0.00001f ? unchangedWitnesses + 1 : 0;
                 if (unchangedWitnesses >= 3)
                 { Block(frame, "UNKNOWN", "STUCK_ACTUAL_POSE"); return; }
@@ -394,11 +404,13 @@ namespace RustBots.Navigation
                     // very little. Scale toward that ceiling before the coarse
                     // fallback; halving may instead require impossible braking.
                     // This changes only the next queried candidate, not a limit.
+                    // Reserve the witness's Numerical speed margin for actual
+                    // quantization; do not spend it on the planned command.
                     if (SupportedAt(landing, requested) && Mathf.Abs(requested.y - actual.y) <= (requested.y >= actual.y ? maxStep : maxDrop) &&
-                        Finite(velocity) && velocity.magnitude > maxSpeed + Numerical)
-                    { horizontalDistance *= maxSpeed / velocity.magnitude; continue; }
+                        Finite(velocity) && velocity.magnitude > maxSpeed)
+                    { horizontalDistance *= Mathf.Max(0f, maxSpeed - Numerical) / velocity.magnitude; continue; }
                     if (SupportedAt(landing, requested) && Mathf.Abs(requested.y - actual.y) <= (requested.y >= actual.y ? maxStep : maxDrop) &&
-                        velocity.magnitude <= maxSpeed + Numerical && (velocity - lastVelocity).magnitude / dt <= MaxAcceleration + Numerical)
+                        velocity.magnitude <= maxSpeed && (velocity - lastVelocity).magnitude / dt <= MaxAcceleration + Numerical)
                     { candidate = true; break; }
                 }
                 horizontalDistance *= 0.5f;
@@ -452,7 +464,8 @@ namespace RustBots.Navigation
             pendingFrame = Copy(frame); pending = true;
             // This is the sole position actuator. No native collision response is
             // assumed; full pre-query and next-tick actual geometry are mandatory.
-            body.MovePosition(body.position + requested - actual); actuations++;
+            // Subtract first to avoid cancellation of large world coordinates.
+            body.MovePosition(body.position + (requested - actual)); actuations++;
             acquisitionEligible = false;
             lastPosition = actual; lastTime = now;
         }
@@ -536,7 +549,7 @@ namespace RustBots.Navigation
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = "CLEAR";
             commandClock = currentClock;
             commandHold = hold; commandAcquisition = true; pendingFrame = Copy(frame); pending = true;
-            body.MovePosition(body.position + requested - actual); actuations++;
+            body.MovePosition(body.position + (requested - actual)); actuations++;
             lastPosition = actual; lastTime = now;
         }
 
@@ -547,15 +560,14 @@ namespace RustBots.Navigation
 
         private void ObserveLatePending()
         {
-            // Diagnostic evidence only. A valid next physics step cannot repair
-            // the independently failed wall-gap gate or complete this command.
+            // Terminal diagnostic only. Watchdog/deadline/stale work never earns credit.
             if (!pending || !clockReady || BodyProblem() != null || currentClock.Sequence != commandClock.Sequence + 1 ||
                 Math.Abs(currentClock.FixedTime - commandClock.FixedTime - commandClock.Delta) > ClockPrecision) return;
             Vector3 actual = npc.transform.position;
             var frame = Frame((float)currentClock.WallTime, actual);
             frame["IssuedClock"] = ClockRow(commandClock); frame["From"] = P(commandFrom);
             frame["Requested"] = P(commanded); frame["Classification"] = "UNKNOWN";
-            frame["Reason"] = "WALL_GAP_DIAGNOSTIC"; frame["TerminalOnly"] = true; frame["UnobservedCommand"] = true;
+            frame["Reason"] = "WALL_STOP_DIAGNOSTIC"; frame["TerminalOnly"] = true; frame["UnobservedCommand"] = true;
             frame["NativeResult"] = "OBSERVATION_FAILED";
             try
             {
@@ -593,8 +605,9 @@ namespace RustBots.Navigation
             if (c.WallTime < startWallTime || wallNow < c.WallTime || clockReady && c.WallTime < previousClock.WallTime)
                 return "WALL_REGRESSION";
             if (c.WallTime - startWallTime > 120.0) return "WALL_DEADLINE";
-            if (wallNow - c.WallTime > MaxTick + ClockPrecision || clockReady && c.WallTime - previousClock.WallTime > MaxTick + ClockPrecision)
-                return "WALL_GAP";
+            if (wallNow - c.WallTime > MaxTick + ClockPrecision) return "CALLBACK_EXECUTION_STALE";
+            if (clockReady && c.WallTime - previousClock.WallTime > maxWallStall + ClockPrecision)
+                return "LONG_STALL_UNSAFE";
             return null;
         }
 
@@ -603,7 +616,8 @@ namespace RustBots.Navigation
             if (!Finite(c.FixedTime) || !Finite(c.FixedUnscaledTime) || !Finite(c.Delta) || !Finite(c.UnscaledDelta) || !Finite(c.TimeScale) ||
                 c.FixedTime < 0 || c.FixedUnscaledTime < 0 || c.Delta <= 0 || c.Delta > MaxTick || c.UnscaledDelta <= 0 || c.UnscaledDelta > MaxTick ||
                 c.TimeScale != 1f || Math.Abs(c.Delta - c.UnscaledDelta) > ClockPrecision || !c.InFixedStep || c.Sequence <= 0 || c.Frame < 0 ||
-                c.PhysicsMode != "FixedUpdate") return "INVALID_DECLARED_PHYSICS_CLOCK";
+                c.PhysicsMode != "FixedUpdate" || !Finite(c.MaximumDelta) || c.MaximumDelta != nativeMaximumDelta)
+                return "INVALID_DECLARED_PHYSICS_CLOCK";
             // The driver reports the native callback; independently bind its
             // immutable step values to this actual invocation, not an arbitrary
             // synthetic clock or an OnTick/render callback.
@@ -611,7 +625,8 @@ namespace RustBots.Navigation
                 Math.Abs(c.FixedTime - Time.fixedTimeAsDouble) > ClockPrecision ||
                 Math.Abs(c.FixedUnscaledTime - Time.fixedUnscaledTimeAsDouble) > ClockPrecision ||
                 c.Delta != Time.fixedDeltaTime || c.UnscaledDelta != Time.fixedUnscaledDeltaTime || c.TimeScale != Time.timeScale ||
-                c.Frame != Time.frameCount || c.PhysicsMode != Physics.simulationMode.ToString()) return "NATIVE_CLOCK_BINDING";
+                c.Frame != Time.frameCount || c.PhysicsMode != Physics.simulationMode.ToString() ||
+                c.MaximumDelta != Time.maximumDeltaTime) return "NATIVE_CLOCK_BINDING";
             if (!clockReady) return null;
             if (previousClock.Sequence == long.MaxValue || c.Sequence != previousClock.Sequence + 1 || c.Frame < previousClock.Frame ||
                 c.Delta != previousClock.Delta || c.UnscaledDelta != previousClock.UnscaledDelta || c.TimeScale != previousClock.TimeScale ||
@@ -627,7 +642,7 @@ namespace RustBots.Navigation
         {
             return new { Schema = 2, WallTime = c.WallTime, FixedTime = c.FixedTime, FixedUnscaledTime = c.FixedUnscaledTime,
                 Delta = c.Delta, UnscaledDelta = c.UnscaledDelta, TimeScale = c.TimeScale, InFixedStep = c.InFixedStep,
-                Sequence = c.Sequence, Frame = c.Frame, PhysicsMode = c.PhysicsMode };
+                Sequence = c.Sequence, Frame = c.Frame, PhysicsMode = c.PhysicsMode, MaximumDelta = c.MaximumDelta };
         }
 
         private bool Plan(Vector3 end)
@@ -873,7 +888,7 @@ namespace RustBots.Navigation
             if (c == null) return null; var entity = c.GetComponentInParent<BaseEntity>(); var door = entity as Door; var rigid = c.attachedRigidbody;
             return new { Instance = c.GetInstanceID(), Type = c.GetType().Name, Entity = entity == null || entity.net == null ? null : entity.net.ID.Value.ToString(),
                 EntityType = entity == null ? null : entity.GetType().Name, MovingEntity = entity is Door || entity is BasePlayer || entity is BaseVehicle,
-                Prefab = entity == null ? null : entity.PrefabName, Enabled = c.enabled, Trigger = c.isTrigger, Layer = c.gameObject.layer,
+                Prefab = entity == null ? null : entity.PrefabName, Owner = entity == null ? null : entity.OwnerID.ToString(), Enabled = c.enabled, Trigger = c.isTrigger, Layer = c.gameObject.layer,
                 BoundsCenter = P(c.bounds.center), BoundsSize = P(c.bounds.size), DoorOpen = door == null ? (bool?)null : door.IsOpen(),
                 RigidbodyInstance = rigid == null ? (int?)null : rigid.GetInstanceID(), Kinematic = rigid == null ? (bool?)null : rigid.isKinematic };
         }
@@ -885,6 +900,12 @@ namespace RustBots.Navigation
                 { "Dt", clockContext ? (object)currentClock.Delta : null }, { "FixedDt", clockContext ? (object)(double)currentClock.Delta : null },
                 { "WallDt", clockContext ? (object)(currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime)) : null },
                 { "Clock", clockContext ? ClockRow(currentClock) : null }, { "PreviousClock", clockContext && clockReady ? ClockRow(previousClock) : null }, { "IssuedClock", null },
+                { "WallTelemetry", clockContext ? new { CallbackGap = currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime),
+                    ReadDelay = Time.realtimeSinceStartupAsDouble - currentClock.WallTime, MaxWallStall = maxWallStall,
+                    NativeMaximumDelta = nativeMaximumDelta, NativeCatchupExceeded = clockReady && currentClock.WallTime - previousClock.WallTime > nativeMaximumDelta + ClockPrecision,
+                    State = PhysicsClockProblem(currentClock) != null ? "PHYSICS_SKIPPED_OR_CHANGED" :
+                        clockReady && currentClock.WallTime - previousClock.WallTime > maxWallStall + ClockPrecision ? "LONG_STALL_UNSAFE" :
+                        clockReady && currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision ? "PHYSICS_CONTIGUOUS_WITH_WALL_LAG" : "ON_TIME" } : null },
                 { "Support", null }, { "Sweeps", new object[0] }, { "Overlaps", new object[0] }, { "Mask", Mask }, { "Triggers", "Ignore" },
                 { "Permission", null }, { "WaterDepth", null }, { "SupportAccepted", null }, { "OverlapClear", null },
                 { "SupportPhase", acquiring ? "FLOOR_ACQUISITION" : "NORMAL" }, { "Acquisition", null },
@@ -901,6 +922,16 @@ namespace RustBots.Navigation
         {
             if (evidence.Count >= MaxEvidence) { active = false; blocked = true; arrived = false; reason = "EVIDENCE_BUDGET"; return; }
             var row = Copy(frame); row["Event"] = name; row["Casts"] = casts; row["QueryMilliseconds"] = queryClock.Elapsed.TotalMilliseconds;
+            if (clockContext) {
+                var telemetry = new Dictionary<string, object> {
+                    { "CallbackGap", currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime) },
+                    { "ReadDelay", Time.realtimeSinceStartupAsDouble - currentClock.WallTime }, { "MaxWallStall", maxWallStall },
+                    { "NativeMaximumDelta", nativeMaximumDelta }, { "NativeCatchupExceeded", currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime) > nativeMaximumDelta + ClockPrecision },
+                    { "State", PhysicsClockProblem(currentClock) != null ? "PHYSICS_SKIPPED_OR_CHANGED" :
+                        clockReady && currentClock.WallTime - previousClock.WallTime > maxWallStall + ClockPrecision ? "LONG_STALL_UNSAFE" :
+                        clockReady && currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision ? "PHYSICS_CONTIGUOUS_WITH_WALL_LAG" : "ON_TIME" } };
+                row["WallTelemetry"] = telemetry;
+            }
             evidence.Add(row); if (sink != null) sink(row);
         }
         private void CountCast() { if (++casts > MaxCasts) throw new InvalidOperationException("PHYSICS_QUERY_BUDGET"); }
