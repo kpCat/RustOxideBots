@@ -1,0 +1,51 @@
+# API decision019
+
+Controller C, original ScientistNPC : BasePlayer, original radius0.5/height1.8 capsule and Rigidbody configuration remain unchanged. RustNav plans routes; the existing checked MovePosition path is the sole actuator. No default product promotion.
+
+Independent installed API review checked Assembly-CSharp SHA256 `04FB89520F18A1920C1B1A350B82DD24A4258F31D97B82496971A9CC7A49DCB7`, matching the native metadata/IL evidence012/013. Existing FirstHome confirms Planner.DoBuild(Construction.Target,Construction), Construction placement/socket rules, actual Item UID costs, Wood upgrades, ItemModDeployable TC/Door registration, native TC auth and GetProtectedMinutes(true). No new native API or dependency is required. Combined installed C#7.3 and actual Oxide compilation are separate gates.
+
+The observational defect is explicit: ProbeDisplacement emits OBSTACLE_PROBE/PHYSICAL_CONTACT then calls Block for READ_ONLY_REFUSED. Block clears active/arrived and sets blocked/reason. This contradicts sequential negative probes and later detour. Repair: separate PROBE_REFUSED from motor BLOCKED; require native stationary body and no active/pending/acquiring/unobserved command; preserve full control state and emit before/after snapshots. Actual command collision admission remains fail-closed.
+
+Fixture choice: reuse the full eight-role FirstHome TEST_FIXTURE path with native previews and payments. G4 runs before HomeInterior. Wall and closed Door receive separate exact target bindings. The detour crosses between supported exterior stands next to adjacent solid walls, around the outside corner; it never targets the sealed interior. Native Door remains closed, and foundation-local footprint exclusion accompanies physical sweep/support witnesses.
+
+Version constraints: installed C#7.3/Oxide, PowerShell5.1, no external providers. Historical slopes018 are preserved as SLOPE, not discrete step proof. The real raised doorway lip remains a mandatory physical gate. Static API agreement does not prove construction, negative contact, detour or G5; live statuses will be recorded in RESULT.
+
+## Start1 native readiness finding
+
+The accepted approach stopped on global HasPendingTiles=true while agent OnNavMesh, current native path and committed mesh epochs stayed valid. This global flag wasfalse in a receipt11.6ms later. It does not establish route-local invalidation. Actual physical gates accepted all371 issued commands; no wall/door construction had begun.
+
+Metadata/IL confirms RustNavigation.HasPendingTiles calls BackgroundTileBuilder.GetPendingTilesOnMainThread over every mesh. The active tileBuilder fields on RustNavigation and RustNavmesh are private. Public GetTilesInBounds/GetTile/rcCalcTileCoordFromPos and Tile.hasData/wasBuiltOnce expose geometry/data, not pending intersection. Therefore no claim of precise corridor-only pending is possible through the verified public API, and no private reflection is introduced.
+
+RustNavMeshPath exposes native corners/polyRefs/polyRefCount; RustNavmesh exposes IsValidPolyRef, and explicit agent.CalculatePath(from,to,path) does not depend on native nextPosition as its origin. These support a reviewed distinction between global queue telemetry and the committed route, while retaining epochs and every physical check. They do not prove that pending work cannot affect that route. This policy was presented with alternatives to the owner and subsequently approved as described below. No route-local pending query is fabricated.
+
+## Owner decision and implementation for Start2
+
+The owner explicitly selected option1: refine readiness within C and proceed toward Start2. Global PendingTiles must remain visible; fresh native PathComplete from the actual actor, trustworthy refs, immutable epochs and all existing physical limits are mandatory. Invalid/uncertain routes, changed epochs and physical obstacles must fail closed. The previous decision gate is resolved; budget remains1/3 until an actual second PID.
+
+Installed metadata/IL confirms public DefaultNavmesh.CalculatePath(from,to,path,agent.npcDoorsWillOpen), public actor explicit-from/to CalculatePath, public npcDoorsWillOpen getter and exact mesh IsValidPolyRef. RustNavMeshPath holds a256-ref buffer; Reset does not erase its tail. Read only the first polyRefCount and reject empty/saturated counts or corners. A valid ref alone proves existence on a mesh, not actor-path provenance or traversability.
+
+NATIVE_CURRENT_ROUTE_V1 obtains its primary complete path on the exact DefaultNavmesh handle, then independently queries the actor planner with identical actual inputs and unchanged native door filter. Full prefix refs/corners must match. Both native endpoints retain the established0.5m projection bound; the actual body/query origin is never replaced with a projected corner. Every original/fresh ref is checked on that exact mesh. The issued horizontal segment must align with the fresh first native leg; physical height/support remains governed by unchanged full-body queries.
+
+Each physical command, including initial acquisition, requires a new certificate from the same native callback, with exact actual From/Requested/destination, both epochs before/after, native filter, global pending observations, native refs/corners and bounded query timestamps. Initial route admission, construction/site readiness remain strict on global pending. An already active route may continue during global queue work only with this stronger certificate. The writer rechecks epochs/filter/refs/body/clock after the evidence sink, without resetting velocity, clock, retry or actuation state. Actual global PendingTiles is never relabeled as route-local false.
+
+Public complete-path status does not expose every raw native search-detail flag; those details are NOT_EXPOSED/NOT_VERIFIED. No claim of absent search-limit flags or of absent route-local pending work is made. The certificate proves the current official complete committed route under its native filter, corroborated on the exact mesh; per-step full-body physics and epoch/freshness guards remain mandatory.
+
+Prelive2: focused negative readiness tests RED→GREEN; installed combined C#7.3 passed. Full Test-All and independent source/security review remain required before a second PID. No native building/obstacle success is implied by these offline checks.
+
+Prelive2 review completion: two Important findings were corrected before live. A prechecked intent is distinct from an actual writer call: a final post-sink native guard captures real timestamps, current handle/epochs/filter/refs/body/profile/clock and queue observations. MOVE_ISSUED is published only after MovePosition returns and the actuation count increments; its future physical witness remains mandatory. A failed guard publishes MOVE_REJECTED/NOT_ISSUED without invoking the writer or incrementing counters. The validator matches intent/issue/rejection and accepts zero-actuation cancellation without inventing movement; a writer exception remains unobserved/unknown.
+
+Bounded replan now obtains each native leg with the same exact-mesh/actor corroboration, preserves active counts and leg boundaries, requires matching native corner/poly joins and stable epochs/filter/handle, and atomically installs merged true refs/corners/provenance. The validator reconstructs that merge and rejects prior-route refs or disconnected native joins. It does not weaken the fresh first-leg or physical admission rules. Complete Test-All/C#7.3 and independent bounded re-review passed; GO for source only, physical proof remains live-required.
+
+## Start2 observation and bounded Start3 correction
+
+Start2 compiled/loaded natively but stopped at the old stationary-readiness compound predicate before any writer. It did not exercise NATIVE_CURRENT_ROUTE_V1. Missing individual observations prevent attribution to a specific clock or body condition; the root cause remains UNKNOWN. PendingTiles is not checked by that warmup predicate.
+
+STATIONARY_CLOCK_WINDOW_V1 captures the existing C instance's immutable native maximumDelta, original actual pose, complete body/agent/collider fingerprint and one20s wall deadline. It only reads native state. Every observation, including rejected clocks, receives a contiguous journal ordinal and is retained; body/pose drift, nonzero velocity, motor activity or changed original profile cannot be accepted. Invalid clocks end the eligibility window without resetting C, clocks, pose, budgets or the original deadline. Movement requires a contiguous eligible window spanning2s in wall/fixed/fixed-unscaled time, with the previous exact sequence/delta/timeScale/context/gap limits. An absent FixedUpdate cannot extend the deadline.
+
+The independent validator replays the complete journal and binds terminal total/LastClock, original body/profile/pose, subsequent physical timestamps/native anchors/driver sequence, and the first actual C baseline pose. No arbitrary startup sleep, fake native sample, relaxed physical admission or hidden motor reset is introduced. This is a bounded readiness/observability repair, not a declaration that a particular engine bug has been fixed. Final offline and independent prelive3 gates precede the last authorized live attempt.
+
+## Final observed limits
+
+Start3 passed the strict stationary window and produced649 issued/current-route-certified/physically witnessed commands and one paid native Wood foundation. Every new certificate/final guard observed global pending=false; pending=true continuation remains untested. The subsequent unsupported continuation/repath stopped at CLOCK_UNOBSERVED_ACTIVE_HOLD, without accepting an unwitnessed brake or hold. No resolved discrete transition, native wall/Door refusal, detour or home credit follows. No fourth start.
+
+The unchanged runner's Depth8 secondary serialization cannot retain the deeper native RoutePlan corner arrays: embedded result.Navigation fails repeat full validation. The complete immutable plugin-result.json independently passes; the runner originally validates that parsed primary object before serialization. Use primary raw for physical evidence and root runner fields for lifecycle facts. The open P2 wrapper limitation is documented rather than rewriting historical raw or claiming both copies validate.

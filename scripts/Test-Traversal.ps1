@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+param([switch]$ReadinessOnly)
 $ErrorActionPreference='Stop'
 # OFFLINE_ONLY: synthetic receipts exercise validation, never Unity/PhysX or live movement.
 $validator=Join-Path $PSScriptRoot 'TraversalValidation.ps1'
@@ -40,8 +41,113 @@ function New-TraversalFrames {
     $w1.Acceleration=$w1.Speed/0.05;$w2.Acceleration=($w2.Speed-$w1.Speed)/0.05
     @($d1,$w1,$d2,$w2)
 }
+# OFFLINE_ONLY: current native route certificate is mandatory, never hide global pending.
+$ready=New-TraversalFrame 'MOVE_DECISION' 1 1 @(0,0,0) @(0.009,0.002,0) 0
+$ready.Schema=2;$ready|Add-Member NoteProperty Clock @{Sequence=41;WallTime=1.0}
+$ready.Navigation.PendingTiles=$true
+$ready.Navigation|Add-Member NoteProperty AdmissionPolicy 'NATIVE_CURRENT_ROUTE_V1'
+$ready.Navigation|Add-Member NoteProperty DefaultBuilt $true
+$ready.Navigation|Add-Member NoteProperty RoutePolys @('101')
+$certificate=Copy-TraversalFixture @{Kind='NATIVE_CURRENT_ROUTE_V1';From=$ready.From;To=$ready.Navigation.RouteTo;Requested=$ready.Requested;Sequence=41;StartedWall=1.001;CompletedWall=1.002;CheckedWall=1.003;
+    Mesh=$ready.Navigation.Mesh;ChangeBefore=1;ChangeAfter=1;DataBefore=1;DataAfter=1;FilterBefore=$false;FilterAfter=$false;
+    NativeCalculated=$true;ActorCalculated=$true;NativeStatus='PathComplete';ActorStatus='PathComplete';Capacity=256;
+    NativeCorners=$ready.Navigation.Corners;ActorCorners=$ready.Navigation.Corners;NativePolys=@(@{Ref='101';Valid=$true});ActorPolys=@('101');RoutePolys=@(@{Ref='101';Valid=$true});
+    GlobalPendingBefore=$true;GlobalPendingAfter=$true}
+$ready.Navigation|Add-Member NoteProperty Admission $certificate
+$ready.Navigation|Add-Member NoteProperty RouteFilter $false
+$ready.Navigation|Add-Member NoteProperty RoutePlan @((Copy-TraversalFixture @{Kind='DEFAULT_NATIVE_PATH_V1';Mesh=$ready.Navigation.Mesh;From=$ready.Navigation.RouteFrom;To=$ready.Navigation.RouteTo;Filter=$false;
+    ChangeBefore=1;ChangeAfter=1;DataBefore=1;DataAfter=1;NativeCalculated=$true;ActorCalculated=$true;NativeStatus='PathComplete';ActorStatus='PathComplete';Capacity=256;
+    NativeCorners=$ready.Navigation.Corners;ActorCorners=$ready.Navigation.Corners;NativePolys=@('101');ActorPolys=@('101')}))
+$ready|Add-Member NoteProperty DecisionPublishedWall 1.0025
+Assert-TraversalNavigation $ready -Decision
+foreach($mutation in @(
+    @{Name='global pending without fresh native proof';Change={param($x)$x.Navigation.Admission=$null}},
+    @{Name='stale callback certificate';Change={param($x)$x.Navigation.Admission.Sequence=40}},
+    @{Name='nonactual native query origin';Change={param($x)$x.Navigation.Admission.From=@(1,0,0)}},
+    @{Name='native invalid poly ref';Change={param($x)$x.Navigation.Admission.NativePolys[0].Valid=$false}},
+    @{Name='native mesh epoch changed during check';Change={param($x)$x.Navigation.Admission.DataAfter=2}},
+    @{Name='actor/default native path provenance mismatch';Change={param($x)$x.Navigation.Admission.ActorPolys[0]='102'}},
+    @{Name='fresh path incomplete';Change={param($x)$x.Navigation.Admission.NativeStatus='PathPartial'}},
+    @{Name='changed native door filter';Change={param($x)$x.Navigation.Admission.FilterAfter=$true}},
+    @{Name='expired native proof wall budget';Change={param($x)$x.Navigation.Admission.CheckedWall=1.2}},
+    @{Name='numeric native success is not a bool';Change={param($x)$x.Navigation.Admission.NativeCalculated=1}},
+    @{Name='saturated native poly buffer';Change={param($x)$x.Navigation.Admission.NativePolys=@($x.Navigation.Admission.NativePolys[0])*256;$x.Navigation.Admission.ActorPolys=@('101')*256}},
+    @{Name='issued segment deviates from fresh native first leg';Change={param($x)$x.Navigation.Admission.NativeCorners[1]=@(0,0.002,0.009);$x.Navigation.Admission.ActorCorners[1]=@(0,0.002,0.009)}}
+)){$x=Copy-TraversalFixture $ready;& $mutation.Change $x;Deny-TraversalFixture {Assert-TraversalNavigation $x -Decision} $mutation.Name}
+Write-Output 'PASS OFFLINE_ONLY019 readiness: global pending visible, native current-pose dual path/poly/epoch/filter/segment admission; uncertainty rejected'
+if(-not (Get-Command Assert-TraversalFinalIssue -CommandType Function -ErrorAction SilentlyContinue)){throw 'Missing post-sink issue/cancel contract'}
+$issue=Copy-TraversalFixture $ready;$issue.Event='MOVE_ISSUED';$issue.NativeResult='ISSUED'
+$issue|Add-Member NoteProperty Actuations 1;$issue|Add-Member NoteProperty WriterCalled $true
+$issue|Add-Member NoteProperty FinalAdmission (Copy-TraversalFixture @{Kind='POST_SINK_NATIVE_GUARD_V1';Accepted=$true;Error=$null;Sequence=41;StartedWall=1.003;CheckedWall=1.004;
+    From=$ready.Actual;Requested=$ready.Requested;MeshBefore=$ready.Navigation.Mesh;MeshAfter=$ready.Navigation.Mesh;ChangeBefore=1;ChangeAfter=1;DataBefore=1;DataAfter=1;
+    FilterBefore=$false;FilterAfter=$false;DefaultBuilt=$true;OnNavMesh=$true;ProfileMatches=$true;BodyValid=$true;ClockAccepted=$true;ControlActive=$true;
+    RoutePolys=@(@{Ref='101';Valid=$true});NativePolys=@(@{Ref='101';Valid=$true});GlobalPendingBefore=$true;GlobalPendingAfter=$true})
+Assert-TraversalFinalIssue $issue $ready 0
+$cancelled=Copy-TraversalFixture $issue;$cancelled.Event='MOVE_REJECTED';$cancelled.NativeResult='NOT_ISSUED';$cancelled.WriterCalled=$false;$cancelled.Actuations=0
+$cancelled.FinalAdmission.Accepted=$false;$cancelled.FinalAdmission.FilterAfter=$true
+Assert-TraversalFinalIssue $cancelled $ready 0 -Rejected
+Deny-TraversalFixture {$x=Copy-TraversalFixture $issue;$x.FinalAdmission.DataAfter=2;Assert-TraversalFinalIssue $x $ready 0} 'writer admitted changed epoch after sink'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $cancelled;$x.WriterCalled=$true;Assert-TraversalFinalIssue $x $ready 0 -Rejected} 'cancelled intent actually called writer'
+if(-not (Get-Command Assert-TraversalNativeRoutePlan -CommandType Function -ErrorAction SilentlyContinue)){throw 'Missing native composite route provenance contract'}
+$composite=Copy-TraversalFixture $ready.Navigation
+$one=Copy-TraversalFixture $composite.RoutePlan[0];$one.From=@(0,0,0);$one.To=@(1,0,0);$one.NativeCorners=@(@(0,0,0),@(1,0,0));$one.ActorCorners=@(@(0,0,0),@(1,0,0));$one.NativePolys=@('101','102');$one.ActorPolys=@('101','102')
+$two=Copy-TraversalFixture $one;$two.From=@(1,0,0);$two.To=@(1,0,1);$two.NativeCorners=@(@(1,0,0),@(1,0,1));$two.ActorCorners=@(@(1,0,0),@(1,0,1));$two.NativePolys=@('102','103');$two.ActorPolys=@('102','103')
+$composite.RoutePlan=@($one,$two);$composite.RouteFrom=@(0,0,0);$composite.RouteTo=@(1,0,1);$composite.Corners=@(@(0,0,0),@(1,0,0),@(1,0,1));$composite.RoutePolys=@('101','102','102','103')
+Assert-TraversalNativeRoutePlan $composite
+Deny-TraversalFixture {$x=Copy-TraversalFixture $composite;$x.RoutePolys=@('101');Assert-TraversalNativeRoutePlan $x} 'composite corners retain old path refs'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $composite;$x.RoutePlan[1].NativePolys[0]='104';$x.RoutePlan[1].ActorPolys[0]='104';$x.RoutePolys[2]='104';Assert-TraversalNativeRoutePlan $x} 'native legs have no matching polygon join'
+if(-not (Get-Command Assert-TraversalStationaryWindow -CommandType Function -ErrorAction SilentlyContinue)){throw 'Missing bounded stationary-clock window contract'}
+$warmBody=Copy-TraversalFixture @{Actor='19';Capsules=@(@{Instance=10;Radius=0.5;Height=1.8;Center=@(0,0.9,0);Direction=1;Scale=@(1,1,1);Up=@(0,1,0);Enabled=$true;Trigger=$false;Layer=17;Rigidbody=11});
+    Rigidbody=11;Kinematic=$true;Gravity=$false;DetectCollisions=$true;CollisionMode='Discrete';Colliders=@(10);AgentStopped=$true;AgentUpdatePosition=$false;AgentUpdateRotation=$false}
+$window=Copy-TraversalFixture @{WarmupPolicy='STATIONARY_CLOCK_WINDOW_V1';WarmupContract=@{Start=0;Position=@(0,0,0);Body=$warmBody;NativeMaximumDelta=0.125;MaxSeconds=20;MinWindowSeconds=2;MaxSamples=512};WarmupObservations=@();
+    Warmup=@{Schema=2;Mode='STATIONARY_READ_ONLY';Start=0;End=2.0625;StableSince=0.0625;Samples=33;Resets=0;MotorResets=0;WindowRestarts=0;Position=@(0,0,0)}}
+for($i=0;$i -le 33;$i++){
+    $time=$i*0.0625;$delta=if($i -eq 0){0.2}else{0.0625}
+    $clock=@{WallTime=$time;FixedTime=$time;FixedUnscaledTime=$time;Delta=$delta;UnscaledDelta=$delta;MaximumDelta=0.125;TimeScale=1;InFixedStep=$true;PhysicsMode='FixedUpdate';Sequence=($i+1);Frame=(300+$i)}
+    $outcome=if($i -eq 0){'WAIT'}elseif($i -eq 1){'WINDOW_START'}elseif($i -eq 33){'READY'}else{'WINDOW_ADVANCE'}
+    $window.WarmupObservations+=,(Copy-TraversalFixture @{Observation=($i+1);ObservedWall=$time;Clock=$clock;LiveMaximumDelta=0.125;Position=@(0,0,0);Velocity=@(0,0,0);Body=$warmBody;MotorActuations=0;MotorActive=$false;MotorBlocked=$false;Outcome=$outcome})
+}
+$window|Add-Member NoteProperty WarmupObservationCount 34
+$window.Warmup|Add-Member NoteProperty TotalObservations 34
+$window.Warmup|Add-Member NoteProperty LastClock (Copy-TraversalFixture $window.WarmupObservations[-1].Clock)
+Assert-TraversalStationaryWindow $window '19'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.WarmupObservations=@($x.WarmupObservations|Select-Object -Skip 1);Assert-TraversalStationaryWindow $x '19'} 'readiness journal omits initial rejected clocksample'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.Warmup.LastClock.FixedTime-=0.0625;Assert-TraversalStationaryWindow $x '19'} 'ready receipt substitutes another final native clock'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$past=New-TraversalFrames;foreach($f in $past){$f.Profile|Add-Member NoteProperty NativeMaximumDelta 0.125};$x|Add-Member NoteProperty Frames $past;$x|Add-Member NoteProperty Actuations 2;Assert-TraversalStationaryWindow $x '19'} 'physical movement predates stationary readiness'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.WarmupObservations[10].Position[0]=0.002;Assert-TraversalStationaryWindow $x '19'} 'warmup silently rebases a drifting body'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.WarmupObservations[10].MotorActuations=1;Assert-TraversalStationaryWindow $x '19'} 'readiness observation issued movement'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.WarmupObservations[-1].ObservedWall=21;Assert-TraversalStationaryWindow $x '19'} 'warmup resets total twenty-second deadline'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $window;$x.WarmupObservations[10].Clock.MaximumDelta=0.25;$x.WarmupObservations[10].LiveMaximumDelta=0.25;Assert-TraversalStationaryWindow $x '19'} 'warmup silently accepts changed captured native clock profile'
+$slow=Copy-TraversalFixture $window;$slow.WarmupObservations=@($slow.WarmupObservations[1],$slow.WarmupObservations[2],$slow.WarmupObservations[3])
+for($i=0;$i -lt 3;$i++){$slow.WarmupObservations[$i].ObservedWall=1+$i;$slow.WarmupObservations[$i].Clock.WallTime=1+$i}
+$slow.WarmupObservations[-1].Outcome='READY'
+Deny-TraversalFixture {Assert-TraversalStationaryWindow $slow '19'} 'wall-only window lacks two seconds of native physics'
+Write-Output 'PASS OFFLINE_ONLY019 stationary window: invalid samples wait without movement, strict native/wall span, immutable body/profile and original total deadline'
+if($ReadinessOnly){return}
 $frames=New-TraversalFrames
 Assert-TraversalFrames $frames '19' 'synthetic-world'
+# OFFLINE_ONLY regression: observation cannot consume or poison motor state.
+if(-not (Get-Command Assert-TraversalProbe -CommandType Function -ErrorAction SilentlyContinue)){throw 'Missing nondestructive traversal probe contract'}
+$probe=Copy-TraversalFixture $frames[1]
+$probe.Event='PROBE_REFUSED';$probe.NativeResult='PROBE_ONLY';$probe.Reason='READ_ONLY_REFUSED';$probe.Classification='SOLID_BLOCKED';$probe.Actual=$probe.From;$probe.Requested=@(1,0,0)
+$probe.Body=Copy-TraversalFixture $frames[0].Body;$probe.Support=Copy-TraversalFixture $frames[0].Support
+$probe|Add-Member NoteProperty ControlBefore @{Active=$false;Arrived=$true;Blocked=$false;Pending=$false;Acquiring=$false;UnobservedTerminal=$false;Actuations=2;Retry=0;Command=2;Velocity=@(0,0,0);NativeVelocity=@(0,0,0);Position=$probe.From}
+$probe|Add-Member NoteProperty ControlAfter (Copy-TraversalFixture $probe.ControlBefore)
+Assert-TraversalProbe $probe '19'
+foreach($mutation in @(
+    @{Name='read-only refusal poisoned controller';Change={param($x)$x.ControlAfter.Blocked=$true}},
+    @{Name='read-only probe during pending motion';Change={param($x)$x.ControlBefore.Pending=$true;$x.ControlAfter.Pending=$true}},
+    @{Name='read-only probe issued actuation';Change={param($x)$x.ControlAfter.Actuations=3}}
+)){$x=Copy-TraversalFixture $probe;& $mutation.Change $x;Deny-TraversalFixture {Assert-TraversalProbe $x '19'} $mutation.Name}
+$motor=[IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot -Parent) 'src\navigation\ObstacleTraversal.cs'))
+$probeSource=$motor.Substring($motor.IndexOf('public bool ProbeDisplacement('),$motor.IndexOf('public bool SetDestination(')-$motor.IndexOf('public bool ProbeDisplacement('))
+if($probeSource -match '(?<![\w.])(?:Block|Stop)\(' -or $probeSource -notmatch 'active \|\| pending' -or $probeSource -notmatch 'lastVelocity\.sqrMagnitude != 0' -or $probeSource -notmatch 'PROBE_REFUSED') {throw 'Read-only probe still mutates motor lifecycle or lacks stationary guard'}
+if($motor -notmatch 'Block\(frame,.*"KINEMATIC_CLIP"' -or $motor -notmatch 'if \(!sweptClear \|\| !endClear' -or $motor -notmatch '"FULL_VOLUME_OR_PERMISSION_BLOCKED"'){throw 'Actual motion lost fail-closed physical admission'}
+Write-Output 'PASS OFFLINE_ONLY: nonpoisoning probe snapshots, stationary guard and actual move collision admission'
+$exterior=Copy-TraversalFixture @{FoundationPosition=@(0,0,0);FoundationRotation=@(0,0,0,1);NativeFoundationBounds=@{Center=@(0,0,0);Size=@(3,0.3,3)};Skin=0.02;Radius=0.5;ExteriorMin=@(-2.02,-0.15,-2.02);ExteriorMax=@(2.02,0.15,2.02)}
+if(-not (Get-Command Assert-TraversalExteriorSegment -CommandType Function -ErrorAction SilentlyContinue)){throw 'Missing native exterior detour contract'}
+Assert-TraversalExteriorSegment $exterior @(0,0,2.8) @(2.8,0,2.8)
+Deny-TraversalFixture {Assert-TraversalExteriorSegment $exterior @(0,0,2.8) @(2.8,0,0)} 'detour diagonal crosses sealed native footprint'
 $undefined=Copy-TraversalFixture $frames
 $undefined[1].Overlaps=@([pscustomobject]@{Collider=$undefined[1].Support.Collider;Intersects=$false;Distance=[double]::NaN;Direction=$null;Error=$null;SupportTangent=$true;ActorCollider=10;QueryPosition=$undefined[1].Actual})
 $undefined[1].Sweeps[0].Hits=@([pscustomobject]@{Collider=$undefined[1].Support.Collider;Point=@(0,0,0);Normal=@(0,1,0);Distance=0;Blocking=$false;InitialIntersects=$false;InitialDepth=[double]::NaN;InitialDirection=$null;PlaneClearance=0;SupportTangent=$true})
@@ -93,6 +199,54 @@ function New-FixedClockFrames {
 }
 $clockFrames=New-FixedClockFrames
 Assert-TraversalFrames $clockFrames '19' 'synthetic-world'
+$afterWindow=Copy-TraversalFixture $window;$postFrames=Copy-TraversalFixture $clockFrames
+foreach($f in $postFrames){
+    $f.Profile|Add-Member NoteProperty NativeMaximumDelta 0.125
+    foreach($key in @('Clock','PreviousClock','IssuedClock')){if($null -ne $f.$key){$f.$key.FixedTime+=10;$f.$key.FixedUnscaledTime+=10;$f.$key.Frame+=100;$f.$key|Add-Member NoteProperty MaximumDelta 0.125 -Force}}
+}
+Assert-TraversalFrames $postFrames '19' 'synthetic-world'
+$afterWindow|Add-Member NoteProperty Frames $postFrames;$afterWindow|Add-Member NoteProperty Actuations 2
+Assert-TraversalStationaryWindow $afterWindow '19'
+Deny-TraversalFixture {$x=Copy-TraversalFixture $afterWindow;$x.Frames[0].Actual[0]=0.002;Assert-TraversalStationaryWindow $x '19'} 'first motor baseline silently rebases original warmup pose'
+function Set-TraversalNativePolicyFixture($f){
+    $f.Profile|Add-Member NoteProperty NativeAdmissionPolicy 'NATIVE_CURRENT_ROUTE_V1' -Force
+    $n=$f.Navigation
+    $n|Add-Member NoteProperty AdmissionPolicy 'NATIVE_CURRENT_ROUTE_V1' -Force
+    $n|Add-Member NoteProperty DefaultBuilt $true -Force
+    $n|Add-Member NoteProperty RouteFilter $false -Force
+    $n|Add-Member NoteProperty RoutePolys @('101') -Force
+    $p=Copy-TraversalFixture $ready.Navigation.RoutePlan[0]
+    $p.From=$n.RouteFrom;$p.To=$n.RouteTo;$p.NativeCorners=$n.Corners;$p.ActorCorners=$n.Corners
+    $n|Add-Member NoteProperty RoutePlan @($p) -Force
+    $a=Copy-TraversalFixture $certificate
+    $a.From=$f.Actual;$a.To=$n.RouteTo;$a.Requested=$f.Requested;$a.Sequence=$f.Clock.Sequence
+    $a.NativeCorners=@($f.Actual,$n.RouteTo);$a.ActorCorners=@($f.Actual,$n.RouteTo)
+    $a.StartedWall=$f.Clock.WallTime+0.001;$a.CompletedWall=$f.Clock.WallTime+0.002;$a.CheckedWall=$a.CompletedWall
+    $n|Add-Member NoteProperty Admission $a -Force
+    $f|Add-Member NoteProperty DecisionPublishedWall ($f.Clock.WallTime+0.0025) -Force
+}
+$certified=@();$issued=0;$nativeClockFixture=Copy-TraversalFixture $clockFrames
+foreach($f in $nativeClockFixture){
+    if($f.Event -ne 'MOVE_DECISION'){$certified+=,$f;continue}
+    Set-TraversalNativePolicyFixture $f;$certified+=,$f
+    $called=Copy-TraversalFixture $f;$called.Event='MOVE_ISSUED';$called.NativeResult='ISSUED';$issued++
+    $called|Add-Member NoteProperty Actuations $issued;$called|Add-Member NoteProperty WriterCalled $true
+    $g=Copy-TraversalFixture $issue.FinalAdmission;$g.Sequence=$f.Clock.Sequence;$g.From=$f.Actual;$g.Requested=$f.Requested
+    $g.StartedWall=$f.Clock.WallTime+0.003;$g.CheckedWall=$f.Clock.WallTime+0.004
+    $called|Add-Member NoteProperty FinalAdmission $g;$certified+=,$called
+}
+Assert-TraversalFrames $certified '19' 'synthetic-world'
+Deny-TraversalFixture {Assert-TraversalFrames @($certified|Where-Object Event -ne 'MOVE_ISSUED') '19' 'synthetic-world'} 'new native witness without an actual issued command'
+$rejected=Copy-TraversalFixture $certified[2];$rejected.Event='MOVE_REJECTED';$rejected.NativeResult='NOT_ISSUED';$rejected.WriterCalled=$false;$rejected.Actuations=0
+$rejected.FinalAdmission.Accepted=$false;$rejected.FinalAdmission.FilterAfter=$true
+$stopped=Copy-TraversalFixture $rejected;$stopped.Event='BLOCKED';$stopped.Classification='UNKNOWN';$stopped.Reason='NATIVE_ROUTE_CHANGED_BEFORE_WRITER'
+$cancelledFrames=@($certified[0],$certified[1],$rejected,$stopped)
+Assert-TraversalFrames $cancelledFrames '19' 'synthetic-world'
+$cancelledComponents=Copy-TraversalFixture @{Status='PARTIAL';Actor=@{NetId='19'};Traversal=@{Frames=$cancelledFrames;Scenes=@();World='synthetic-world';Completed=$false;Actuations=0;
+    Components=@(@{Type='UnityEngine.CapsuleCollider';Instance=10;Collider=@{enabled=$true;isTrigger=$false;Scale=@(1,1,1)}},
+        @{Type='UnityEngine.Rigidbody';Instance=11},@{Type='NPCPlayerNavigator';Instance=12;Enabled=$false},@{Type='Rust.Ai.Gen2.RustNavMeshAgent';Instance=13;Enabled=$true})}}
+Assert-TraversalComponents $cancelledComponents
+Write-Output 'PASS OFFLINE_ONLY019 issue protocol: intent, post-sink actual issue and next witness; pre-writer rejection has zero actuation and remains valid PARTIAL'
 $catchup=Copy-TraversalFixture $clockFrames;$catchup[-1].Clock.WallTime=10.08;$catchup[-1].Time=10.08;$catchup[-1].WallDt=0
 Assert-TraversalFrames $catchup '19' 'synthetic-world'
 foreach($mutation in @(
@@ -391,6 +545,33 @@ function New-TraversalBenchFixture {
 $bench=New-TraversalBenchFixture
 $nativeContact=@($bench.Traversal.Frames|Where-Object {$_.Event -eq 'PHYSICAL_CONTACT' -and $_.Stage -eq 'DOOR_CLOSED'})
 $h=$nativeContact[0].Sweeps[0].Hits[0]
+$targetContact=Copy-TraversalFixture $nativeContact[0]
+$targetContact|Add-Member NoteProperty TargetEntity $h.Collider.Entity
+Assert-TraversalBlockedContact $targetContact 'DOOR_CLOSED' '19'
+$wrongTarget=Copy-TraversalFixture $targetContact;$wrongTarget.TargetEntity='999'
+Deny-TraversalFixture {Assert-TraversalBlockedContact $wrongTarget 'DOOR_CLOSED' '19'} 'negative names another intended native target'
+# Composite native-plan contract, synthetic only: two physical legs must join at observed rest.
+$ep=Copy-TraversalFixture @{Source='OWNED_NATIVE_TEST_FIXTURE';Wall='103';Door='101';Start=@(0,0,2.8);Goal=@(2.8,0,0);Corners=@(@(0,0,2.8),@(2.8,0,2.8),@(2.8,0,0));Status='PathComplete';Length=5.6;DirectLength=[Math]::Sqrt(15.68);
+    Legs=@(@{Status='PathComplete';Length=2.8;Corners=@(@(0,0,2.8),@(2.8,0,2.8))},@{Status='PathComplete';Length=2.8;Corners=@(@(2.8,0,2.8),@(2.8,0,0))})}
+$ef=Copy-TraversalFixture $exterior
+$ef|Add-Member NoteProperty Source 'OWNED_NATIVE_TEST_FIXTURE';$ef|Add-Member NoteProperty Wall '103';$ef|Add-Member NoteProperty Door '101';$ef|Add-Member NoteProperty Foundation '100'
+$en=Copy-TraversalFixture @{Actor=@{NetId='19'};FirstHome=@{Home=@{Entities=@(@{Role='FOUNDATION';NetId='100';Position=@(0,0,0);Rotation=@(0,0,0,1)},@{Role='DOOR';NetId='101';Position=@(0,0,-1.5)},@{Role='WALL_N';NetId='103'})}};Traversal=@{Fixture=$ef;Detour=$ep}}
+$ec=New-TraversalFrame 'PROBE_REFUSED' 10 9 $ep.Start $ep.Start 0
+$ec.Stage='FIXTURE_DIRECT_REFUSAL';$ec.NativeResult='PROBE_ONLY';$ec.Classification='SOLID_BLOCKED';$ec.Requested=@([Math]::Sqrt(2),0,(2.8-[Math]::Sqrt(2)));$ec|Add-Member NoteProperty TargetEntity '103'
+$ec.Sweeps[0].To=$ec.Requested;$ec.Sweeps[0].Distance=2
+$hc=Copy-TraversalFixture $h.Collider;$hc.Entity='103';$hc.DoorOpen=$null
+$ec.Sweeps[0].Hits=@(@{Collider=$hc;Point=@(1.2,0.9,1.5);Normal=@(0,0,1);Distance=1;Blocking=$true;InitialIntersects=$false;InitialDepth=0;InitialDirection=@(0,0,0)})
+$ew=@();$last=$ep.Start
+foreach($endpoint in @(@(1.4,0,2.8),@(2.8,0,2.8),@(2.8,0,1.4),@(2.8,0,0))){
+    $i=$ew.Count;$to=if($i -lt 2){@(2.8,0,2.8)}else{$ep.Goal}
+    $ew+=,[pscustomobject]@{From=$last;Actual=$endpoint;Speed=$(if($i%2 -eq 1){0}else{0.8});Navigation=@{RouteTo=$to};
+        FixtureDetourWitness=@{Door='101';Open=$false;DoorPosition=@(0,0,-1.5);Foundation='100';LocalPosition=$endpoint;Outside=$true;Plan=$ep}}
+    $last=$endpoint
+}
+$es=[pscustomobject]@{Start=$ep.Start;End=$ep.Goal}
+Assert-TraversalExteriorDetour $en $es $ew @($ec)
+$badLeg=Copy-TraversalFixture $ew;$badLeg[1].Speed=0.8
+Deny-TraversalFixture {Assert-TraversalExteriorDetour $en $es $badLeg @($ec)} 'native exterior leg changed destination before observed rest'
 $detourBinding=[pscustomobject]@{Door=$h.Collider.Entity;Collider=$h.Collider.Instance;PlanePoint=$h.Point;PlaneNormal=$h.Normal;BoundsCenter=$h.Collider.BoundsCenter;BoundsSize=$h.Collider.BoundsSize}
 Assert-TraversalDetourContact $detourBinding $nativeContact
 Deny-TraversalFixture {$x=Copy-TraversalFixture $detourBinding;$x.PlanePoint[0]+=1;Assert-TraversalDetourContact $x $nativeContact} 'consistent fabricated detour plane not bound to native negative contact'
@@ -421,6 +602,19 @@ $partial=Copy-TraversalFixture @{Status='PARTIAL';Mode='BUILD_SMOKE';ManualPosit
     FirstHome=@{Schema=1;DiagnosticOnly=$true;SaveReady=$false;NavigationComplete=$false;Fixture=@()};Economy=@{World=$world;WorldKey=$keys.WorldKey};
     Traversal=@{Schema=1;Mode='TRAVERSAL_BENCH';World=$keys.WorldKey;Frames=@();Scenes=@(@{Kind='OUTDOOR_STEP';Status='NOT_PROVEN';Stage='OUTDOOR';Start=@(0,0,0);End=@(0,0,0);StartTime=0;EndTime=0;FramesFrom=0;FramesTo=0});Components=@();Actuations=0;Completed=$false}}
 Assert-TraversalResult $partial
+$economicPartial=Copy-TraversalFixture $partial
+$economicPartial.Actor=Copy-TraversalFixture $bench.Actor
+$economicPartial|Add-Member NoteProperty SpawnCount 1
+$stock=[pscustomobject]@{Uid='203';Shortname='wood';Amount=10;Condition=0;MaxCondition=0;OwnerNetId='19'}
+$economicPartial|Add-Member NoteProperty Recipe @{Ingredients=@()}
+$economicPartial|Add-Member NoteProperty StarterKit @()
+$economicPartial|Add-Member NoteProperty Inventory @($stock)
+$economicPartial.FirstHome|Add-Member NoteProperty Budget @{wood=10}
+$economicPartial.FirstHome.Fixture=@([pscustomobject]@{DiagnosticOnly=$true;Source='TEST_FIXTURE_WOOD';Amount=10;Item=$stock})
+$economicPartial=Copy-TraversalFixture $economicPartial
+Assert-TraversalSmokeBoundary $economicPartial
+$unreconciled=Copy-TraversalFixture $economicPartial;$unreconciled.Inventory[0].Amount=133
+Deny-TraversalFixture {Assert-TraversalSmokeBoundary $unreconciled} 'partial result inventory differs from final paid ledger'
 foreach($mutation in @(
     @{Name='cross-world economy';Change={param($x)$x.Economy.World.Seed=18}},
     @{Name='cross-world frames namespace';Change={param($x)$x.Traversal.World=('B'*64)}},

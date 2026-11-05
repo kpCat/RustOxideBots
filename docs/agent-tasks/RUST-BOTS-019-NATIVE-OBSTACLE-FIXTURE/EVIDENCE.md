@@ -1,0 +1,15 @@
+# Evidence needed for review
+
+**Preflight:** Git exact HEAD/tracking/public master, clean original index, installed native DLL/IL signatures, source/compiler hashes, root AGENTS, protected owner Server SHA/length all, allowed paths, isolated root identity. Native construction/site plan (relative geometry, test material budget UID, exact role/sockets/stability/TC if built) before game PID. Source of TEST_FIXTURE explicit.
+
+**For each live:** distinct run ID, actual RustDedicated PID/Job + private Oxide root+firewall in/out, native installed Oxide compiler/load, RustNav readiness, file source binding, map/world/wipe generation, owner untouched, all stage timestamps/timeouts and native exit/cleanup. Never report time of cleanup as exact process exit. Raw under `.local/runtime/<id>/` or `.local/audit/traversal019`, never public secrets.
+
+**Native fixture:** source site full terrain/slope/ray/nav/native preview/permission and reason of rejected sites, actually placed native entity NetID/prefab/owner/building ID/socket, native `Planner.DoBuild`, original paid UID/cost/grade and material origin, TC auth/upkeep, actual door hinge/mesh/closed state. Partial fixture marked as G4 only. NO special fake entity or owner Steam impersonation.
+
+**Probe:** before/after same NPC ActorId+native capsule radius/height/layer, actual position/support/velocity/rest, no movement/pending, requested world vector, full current + swept+endpoint collider set; proof target named wall/door collider ID, native contact normal/closest point, `ComputePenetration` true/false distinction. `PROBE_REFUSED` separate from `MOTOR_BLOCKED`; target false positives rejected. Negative-only event does not consume reachability/repath budget or block future allowed route.
+
+**Detour:** chosen start/end/actual route corners, direct blocking line + independent RustNav alternate route `PathComplete` with distance and curvature, real physical path frames/lateral displacement, no closed door crossing, actual door remains closed throughout. No claimed detour with unreachable sealed interior or path through collider. Native flags and traces not enough without body witnesses.
+
+**Home:** real paid full eight-role structure + TC UID/protection/own auth, door open+close native, full body IN/OUT physical raw, passage vs lip measured; no invented world credits. `STEP_RESOLVED` only for actual supported discrete native step versus existing slope receipt. Record each gate independently even when a later gate fails.
+
+**Review/security/Git:** independently review before each run and final raw; Test-All exit0 and installed C#7.3 compile, focused negative cases; SHA owner files count recheck and protected history/cache; zero owned PIDs/ports/brokers/rules/locks; strict UTF-8/NUL; mojibake and escaped Cyrillic separately; actual RCON/user/owner secrets patterns; `git diff --cached --name-only` exact allowlist; normal push SHA and public master verified. No raw/Server/.local tracked. Prior 018 frozen reports remain PARTIAL.

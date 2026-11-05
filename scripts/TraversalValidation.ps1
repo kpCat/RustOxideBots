@@ -214,12 +214,201 @@ function Assert-TraversalNavigation($f,[switch]$Decision){
         $v=Get-TraversalNumber $n.$name 'native tile version';if($v -lt 0 -or $v -ne [Math]::Floor($v)){throw 'Invalid native map version'}
     }
     if([string]::IsNullOrWhiteSpace([string]$n.PlannedMesh) -or [string]::IsNullOrWhiteSpace([string]$n.Mesh)){throw 'Missing actual native navmesh identity'}
-    if($Decision -and (-not $n.OnNavMesh -or $n.PendingTiles -or $n.PlannedMesh -cne $n.Mesh -or
+    $fresh=$f.Event -ceq 'MOVE_DECISION' -and ($n.AdmissionPolicy -ceq 'NATIVE_CURRENT_ROUTE_V1' -or $f.Profile.NativeAdmissionPolicy -ceq 'NATIVE_CURRENT_ROUTE_V1')
+    if($Decision -and (-not $n.OnNavMesh -or ($n.PendingTiles -and -not $fresh) -or $n.PlannedMesh -cne $n.Mesh -or
         $n.PlannedTileChangeVersion -ne $n.TileChangeVersion -or $n.PlannedTileDataVersion -ne $n.TileDataVersion)){throw 'Native route epoch is stale before actuation'}
     Assert-TraversalVector $n.RouteFrom;Assert-TraversalVector $n.RouteTo
     $corners=@($n.Corners);if($corners.Count -lt 2 -or $corners.Count -gt 4096){throw 'Missing/unbounded actual native path corners'}
     foreach($c in $corners){Assert-TraversalVector $c}
     if((Get-WorldDistance $corners[0] $n.RouteFrom) -gt 0.5 -or (Get-WorldDistance $corners[-1] $n.RouteTo) -gt 0.5){throw 'Native path corners are not bound to planned actual start/destination'}
+    if($Decision -and $fresh){Assert-TraversalNativeAdmission $f}
+}
+function Assert-TraversalNativeAdmission($f){
+    $n=$f.Navigation;$a=$n.Admission
+    Assert-TraversalNativeRoutePlan $n
+    if($n.AdmissionPolicy -cne 'NATIVE_CURRENT_ROUTE_V1' -or $a.Kind -cne 'NATIVE_CURRENT_ROUTE_V1' -or
+        $n.DefaultBuilt -isnot [bool] -or -not $n.DefaultBuilt -or $a.NativeCalculated -isnot [bool] -or $a.ActorCalculated -isnot [bool] -or $a.NativeCalculated -ne $true -or $a.ActorCalculated -ne $true -or
+        $a.NativeStatus -cne 'PathComplete' -or $a.ActorStatus -cne 'PathComplete' -or [string]$a.Mesh -cne [string]$n.Mesh){throw 'Missing actual native current-route admission'}
+    foreach($key in @('GlobalPendingBefore','GlobalPendingAfter','FilterBefore','FilterAfter')){if($a.$key -isnot [bool]){throw 'Missing native queue/filter observations'}}
+    if($a.FilterBefore -ne $a.FilterAfter -or $a.FilterBefore -ne $n.RouteFilter){throw 'Native route filter changed during check'}
+    foreach($key in @('ChangeBefore','ChangeAfter')){Assert-TraversalNear $a.$key $n.TileChangeVersion 'native certificate change epoch' 0}
+    foreach($key in @('DataBefore','DataAfter')){Assert-TraversalNear $a.$key $n.TileDataVersion 'native certificate data epoch' 0}
+    $sequence=Get-TraversalNumber $a.Sequence 'native route check sequence'
+    if($f.Schema -ne 2 -or $sequence -lt 1 -or $sequence -ne [Math]::Floor($sequence) -or $sequence -ne $f.Clock.Sequence){throw 'Native route admission belongs to another callback'}
+    $start=Get-TraversalNumber $a.StartedWall 'native query start';$end=Get-TraversalNumber $a.CompletedWall 'native query completion';$checked=Get-TraversalNumber $a.CheckedWall 'native query final check'
+    if($start -lt $f.Clock.WallTime -or $end -lt $start -or $checked -lt $end -or $checked-$f.Clock.WallTime -gt $f.Profile.MaxTick){throw 'Stale native current-route query'}
+    Assert-TraversalSamePoint $a.From $f.Actual 'native query exact actual pose';Assert-TraversalSamePoint $a.To $n.RouteTo 'native query actual destination'
+    Assert-TraversalSamePoint $a.Requested $f.Requested 'native query issued segment'
+    Assert-TraversalNear $a.Capacity 256 'installed native path capacity' 0
+    $polys=@($a.NativePolys);$actorPolys=@($a.ActorPolys);$old=@($a.RoutePolys);$routePolys=@($n.RoutePolys)
+    if($polys.Count -lt 1 -or $polys.Count -ge 256 -or $actorPolys.Count -ne $polys.Count -or $old.Count -lt 1 -or $old.Count -ge 256 -or $routePolys.Count -ne $old.Count){throw 'Empty/saturated or unbound native path refs'}
+    for($i=0;$i -lt $polys.Count;$i++){
+        Assert-AvatarUid $polys[$i].Ref
+        $null=[uint64]$polys[$i].Ref
+        if($polys[$i].Valid -isnot [bool] -or -not $polys[$i].Valid -or [string]$polys[$i].Ref -cne [string]$actorPolys[$i]){throw 'Invalid native poly or actor/default provenance mismatch'}
+    }
+    for($i=0;$i -lt $old.Count;$i++){
+        Assert-AvatarUid $old[$i].Ref
+        $null=[uint64]$old[$i].Ref
+        if($old[$i].Valid -isnot [bool] -or -not $old[$i].Valid -or [string]$old[$i].Ref -cne [string]$routePolys[$i]){throw 'Original committed route poly no longer valid'}
+    }
+    $corners=@($a.NativeCorners);$actorCorners=@($a.ActorCorners)
+    if($corners.Count -lt 2 -or $corners.Count -ge 256 -or $corners.Count -ne $actorCorners.Count){throw 'Missing/saturated native current-route corners'}
+    for($i=0;$i -lt $corners.Count;$i++){Assert-TraversalSamePoint $corners[$i] $actorCorners[$i] 'default/actor native corner'}
+    if((Get-WorldDistance $corners[0] $a.From) -gt 0.5 -or (Get-WorldDistance $corners[-1] $a.To) -gt 0.5){throw 'Fresh native endpoints are not bound to actual query'}
+    $delta=Get-HomeRelative $a.Requested $a.From;$delta[1]=0
+    $leg=Get-HomeRelative $corners[1] $a.From;$leg[1]=0
+    $distance=Get-WorldDistance $delta @(0,0,0);$legLength=Get-WorldDistance $leg @(0,0,0)
+    if($distance -gt 0.001){
+        if($legLength -le 0.001){throw 'Issued movement has no fresh native first leg'}
+        $along=(Get-TraversalDot $delta $leg)/$legLength
+        $lateral=@(for($j=0;$j -lt 3;$j++){$delta[$j]-$leg[$j]*$along/$legLength})
+        if($along -lt -0.001 -or $along -gt $legLength+0.001 -or (Get-WorldDistance $lateral @(0,0,0)) -gt 0.001){throw 'Issued segment deviates from fresh native first leg'}
+    }
+}
+function Assert-TraversalNativeRoutePlan($n){
+    $legs=@($n.RoutePlan)
+    if($legs.Count -lt 1 -or $legs.Count -gt 2 -or $n.RouteFilter -isnot [bool]){throw 'Missing bounded exact-mesh native plan provenance'}
+    $joinedCorners=@();$joinedPolys=@();$previous=$null
+    foreach($p in $legs){
+        if($p.Kind -cne 'DEFAULT_NATIVE_PATH_V1' -or [string]$p.Mesh -cne [string]$n.PlannedMesh -or $p.Filter -isnot [bool] -or $p.Filter -ne $n.RouteFilter -or
+            $p.NativeCalculated -isnot [bool] -or -not $p.NativeCalculated -or $p.ActorCalculated -isnot [bool] -or -not $p.ActorCalculated -or
+            $p.NativeStatus -cne 'PathComplete' -or $p.ActorStatus -cne 'PathComplete'){throw 'Unverified native route leg'}
+        Assert-TraversalNear $p.Capacity 256 'native plan path capacity' 0
+        foreach($key in @('ChangeBefore','ChangeAfter')){Assert-TraversalNear $p.$key $n.PlannedTileChangeVersion 'native plan change epoch' 0}
+        foreach($key in @('DataBefore','DataAfter')){Assert-TraversalNear $p.$key $n.PlannedTileDataVersion 'native plan data epoch' 0}
+        $refs=@($p.NativePolys);$actor=@($p.ActorPolys);$corners=@($p.NativeCorners);$actorCorners=@($p.ActorCorners)
+        if($refs.Count -lt 1 -or $refs.Count -ge 256 -or $actor.Count -ne $refs.Count -or $corners.Count -lt 2 -or $corners.Count -ge 256 -or $actorCorners.Count -ne $corners.Count){throw 'Empty/saturated native plan leg'}
+        for($i=0;$i -lt $refs.Count;$i++){Assert-AvatarUid $refs[$i];$null=[uint64]$refs[$i];if([string]$refs[$i] -cne [string]$actor[$i]){throw 'Native plan actor/default poly mismatch'}}
+        for($i=0;$i -lt $corners.Count;$i++){Assert-TraversalSamePoint $corners[$i] $actorCorners[$i] 'native plan actor/default corner'}
+        Assert-TraversalVector $p.From;Assert-TraversalVector $p.To
+        if((Get-WorldDistance $corners[0] $p.From) -gt 0.5 -or (Get-WorldDistance $corners[-1] $p.To) -gt 0.5){throw 'Native plan leg has another query endpoint'}
+        if($null -ne $previous){
+            Assert-TraversalSamePoint $previous.To $p.From 'native plan query join'
+            Assert-TraversalSamePoint $joinedCorners[-1] $corners[0] 'native plan corner join'
+            if([string]$joinedPolys[-1] -cne [string]$refs[0]){throw 'Native composite polygon join is not established'}
+            $joinedCorners+=@($corners|Select-Object -Skip 1)
+        }else{$joinedCorners=$corners}
+        $joinedPolys+=$refs;$previous=$p
+    }
+    if($joinedPolys.Count -ge 256 -or $joinedCorners.Count -ge 256 -or $joinedPolys.Count -ne @($n.RoutePolys).Count -or $joinedCorners.Count -ne @($n.Corners).Count){throw 'Composite route arrays do not match native leg provenance'}
+    for($i=0;$i -lt $joinedPolys.Count;$i++){if([string]$joinedPolys[$i] -cne [string]$n.RoutePolys[$i]){throw 'Route carries polygon refs from another plan'}}
+    for($i=0;$i -lt $joinedCorners.Count;$i++){Assert-TraversalSamePoint $joinedCorners[$i] $n.Corners[$i] 'merged native route corner'}
+    Assert-TraversalSamePoint $legs[0].From $n.RouteFrom 'native plan original start';Assert-TraversalSamePoint $legs[-1].To $n.RouteTo 'native plan final destination'
+}
+function Assert-TraversalFinalIssue($f,$intent,[int]$priorIssued,[switch]$Rejected){
+    $g=$f.FinalAdmission;$a=$intent.Navigation.Admission
+    if($null -eq $intent -or $g.Kind -cne 'POST_SINK_NATIVE_GUARD_V1' -or $g.Accepted -isnot [bool] -or
+        $f.Command -ne $intent.Command -or $f.Stage -cne $intent.Stage -or [string]$f.Actor -cne [string]$intent.Actor -or [string]$f.World -cne [string]$intent.World){throw 'Unbound post-sink native issue/rejection receipt'}
+    Assert-TraversalSamePoint $f.From $intent.From 'issue/rejection original intent';Assert-TraversalSamePoint $f.Actual $intent.Actual 'issue/rejection actual pose'
+    Assert-TraversalSamePoint $f.Requested $intent.Requested 'issue/rejection request'
+    Assert-TraversalSamePoint $g.From $intent.Actual 'post-sink measured body pose';Assert-TraversalSamePoint $g.Requested $intent.Requested 'post-sink requested pose'
+    Assert-TraversalNear $g.Sequence $intent.Clock.Sequence 'post-sink native callback' 0
+    $start=Get-TraversalNumber $g.StartedWall 'post-sink guard start';$end=Get-TraversalNumber $g.CheckedWall 'post-sink guard finish'
+    $published=Get-TraversalNumber $intent.DecisionPublishedWall 'intent sink publication time'
+    if($published -lt $a.CompletedWall -or $start -lt $published -or $end -lt $start){throw 'Native final guard precedes its decision sink'}
+    if($f.WriterCalled -isnot [bool]){throw 'Missing actual native writer call outcome'}
+    if($Rejected){
+        if($f.Event -cne 'MOVE_REJECTED' -or $f.NativeResult -cne 'NOT_ISSUED' -or $f.WriterCalled -or $g.Accepted -or $f.Actuations -ne $priorIssued){throw 'Rejected intent issued or credited a native command'}
+        return
+    }
+    if($f.Event -cne 'MOVE_ISSUED' -or $f.NativeResult -cne 'ISSUED' -or -not $f.WriterCalled -or -not $g.Accepted -or
+        -not [string]::IsNullOrEmpty([string]$g.Error) -or $f.Actuations -ne $priorIssued+1 -or $end-$intent.Clock.WallTime -gt $intent.Profile.MaxTick){throw 'Native writer lacks a fresh successful post-sink guard'}
+    foreach($key in @('DefaultBuilt','OnNavMesh','ProfileMatches','BodyValid','ClockAccepted','ControlActive')){if($g.$key -isnot [bool] -or -not $g.$key){throw ('Unsafe final native issue state: '+$key)}}
+    foreach($key in @('FilterBefore','FilterAfter','GlobalPendingBefore','GlobalPendingAfter')){if($g.$key -isnot [bool]){throw 'Missing final native filter/queue telemetry'}}
+    if($g.FilterBefore -ne $a.FilterBefore -or $g.FilterAfter -ne $a.FilterAfter -or [string]$g.MeshBefore -cne [string]$a.Mesh -or [string]$g.MeshAfter -cne [string]$a.Mesh){throw 'Native mesh/filter changed after decision sink'}
+    foreach($key in @('ChangeBefore','ChangeAfter')){Assert-TraversalNear $g.$key $a.ChangeAfter 'post-sink change epoch' 0}
+    foreach($key in @('DataBefore','DataAfter')){Assert-TraversalNear $g.$key $a.DataAfter 'post-sink data epoch' 0}
+    foreach($key in @('RoutePolys','NativePolys')){
+        $rows=@($g.$key);$before=@($a.$key)
+        if($rows.Count -ne $before.Count){throw 'Final native poly set changed'}
+        for($i=0;$i -lt $rows.Count;$i++){if([string]$rows[$i].Ref -cne [string]$before[$i].Ref -or $rows[$i].Valid -isnot [bool] -or -not $rows[$i].Valid){throw 'Final native polygon became invalid'}}
+    }
+}
+function Assert-TraversalStationaryWindow($t,$actor){
+    $contract=$t.WarmupContract;$observations=@($t.WarmupObservations);$receipt=$t.Warmup
+    $needsProof=$t.Completed -eq $true -or $t.Actuations -gt 0 -or @($t.Scenes|Where-Object Status -eq 'PASSED').Count -gt 0
+    if($null -eq $contract -and -not $observations.Count){if($needsProof){throw 'Movement began without native stationary-clock readiness'};return}
+    if($t.WarmupPolicy -cne 'STATIONARY_CLOCK_WINDOW_V1' -or $null -eq $contract -or -not $observations.Count -or $observations.Count -gt 512){throw 'Missing/bounded native stationary observations'}
+    if($t.WarmupObservationCount -ne $observations.Count){throw 'Incomplete native readiness observation journal'}
+    Assert-TraversalNear $contract.MaxSeconds 20 'original warmup deadline' 0;Assert-TraversalNear $contract.MinWindowSeconds 2 'native readiness span' 0;Assert-TraversalNear $contract.MaxSamples 512 'warmup observation budget' 0
+    $start=Get-TraversalNumber $contract.Start 'warmup original start';Assert-TraversalVector $contract.Position
+    $maximum=Get-TraversalNumber $contract.NativeMaximumDelta 'captured immutable native simulation profile'
+    if($start -lt 0 -or $maximum -le 0){throw 'Invalid captured warmup clock profile'}
+    $body=$contract.Body;$caps=@($body.Capsules)
+    foreach($key in @('Kinematic','Gravity','DetectCollisions','AgentStopped','AgentUpdatePosition','AgentUpdateRotation')){if($body.$key -isnot [bool]){throw 'Missing typed warmup body flags'}}
+    if([string]$body.Actor -cne [string]$actor -or $caps.Count -ne 1 -or @($body.Colliders).Count -ne 1 -or $body.Colliders[0] -ne $caps[0].Instance -or
+        $caps[0].Rigidbody -ne $body.Rigidbody -or $caps[0].Enabled -ne $true -or $caps[0].Trigger -ne $false -or $caps[0].Direction -ne 1 -or
+        $body.DetectCollisions -ne $true -or $body.AgentStopped -ne $true -or $body.AgentUpdatePosition -ne $false -or $body.AgentUpdateRotation -ne $false){throw 'Warmup original body/writer configuration unproven'}
+    Assert-TraversalNear $caps[0].Radius 0.5 'warmup full radius';Assert-TraversalNear $caps[0].Height 1.8 'warmup full height'
+    Assert-TraversalSamePoint $caps[0].Center @(0,0.9,0) 'warmup original capsule center';Assert-TraversalSamePoint $caps[0].Scale @(1,1,1) 'warmup original scale'
+    Assert-TraversalSamePoint $caps[0].Up @(0,1,0) 'warmup original upright body'
+    $bodyKey=$body|ConvertTo-Json -Depth 15 -Compress;$previous=$null;$first=$null;$samples=0;$restarts=0;$ready=$false;$lastObserved=$start
+    for($i=0;$i -lt $observations.Count;$i++){
+        $o=$observations[$i];$clock=$o.Clock;$fatal=$false
+        if($o.Observation -ne $i+1){throw 'Readiness observation ordinal missing/replayed'}
+        try{
+            $observed=Get-TraversalNumber $o.ObservedWall 'warmup independent observation wall';Assert-TraversalVector $o.Position;Assert-TraversalVector $o.Velocity
+            if($observed -lt $start -or $observed -lt $lastObserved -or $observed-$start -gt 20 -or $i -ge 511 -or
+                (Get-WorldDistance $o.Position $contract.Position) -gt 0.001 -or (Get-WorldDistance $o.Velocity @(0,0,0)) -ne 0 -or
+                ($o.Body|ConvertTo-Json -Depth 15 -Compress) -cne $bodyKey -or $o.MotorActuations -ne 0 -or
+                $o.MotorActive -isnot [bool] -or $o.MotorActive -or $o.MotorBlocked -isnot [bool] -or $o.MotorBlocked){$fatal=$true}
+            $lastObserved=$observed
+        }catch{$fatal=$true}
+        if($fatal){
+            if($o.Outcome -cne 'FATAL' -or $i -ne $observations.Count-1 -or $null -ne $receipt -or $needsProof){throw 'Warmup ignored a body/motor/deadline violation'}
+            return
+        }
+        $valid=$true
+        try{
+            foreach($key in @('WallTime','FixedTime','FixedUnscaledTime','Delta','UnscaledDelta','MaximumDelta','TimeScale','Sequence','Frame')){$null=Get-TraversalNumber $clock.$key ('warmup '+$key)}
+            $live=Get-TraversalNumber $o.LiveMaximumDelta 'live native maximum'
+            if($clock.WallTime -lt $start -or $clock.WallTime -gt $observed -or $observed-$clock.WallTime -gt 0.1 -or $clock.FixedTime -lt 0 -or $clock.FixedUnscaledTime -lt 0 -or
+                $clock.Sequence -le 0 -or $clock.Sequence -ne [Math]::Floor($clock.Sequence) -or $clock.Frame -lt 0 -or $clock.Frame -ne [Math]::Floor($clock.Frame) -or
+                $clock.InFixedStep -isnot [bool] -or -not $clock.InFixedStep -or $clock.PhysicsMode -cne 'FixedUpdate' -or $clock.TimeScale -ne 1 -or
+                $clock.Delta -le 0 -or $clock.Delta -gt 0.1 -or $clock.UnscaledDelta -ne $clock.Delta -or $clock.MaximumDelta -lt $clock.Delta -or
+                $clock.MaximumDelta -ne $maximum -or $clock.MaximumDelta -ne $live){$valid=$false}
+        }catch{$valid=$false}
+        if($valid -and $null -ne $previous){
+            $gap=$clock.WallTime-$previous.WallTime
+            if($gap -lt 0 -or $gap -gt 1.500001 -or $clock.MaximumDelta -ne $previous.MaximumDelta -or $clock.Sequence -ne $previous.Sequence+1 -or $clock.Frame -lt $previous.Frame -or
+                $clock.Delta -ne $previous.Delta -or [Math]::Abs($clock.FixedTime-$previous.FixedTime-$previous.Delta) -gt 0.000001 -or
+                [Math]::Abs($clock.FixedUnscaledTime-$previous.FixedUnscaledTime-$previous.UnscaledDelta) -gt 0.000001){$valid=$false}
+        }
+        if(-not $valid){
+            if($o.Outcome -cne 'WAIT'){throw 'Invalid native clocksample accepted into readiness window'}
+            if($null -ne $previous){$restarts++};$previous=$null;$first=$null;$samples=0;continue
+        }
+        $outcome=if($null -eq $previous){'WINDOW_START'}else{'WINDOW_ADVANCE'}
+        if($null -eq $first){$first=$clock};$previous=$clock;$samples++
+        if($clock.WallTime-$first.WallTime -ge 2 -and $clock.FixedTime-$first.FixedTime -ge 2 -and $clock.FixedUnscaledTime-$first.FixedUnscaledTime -ge 2){$outcome='READY';$ready=$true}
+        if($o.Outcome -cne $outcome -or ($ready -and $i -ne $observations.Count-1)){throw 'Stationary readiness was declared before a complete native window'}
+    }
+    if(-not $ready){if($null -ne $receipt -or $needsProof){throw 'Stationary clock readiness is incomplete'};return}
+    if($null -eq $receipt -or $receipt.Schema -ne 2 -or $receipt.Mode -cne 'STATIONARY_READ_ONLY' -or $receipt.Samples -ne $samples -or $receipt.TotalObservations -ne $observations.Count -or
+        $receipt.Resets -ne 0 -or $receipt.MotorResets -ne 0 -or $receipt.WindowRestarts -ne $restarts){throw 'Warmup receipt conceals controller resets or clock window restarts'}
+    Assert-TraversalNear $receipt.Start $start 'immutable total warmup start' 0.000001
+    Assert-TraversalNear $receipt.StableSince $first.WallTime 'actual native stable-window anchor' 0.000001
+    Assert-TraversalNear $receipt.End $previous.WallTime 'actual native ready time' 0.000001
+    Assert-TraversalSamePoint $receipt.Position $contract.Position 'warmup never changes original pose'
+    foreach($key in @('WallTime','FixedTime','FixedUnscaledTime','Delta','UnscaledDelta','TimeScale','MaximumDelta','Sequence','Frame')){Assert-TraversalNear $receipt.LastClock.$key $previous.$key ('last actual warmup clock '+$key) 0.000001}
+    if($receipt.LastClock.InFixedStep -isnot [bool] -or $receipt.LastClock.InFixedStep -ne $previous.InFixedStep -or $receipt.LastClock.PhysicsMode -cne $previous.PhysicsMode){throw 'Ready receipt substituted final native clock flags'}
+    $firstBaseline=$null
+    foreach($f in @($t.Frames)){
+        if($null -eq $f.Profile){continue}
+        Assert-TraversalNear $f.Profile.NativeMaximumDelta $maximum 'warmup/controller native profile binding' 0.000001
+        if([string]$f.Actor -cne [string]$actor -or $f.Body.Instance -ne $caps[0].Instance -or $f.Body.RigidbodyInstance -ne $body.Rigidbody){throw 'Warmup actor/body differs from physical controller'}
+        if([single](Get-TraversalNumber $f.Time 'post-readiness frame time') -lt [single]$receipt.End){throw 'Physical frame predates stationary readiness'}
+        if($f.Event -in @('CLOCK_BASELINE','MOVE_DECISION','MOVE_ISSUED','MOTION_WITNESS') -and ($f.Schema -ne 2 -or $null -eq $f.Clock)){throw 'Post-readiness physical event lacks native clocks'}
+        if($null -ne $f.Clock){
+            Assert-TraversalNear $f.Clock.MaximumDelta $maximum 'post-readiness native maximum binding' 0.000001
+            if($f.Clock.Sequence -le $previous.Sequence -or $f.Clock.Frame -lt $previous.Frame -or $f.Clock.WallTime -lt $previous.WallTime -or $f.Clock.FixedTime -le $previous.FixedTime -or $f.Clock.FixedUnscaledTime -le $previous.FixedUnscaledTime){throw 'Physical native callback does not follow the accepted readiness anchor'}
+            if($f.Event -ceq 'CLOCK_BASELINE' -and $null -eq $firstBaseline){
+                Assert-TraversalSamePoint $f.Actual $contract.Position 'first motor baseline remains at original stationary pose';$firstBaseline=$f
+            }
+        }
+    }
+    if($needsProof -and $null -eq $firstBaseline){throw 'Movement has no original-pose native baseline after readiness'}
 }
 function Assert-TraversalBlockedContact($f,[string]$kind,$actor){
     foreach($name in @('From','Requested','Actual')){Assert-TraversalVector $f.$name}
@@ -243,8 +432,9 @@ function Assert-TraversalBlockedContact($f,[string]$kind,$actor){
                 Assert-TraversalVector $hit.InitialDirection;Assert-TraversalNear (Get-TraversalDot $hit.InitialDirection $hit.InitialDirection) 1 'negative penetration direction'
             }
             if($hit.Blocking -and [Math]::Abs($hit.Normal[1]) -lt [Math]::Cos($f.Profile.MaxSlope*[Math]::PI/180)){
-                if($kind -eq 'DOOR_CLOSED' -and $hit.Collider.DoorOpen -is [bool] -and -not $hit.Collider.DoorOpen){$found=$true}
-                if($kind -eq 'SOLID_WALL' -and $null -eq $hit.Collider.DoorOpen){$found=$true}
+                $target=[string]::IsNullOrEmpty([string]$f.TargetEntity) -or [string]$hit.Collider.Entity -ceq [string]$f.TargetEntity
+                if($target -and $kind -eq 'DOOR_CLOSED' -and $hit.Collider.DoorOpen -is [bool] -and -not $hit.Collider.DoorOpen){$found=$true}
+                if($target -and $kind -eq 'SOLID_WALL' -and $null -eq $hit.Collider.DoorOpen){$found=$true}
             }
         }
         $from=$s.To
@@ -294,6 +484,97 @@ function Assert-TraversalNativeVelocity($body,$expected){
     if($error -gt 0.001){throw 'Native Rigidbody velocity disagrees with physical fixed-step displacement'}
     return $error
 }
+function Assert-TraversalProbe($f,$actor){
+    if($f.Event -notin @('PROBE_REFUSED','PROBE_CLEAR') -or $f.NativeResult -cne 'PROBE_ONLY'){throw 'Not an executed detached probe'}
+    Assert-TraversalBody $f $actor;Assert-TraversalProfile $f.Profile;Assert-TraversalSupport $f
+    Assert-TraversalSamePoint $f.From $f.Actual 'detached probe zero actual displacement'
+    Assert-TraversalContacts $f
+    $a=$f.ControlBefore;$b=$f.ControlAfter
+    if($null -eq $a -or $null -eq $b -or ($a|ConvertTo-Json -Depth 30 -Compress) -cne ($b|ConvertTo-Json -Depth 30 -Compress)){throw 'Probe changed motor control state'}
+    foreach($key in @('Active','Pending','Acquiring','UnobservedTerminal')){if($a.$key -isnot [bool] -or $a.$key){throw 'Probe was not detached from active motion'}}
+    foreach($key in @('Arrived','Blocked')){if($a.$key -isnot [bool]){throw 'Missing probe lifecycle snapshot'}}
+    foreach($key in @('Velocity','NativeVelocity')){Assert-TraversalVector $a.$key;if((Get-WorldDistance $a.$key @(0,0,0)) -ne 0){throw 'Probe body was not stationary'}}
+    Assert-TraversalSamePoint $a.Position $f.Actual 'probe snapshot actual pose'
+    foreach($key in @('Actuations','Retry','Command')){if((Get-TraversalNumber $a.$key $key) -lt 0){throw 'Invalid probe control counters'}}
+    if($f.Event -eq 'PROBE_REFUSED' -and $f.Reason -cne 'READ_ONLY_REFUSED'){throw 'Refusal lacks observational reason'}
+}
+function Get-TraversalFixtureLocal($fixture,$position){
+    Assert-TraversalVector $fixture.FoundationPosition;Assert-TraversalVector $fixture.FoundationRotation 4;Assert-TraversalVector $position
+    $q=$fixture.FoundationRotation;$norm=0.0;foreach($v in $q){$norm+=$v*$v};Assert-TraversalNear $norm 1 'fixture rotation norm'
+    Get-HomeRotated @(-$q[0],-$q[1],-$q[2],$q[3]) (Get-HomeRelative $position $fixture.FoundationPosition)
+}
+function Assert-TraversalExteriorSegment($fixture,$from,$to){
+    Assert-TraversalVector $fixture.NativeFoundationBounds.Center;Assert-TraversalVector $fixture.NativeFoundationBounds.Size
+    Assert-TraversalNear $fixture.Radius 0.5 'fixture original radius'
+    $skin=Get-TraversalNumber $fixture.Skin 'fixture skin';if($skin -le 0 -or $skin -gt 0.05){throw 'Invalid native fixture skin'}
+    $min=@();$max=@()
+    for($j=0;$j -lt 3;$j++){
+        $size=Get-TraversalNumber $fixture.NativeFoundationBounds.Size[$j] 'native foundation dimension';if($size -le 0){throw 'Missing native footprint dimensions'}
+        $margin=if($j -eq 1){0}else{0.5+$skin}
+        $min+=($fixture.NativeFoundationBounds.Center[$j]-$size*0.5-$margin);$max+=($fixture.NativeFoundationBounds.Center[$j]+$size*0.5+$margin)
+    }
+    Assert-TraversalSamePoint $fixture.ExteriorMin $min 'native expanded exterior min';Assert-TraversalSamePoint $fixture.ExteriorMax $max 'native expanded exterior max'
+    $a=Get-TraversalFixtureLocal $fixture $from;$b=Get-TraversalFixtureLocal $fixture $to
+    if(-not (($a[0] -le $min[0] -and $b[0] -le $min[0]) -or ($a[0] -ge $max[0] -and $b[0] -ge $max[0]) -or
+        ($a[2] -le $min[2] -and $b[2] -le $min[2]) -or ($a[2] -ge $max[2] -and $b[2] -ge $max[2]))){throw 'Route segment enters expanded sealed fixture footprint'}
+}
+function Assert-TraversalExteriorDetour($nav,$s,$w,$prior){
+    $f=$nav.Traversal.Fixture;$p=$nav.Traversal.Detour
+    if($f.Source -cne 'OWNED_NATIVE_TEST_FIXTURE' -or $p.Source -cne $f.Source -or $p.Status -cne 'PathComplete' -or
+        [string]$p.Wall -cne [string]$f.Wall -or [string]$p.Door -cne [string]$f.Door){throw 'Detour lacks owned native fixture plan binding'}
+    $entities=@($nav.FirstHome.Home.Entities);$foundation=@($entities|Where-Object Role -eq 'FOUNDATION');$door=@($entities|Where-Object Role -eq 'DOOR')
+    if($foundation.Count -ne 1 -or $door.Count -ne 1 -or [string]$foundation[0].NetId -cne [string]$f.Foundation -or
+        [string]$door[0].NetId -cne [string]$f.Door -or -not @($entities|Where-Object { $_.Role -like 'WALL_*' -and [string]$_.NetId -ceq [string]$f.Wall }).Count){throw 'Detour fixture entities do not exist in native paid structure'}
+    Assert-TraversalSamePoint $f.FoundationPosition $foundation[0].Position 'fixture foundation position'
+    Assert-TraversalVector $foundation[0].Rotation 4
+    for($j=0;$j -lt 4;$j++){Assert-TraversalNear $f.FoundationRotation[$j] $foundation[0].Rotation[$j] 'fixture foundation rotation'}
+    Assert-TraversalSamePoint $p.Start $s.Start 'detour plan actual start'
+    $direct=Get-WorldDistance $p.Start $p.Goal;Assert-TraversalNear $p.DirectLength $direct 'detour measured direct distance'
+    $corners=@($p.Corners);if($corners.Count -lt 3 -or $corners.Count -gt 4096){throw 'Detour has no actual alternate corners'}
+    if((Get-WorldDistance $corners[0] $p.Start) -gt 0.5){throw 'Detour path has another actual origin'}
+    if((Get-WorldDistance $corners[-1] $p.Goal) -gt 0.5){throw 'Detour path has another destination'}
+    $length=0.0;for($i=1;$i -lt $corners.Count;$i++){$length+=Get-WorldDistance $corners[$i-1] $corners[$i];Assert-TraversalExteriorSegment $f $corners[$i-1] $corners[$i]}
+    Assert-TraversalNear $p.Length $length 'native alternate path length' 0.01
+    if($length -gt 24 -or $length -le $direct+0.1){throw 'Detour is not a bounded longer alternate route'}
+    $legs=@($p.Legs);if($legs.Count -lt 1 -or $legs.Count -gt 2){throw 'Missing bounded native detour legs'}
+    $joined=@();$sum=0.0
+    foreach($leg in $legs){
+        $lc=@($leg.Corners);if($leg.Status -cne 'PathComplete' -or $lc.Count -lt 2){throw 'Incomplete native detour leg'}
+        $ll=0.0;for($i=1;$i -lt $lc.Count;$i++){$ll+=Get-WorldDistance $lc[$i-1] $lc[$i];Assert-TraversalExteriorSegment $f $lc[$i-1] $lc[$i]}
+        Assert-TraversalNear $leg.Length $ll 'native leg length' 0.01;$sum+=$ll
+        if($joined.Count){Assert-TraversalSamePoint $joined[-1] $lc[0] 'native preview leg join';$joined+=@($lc|Select-Object -Skip 1)}else{$joined=$lc}
+    }
+    Assert-TraversalNear $sum $p.Length 'native summed leg length' 0.01
+    if($joined.Count -ne $corners.Count){throw 'Composite detour substituted corners'}
+    for($i=0;$i -lt $joined.Count;$i++){Assert-TraversalSamePoint $joined[$i] $corners[$i] 'native composite corner'}
+    $contact=@($prior|Where-Object {$_.Event -eq 'PROBE_REFUSED' -and $_.Stage -ceq 'FIXTURE_DIRECT_REFUSAL' -and [string]$_.TargetEntity -ceq [string]$f.Wall}|Select-Object -Last 1)
+    if($contact.Count -ne 1){throw 'Detour lacks target-wall direct refusal'}
+    Assert-TraversalBlockedContact $contact[0] 'SOLID_WALL' $nav.Actor.NetId
+    Assert-TraversalSamePoint $contact[0].From $p.Start 'direct refusal at same actual detour start'
+    $a=Get-HomeRelative $contact[0].Requested $contact[0].From;$b=Get-HomeRelative $p.Goal $p.Start;$al=Get-WorldDistance $a @(0,0,0)
+    if($al -le 0 -or (Get-TraversalDot $a $b)/($al*$direct) -lt 0.99999){throw 'Direct refusal is not aimed along actual detour goal line'}
+    $travel=0.0;$groups=@();$current=@();$routeTo=$null
+    foreach($row in $w){
+        $d=$row.FixtureDetourWitness
+        if($d.Open -isnot [bool] -or $d.Open -or $d.Outside -ne $true -or [string]$d.Door -cne [string]$f.Door -or [string]$d.Foundation -cne [string]$f.Foundation -or
+            ($d.Plan|ConvertTo-Json -Depth 12 -Compress) -cne ($p|ConvertTo-Json -Depth 12 -Compress)){throw 'Detour native closed Door/fixture witness changed'}
+        Assert-TraversalSamePoint $d.DoorPosition $door[0].Position 'detour native door pose'
+        Assert-TraversalSamePoint $d.LocalPosition (Get-TraversalFixtureLocal $f $row.Actual) 'independent exterior local position'
+        Assert-TraversalExteriorSegment $f $row.From $row.Actual
+        $encoded=$row.Navigation.RouteTo|ConvertTo-Json -Compress
+        if($null -ne $routeTo -and $routeTo -cne $encoded){$groups+=,@($current);$current=@()};$routeTo=$encoded;$current+=,$row
+        $travel+=Get-WorldDistance $row.From $row.Actual
+    }
+    if($current.Count){$groups+=,@($current)}
+    if($groups.Count -ne $legs.Count){throw 'Observed detour legs differ from native plan'}
+    for($i=0;$i -lt $groups.Count;$i++){
+        $g=@($groups[$i]);$lc=@($legs[$i].Corners)
+        if($g.Count -lt 2 -or $g[-1].Speed -ne 0 -or (Get-WorldDistance $g[-1].Actual $lc[-1]) -gt 0.3 -or
+            (Get-WorldDistance $g[0].Navigation.RouteTo $lc[-1]) -gt 0.5 -or (Get-WorldDistance $g[0].From $lc[0]) -gt 0.5){throw 'Detour leg lacks bound physical start/arrival/rest'}
+        if($i -gt 0){Assert-TraversalSamePoint $groups[$i-1][-1].Actual $g[0].From 'observed stationary detour leg join'}
+    }
+    if($travel -le 2 -or $travel -le $direct+0.1 -or $w[-1].Speed -ne 0 -or (Get-WorldDistance $s.End $p.Goal) -gt 0.3){throw 'Detour lacks real supported alternate travel and rest'}
+}
 function Get-TraversalPhysicsVelocity($to,$from,[double]$dt){
     # Native Vector3 stores coordinates, subtraction and division as Singles.
     # Restore those operands; JSON's short decimal spellings are not exact reals.
@@ -305,7 +586,7 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
     Assert-AvatarUid $expectedActor
     if([string]::IsNullOrWhiteSpace([string]$expectedWorld)){throw 'Missing traversal world binding'}
     $frames=@($frames);if(-not $frames.Count -or $frames.Count -gt 16384){throw 'Missing/unbounded traversal frames'}
-    $pending=$null;$lastWitness=$null;$baseline=$null;$lastTime=-1.0;$resolved=0;$heightWitnesses=@{};$heightRunKey='';$heightRun=0;$acquisition=$null;$ordinaryIssued=$false
+    $pending=$null;$pendingIssued=$false;$issuedCount=0;$lastWitness=$null;$baseline=$null;$lastTime=-1.0;$resolved=0;$heightWitnesses=@{};$heightRunKey='';$heightRun=0;$acquisition=$null;$ordinaryIssued=$false
     $activeClock=$null;$previousClock=$null;$clockStartWall=0.0;$clockBaselinePose=$null
     foreach($f in $frames){
         if($f.Schema -notin @(1,2) -or [string]$f.Actor -cne [string]$expectedActor -or [string]$f.World -cne [string]$expectedWorld -or
@@ -313,6 +594,7 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
         $time=Get-TraversalNumber $f.Time 'time';$tick=Get-TraversalNumber $f.Tick 'tick';$command=Get-TraversalNumber $f.Command 'command'
         if($time -lt $lastTime-0.0001 -or $tick -lt 0 -or $tick -ne [Math]::Floor($tick) -or $command -lt 0 -or $command -ne [Math]::Floor($command)){throw 'Invalid traversal chronology'}
         $lastTime=$time
+        if($f.Event -in @('PROBE_REFUSED','PROBE_CLEAR')){Assert-TraversalProbe $f $expectedActor}
         $fixedProtocol=$f.Schema -eq 2
         if($fixedProtocol -and $null -ne $f.Clock){
             Assert-TraversalClock $f.Clock $f.Profile
@@ -346,7 +628,7 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
             Assert-TraversalNear $f.WallDt ($f.Clock.WallTime-$previousClock.WallTime) 'independent callback wall interval' 0.000001
             if($f.Clock.WallTime-$clockStartWall -gt 120){throw 'Native wall deadline exceeded'}
             if($null -ne $f.Profile.MaxWallStall){Assert-TraversalWallTelemetry $f $previousClock}
-        }elseif($fixedProtocol -and $f.Event -in @('CLOCK_BASELINE','MOVE_DECISION','MOTION_WITNESS','FLOOR_ACQUISITION_OBSERVE','FLOOR_ACQUIRED','STEP_RESOLVED','ARRIVED','REPATH')){throw 'Physical proof is missing its explicit native fixed clock'}
+        }elseif($fixedProtocol -and $f.Event -in @('CLOCK_BASELINE','MOVE_DECISION','MOVE_ISSUED','MOVE_REJECTED','MOTION_WITNESS','FLOOR_ACQUISITION_OBSERVE','FLOOR_ACQUIRED','STEP_RESOLVED','ARRIVED','REPATH')){throw 'Physical proof is missing its explicit native fixed clock'}
         $phase=if($null -eq $f.SupportPhase){'NORMAL'}else{[string]$f.SupportPhase}
         if($phase -notin @('NORMAL','FLOOR_ACQUISITION')){throw 'Unknown native support phase'}
         $isAcquisition=$phase -eq 'FLOOR_ACQUISITION'
@@ -392,6 +674,16 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
             if($null -ne $pending -or $null -eq $lastWitness -or $lastWitness.Speed -ne 0 -or $lastWitness.Command -ne $command -or [Math]::Abs($lastWitness.Time-$time) -gt 0.001){throw 'Arrival lacks observed native rest'}
             Assert-TraversalSamePoint $f.Actual $lastWitness.Actual 'actual arrived rest';Assert-TraversalNavigation $f -Decision
             continue
+        }
+        if($f.Event -in @('MOVE_ISSUED','MOVE_REJECTED')){
+            if($null -eq $pending -or $pendingIssued -or $pending.Navigation.AdmissionPolicy -cne 'NATIVE_CURRENT_ROUTE_V1'){throw 'Native issue/rejection has no new-policy intent'}
+            Assert-TraversalClockSame $f.Clock $pending.Clock
+            if($f.Event -ceq 'MOVE_REJECTED'){
+                Assert-TraversalFinalIssue $f $pending $issuedCount -Rejected
+                $pending=$null;$pendingIssued=$false;continue
+            }
+            Assert-TraversalFinalIssue $f $pending $issuedCount
+            $issuedCount++;$pendingIssued=$true;continue
         }
         if($f.Event -notin @('MOVE_DECISION','MOTION_WITNESS')){continue}
         if($isAcquisition -and ($null -eq $acquisition -or $acquisition.Acquired)){throw 'Acquisition command lacks its one initial stationary observation'}
@@ -442,9 +734,11 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
                 Assert-TraversalNear $f.Distance (Get-WorldDistance $f.From $f.Requested) 'planned displacement';Assert-TraversalNear $f.Speed $plannedSpeed 'planned speed';Assert-TraversalNear $f.Acceleration $plannedAcceleration 'planned acceleration' 0.001
                 if($plannedSpeed -gt $f.Profile.MaxSpeed+0.001 -or $plannedAcceleration -gt $f.Profile.MaxAcceleration+0.001){throw 'Unsafe planned physics speed/acceleration'}
             }
-            $pending=$f;continue
+            $pending=$f;$pendingIssued=$f.Navigation.AdmissionPolicy -cne 'NATIVE_CURRENT_ROUTE_V1'
+            if($pendingIssued){$issuedCount++} # Legacy records predate explicit native issue events.
+            continue
         }
-        if($null -eq $pending -or $command -ne $pending.Command -or $f.Stage -cne $pending.Stage -or $f.Classification -cne $pending.Classification -or $f.NativeResult -cne 'OBSERVED' -or
+        if($null -eq $pending -or -not $pendingIssued -or $command -ne $pending.Command -or $f.Stage -cne $pending.Stage -or $f.Classification -cne $pending.Classification -or $f.NativeResult -cne 'OBSERVED' -or
             $f.SupportPhase -cne $pending.SupportPhase -or $f.MotionMode -cne $pending.MotionMode -or $f.Schema -ne $pending.Schema){throw 'Unbound/failed native after-pose witness'}
         Assert-TraversalSamePoint $f.From $pending.From 'witness origin';Assert-TraversalSamePoint $f.Requested $pending.Requested 'witness request'
         Assert-TraversalSamePoint $f.Actual $f.Requested 'observed actuator target';Assert-TraversalSweeps $f $f.Actual
@@ -486,7 +780,7 @@ function Assert-TraversalFrames($frames,$expectedActor,$expectedWorld){
             $key=[string]$f.Stage+'|'+[string]$f.Classification
             if($heightRunKey -cne $key){$heightRunKey=$key;$heightRun=0};$heightRun++
         }else{$heightRunKey='';$heightRun=0}
-        $lastWitness=$f;$pending=$null
+        $lastWitness=$f;$pending=$null;$pendingIssued=$false
     }
     if($null -ne $pending){throw 'Unobserved native actuation command'}
     if($null -eq $lastWitness -and -not @($frames|Where-Object Event -eq 'BLOCKED').Count){throw 'No actual movement or blocked evidence'}
@@ -587,7 +881,7 @@ function Assert-TraversalSceneResult($nav){
     if(@($t.Frames).Count){Assert-AvatarActor $nav;Assert-TraversalFrames $t.Frames $nav.Actor.NetId $t.World}
     elseif($nav.Status -eq 'GREEN' -or $t.Completed -eq $true -or $t.Actuations -ne 0){throw 'Complete traversal has no native frames'}
     $frames=@($t.Frames);$scenes=@($t.Scenes);$passed=@{}
-    if($t.Order -ceq 'OUTDOOR_FIRST'){Assert-TraversalOutdoorOrder $scenes}
+    if($t.Order -in @('OUTDOOR_FIRST','OWNED_NATIVE_TEST_FIXTURE')){Assert-TraversalOutdoorOrder $scenes}
     $actuations=Get-TraversalNumber $t.Actuations 'actuation count'
     if($actuations -ne @($frames|Where-Object Event -eq 'MOTION_WITNESS').Count){throw 'Unobserved or unaccounted native actuation'}
     foreach($s in $scenes){
@@ -605,6 +899,10 @@ function Assert-TraversalSceneResult($nav){
             if($s.Kind -in @('SOLID_WALL','DOOR_CLOSED') -or $w.Count -lt 2){throw 'Missing distinct physical scene witnesses'}
             Assert-TraversalSamePoint $s.Start $allWitnesses[0].From 'scene actual start';Assert-TraversalSamePoint $s.End $allWitnesses[-1].Actual 'scene actual end'
             if($s.Kind -eq 'SAFE_DETOUR'){
+                if($t.Order -ceq 'OWNED_NATIVE_TEST_FIXTURE'){
+                    Assert-TraversalExteriorDetour $nav $s $w @($frames|Select-Object -First $from)
+                    $passed[$s.Kind]=$s;continue
+                }
                 if((Get-WorldDistance $s.Start $s.End) -lt 1 -or $w[-1].Speed -ne 0){throw 'Detour lacks actual distance and observed rest'}
                 $door=$null
                 $binding=$null
@@ -638,7 +936,7 @@ function Assert-TraversalSceneResult($nav){
             $passed[$s.Kind]=$s
         }
         if($s.Status -eq 'BLOCKED' -and $s.Kind -in @('SOLID_WALL','DOOR_CLOSED')){
-            $blocked=@($slice|Where-Object {$_.Event -eq 'BLOCKED' -and $_.Classification -in @('SOLID_BLOCKED','DOOR_CLOSED')})
+            $blocked=@($slice|Where-Object {$_.Event -in @('BLOCKED','PROBE_REFUSED') -and $_.Classification -in @('SOLID_BLOCKED','DOOR_CLOSED')})
             if(-not $blocked.Count -or [string]::IsNullOrWhiteSpace([string]$s.Reason)){throw 'Wall/closed-door flag lacks actual blocking receipt'}
             $contact=@($slice|Where-Object Event -eq 'PHYSICAL_CONTACT')
             if(-not $contact.Count){throw 'Blocked scene lacks native collision measurement'}
@@ -647,13 +945,20 @@ function Assert-TraversalSceneResult($nav){
                 if($c.Stage -cne $s.Stage){throw 'Negative contact belongs to another scene'}
                 Assert-TraversalSamePoint $s.Start $c.Actual 'negative scene contact pose'
                 Assert-TraversalBlockedContact $c $s.Kind $nav.Actor.NetId
+                if($t.Order -ceq 'OWNED_NATIVE_TEST_FIXTURE'){
+                    Assert-TraversalProbe $blocked[0] $nav.Actor.NetId
+                    $expected=if($s.Kind -eq 'DOOR_CLOSED'){$t.Fixture.Door}else{$t.Fixture.Wall}
+                    if([string]::IsNullOrEmpty([string]$expected) -or [string]$c.TargetEntity -cne [string]$expected){throw 'Fixture refusal names another native target'}
+                }
             }
             $passed[$s.Kind]=$s
         }
     }
     if($nav.Status -eq 'GREEN' -or $t.Completed -eq $true){
         foreach($kind in @('OUTDOOR_STEP','SLOPE_DOWN','NATIVE_BUILDING_STEP','SOLID_WALL','DOOR_CLOSED')){if(-not $passed.ContainsKey($kind)){throw ('GREEN traversal lacks '+$kind)}}
-        if($t.Order -ceq 'OUTDOOR_FIRST' -and -not $passed.ContainsKey('SAFE_DETOUR')){throw 'Outdoor-first completion lacks actual safe detour'}
+        if($t.Order -in @('OUTDOOR_FIRST','OWNED_NATIVE_TEST_FIXTURE') -and -not $passed.ContainsKey('SAFE_DETOUR')){throw 'Outdoor-first completion lacks actual safe detour'}
+        if($t.Order -ceq 'OWNED_NATIVE_TEST_FIXTURE' -and -not @($frames|Where-Object {$_.Stage -like 'HOME_*' -and $_.Event -eq 'MOTION_WITNESS' -and
+            $_.Classification -eq 'SMALL_STEP_UP' -and ($_.Support.Kind -eq 'STEP_EDGE' -or $_.Landing.Kind -eq 'STEP_EDGE')}).Count){throw 'Complete fixture traversal lacks an actual discrete native step'}
         if($t.Completed -isnot [bool] -or -not $t.Completed -or $passed.OUTDOOR_STEP.Stage -eq $passed.NATIVE_BUILDING_STEP.Stage){throw 'GREEN traversal lacks separate outdoor/building contexts'}
     }
 }
@@ -687,7 +992,19 @@ function Assert-TraversalSmokeBoundary($n){
         if(-not $cost -or (Get-FirstHomeCostKey $cost) -cne (Get-FirstHomeCostKey $op.Costs)){throw 'Traversal payment differs from loaded recipe/grade'}
         $paid[[string]$op.Kind]=$true;$last=$op.After
     }
-    if(-not $complete -and -not $h.NavigationComplete){return}
+    $fixtureReady=$n.Traversal.Order -ceq 'OWNED_NATIVE_TEST_FIXTURE' -and $null -ne $n.Traversal.Fixture
+    if(-not $complete -and -not $h.NavigationComplete -and -not $fixtureReady){
+        if($h.PendingIntent){throw 'Partial traversal has an unreconciled native payment intent'}
+        $expectedInventory=$last
+        if($null -ne $h.Upkeep){
+            $u=$h.Upkeep;Assert-FirstHomeUpkeep $u
+            if((Get-FirstHomeEconomicKey $last) -cne (Get-FirstHomeEconomicKey $u.Before) -or
+                (Get-FirstHomeEconomicKey $u.Before) -cne (Get-FirstHomeEconomicKey @(@($u.After)+@($u.TcInventory)))){throw 'Partial traversal TC transfer differs from paid ledger'}
+            $expectedInventory=$u.After
+        }
+        if((Get-FirstHomeEconomicKey $expectedInventory) -cne (Get-FirstHomeEconomicKey $n.Inventory)){throw 'Partial traversal final inventory differs from paid ledger'}
+        return
+    }
     Assert-FirstHomeTcPlacement $h.NativePlacements
     Assert-FirstHomeDoorPlacement $h.NativePlacements @($h.Home.Entities|Where-Object Role -eq 'DOOR')[0] @($h.Home.Entities|Where-Object Role -eq 'DOORWAY')[0].NetId
     Assert-FirstHomeTcAuthorization $h.TcAuthorization $n.Actor.UserId $h.Home.BuildingId @($h.Home.Entities|Where-Object Role -eq 'TC')[0]
@@ -706,16 +1023,25 @@ function Assert-TraversalComponents($nav){
     if(-not $frames.Count -and $nav.Status -ne 'GREEN' -and $nav.Traversal.Completed -eq $false -and
         -not @($nav.Traversal.Scenes|Where-Object Status -eq 'PASSED').Count -and
         (Get-TraversalNumber $nav.Traversal.Actuations 'actuation count') -eq 0){
-        $frames=@($nav.Traversal.Frames|Where-Object {$_.Event -in @('BLOCKED','FLOOR_ACQUISITION_OBSERVE','CLOCK_BASELINE')})
+        $native=@($nav.Traversal.Frames|Where-Object {$_.Profile.NativeAdmissionPolicy -ceq 'NATIVE_CURRENT_ROUTE_V1'}).Count -gt 0
+        $allowed=@('BLOCKED','FLOOR_ACQUISITION_OBSERVE','CLOCK_BASELINE')
+        if($native){
+            # A prechecked intent is not a writer call. Its explicit rejection
+            # must validate before a zero-actuation result can use these rows.
+            Assert-TraversalFrames $nav.Traversal.Frames $nav.Actor.NetId $nav.Traversal.World
+            $allowed+=@('MOVE_DECISION','MOVE_REJECTED','OBSTACLE_PROBE','PHYSICAL_CONTACT')
+        }
+        $frames=@($nav.Traversal.Frames|Where-Object {$_.Event -in $allowed})
         if($frames.Count -ne @($nav.Traversal.Frames).Count){throw 'Zero-motion refusal contains unobserved native commands'}
         $configuration=$null
         foreach($f in $frames){
             $notIssued=$f.NativeResult -in @('NOT_ISSUED','STOPPED') -or ($f.Event -eq 'FLOOR_ACQUISITION_OBSERVE' -and $f.NativeResult -ceq 'STATIONARY_OBSERVATION')
             if($f.Event -eq 'CLOCK_BASELINE' -and $f.NativeResult -ceq 'CLOCK_BASELINE'){$notIssued=$true}
+            if($native -and $f.Event -ceq 'MOVE_DECISION' -and $f.NativeResult -ceq 'PRECHECKED'){$notIssued=$true}
             if(-not $notIssued -or $f.UnobservedCommand -eq $true){throw 'Unobserved native command is not a zero-motion refusal'}
             Assert-TraversalBody $f $nav.Actor.NetId
             Assert-TraversalSamePoint $f.From $f.Actual 'blocked no-actuation origin'
-            Assert-TraversalSamePoint $f.Requested $f.Actual 'blocked no-actuation request'
+            if(-not $native){Assert-TraversalSamePoint $f.Requested $f.Actual 'blocked no-actuation request'}
             Assert-TraversalSamePoint $frames[0].Actual $f.Actual 'blocked no-actuation continuity'
             $key=@($f.Body.Instance,$f.Body.RigidbodyInstance,$f.Body.Kinematic,$f.Body.Gravity,$f.Body.CollisionMode,$f.Body.Layer,$f.Body.DetectCollisions) -join '|'
             if($null -eq $configuration){$configuration=$key}elseif($configuration -cne $key){throw 'Native body changed during zero-motion refusal'}
@@ -732,6 +1058,12 @@ function Assert-TraversalComponents($nav){
     foreach($f in $frames){if($f.Body.Instance -ne $capsules[0].Instance -or $f.Body.RigidbodyInstance -ne $rigid[0].Instance){throw 'Runtime body differs from full component inventory'}}
 }
 function Assert-TraversalResult($nav){
+    if($nav.Traversal.WarmupPolicy -ceq 'STATIONARY_CLOCK_WINDOW_V1'){Assert-TraversalStationaryWindow $nav.Traversal $nav.Actor.NetId}
+    if($nav.Traversal.ReadinessPolicy -ceq 'NATIVE_CURRENT_ROUTE_V1'){
+        foreach($f in @($nav.Traversal.Frames|Where-Object Event -eq 'MOVE_DECISION')){
+            if($f.Profile.NativeAdmissionPolicy -cne $nav.Traversal.ReadinessPolicy -or $f.Navigation.AdmissionPolicy -cne $nav.Traversal.ReadinessPolicy){throw 'Native readiness certificate policy missing from a new command'}
+        }
+    }
     if($nav.Status -eq 'GREEN' -or $nav.Traversal.Completed -eq $true -or @($nav.Traversal.Scenes|Where-Object Status -eq 'PASSED').Count){
         $motion=@($nav.Traversal.Frames|Where-Object {$_.Event -in @('MOVE_DECISION','MOTION_WITNESS')})
         if(-not $motion.Count -or @($motion|Where-Object {$_.Schema -ne 2 -or $null -eq $_.Clock}).Count){throw 'New physical traversal success requires the explicit native fixed-clock protocol'}

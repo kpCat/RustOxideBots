@@ -219,7 +219,7 @@ namespace Oxide.Plugins
             for(int count=0;count<64 && homeSearchIndex<HomeSearchLimit;count++) {
                 int index=homeSearchIndex++,i=index/4+1;var rot=Quaternion.Euler(0,Mathf.Floor(Halton(i<=512?i:i-512,5)*8)*45+(index%4)*90,0);Vector3 p;
                 if(i<=512) {
-                    float angle=Halton(i,2)*Mathf.PI*2,r=8+Halton(i,3)*160;
+                    float angle=Halton(i,2)*Mathf.PI*2,r=traversalBench?8+Halton(i,3)*64:8+Halton(i,3)*160;
                     p=homeSearchOrigin+new Vector3(Mathf.Cos(angle),0,Mathf.Sin(angle))*r;
                 }else {
                     i-=512;p=TerrainMeta.Position+new Vector3((0.05f+Halton(i,2)*0.9f)*TerrainMeta.Size.x,0,(0.05f+Halton(i,3)*0.9f)*TerrainMeta.Size.z);
@@ -287,8 +287,8 @@ namespace Oxide.Plugins
                     complete=CalculateRoute(foot,path) && path.status==NavMeshPathStatus.PathComplete;
                     if(!complete)reasons.Add("NAV_PATH");
                     else {
-                        pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/3+30);
-                        if(pathLength>800 || travelSeconds>300)reasons.Add("TRAVEL_BUDGET");
+                        pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/(localMotion==null?3:Mathf.Min(1.2f,agent.walkSpeed))+30);
+                        if(pathLength>(traversalBench?70:800) || travelSeconds>(traversalBench?110:300))reasons.Add("TRAVEL_BUDGET");
                         if(remaining<travelSeconds+reserve)reasons.Add("TIME_BUDGET");
                     }
                 }
@@ -632,6 +632,7 @@ namespace Oxide.Plugins
             if(float.IsNaN(minutes) || float.IsInfinity(minutes) || minutes<=beforeMinutes || minutes<60)throw new InvalidOperationException("Native TC protection >=60 minutes not proven");
             HomeWriteIntent("COMMITTED",homeUpkeep);homeIntent=null;Log("HOME_UPKEEP",homeUpkeep);
             Activate(product.uid);homePhase="NAV_WAIT";homeWait=Time.realtimeSinceStartup+30;
+            if(traversalBench){homePhase="FIXTURE";traversalPhase="FIXTURE_WAIT";}
         }
         private bool HomeInterior(out Vector3 point) {
             var foundation=homeEntities["FOUNDATION"];point=Vector3.zero;
@@ -993,8 +994,7 @@ namespace Oxide.Plugins
                 // Door placement may have used a proven current stand closer than the original site stand.
                 homeOutside=npc.transform.position;
                 HomeReadPortal();
-                if(traversalBench && !TraversalWallNegative()){TraversalStopScene("Native wall refusal not proven");return true;}
-                if(traversalBench && !TraversalDoorNegative()){TraversalStopScene("Native closed-door refusal not proven");return true;}
+                // Bench G4 wall/Door/detour receipts precede this interior sampling gate.
                 HomeOpenDoor(true);homePhase="DOOR_WAIT";homeWait=now+1.5f;return true;
             }
             if(homePhase=="DOOR_WAIT") {
