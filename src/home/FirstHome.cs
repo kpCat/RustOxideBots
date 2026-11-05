@@ -284,7 +284,7 @@ namespace Oxide.Plugins
                 if(privilege!=null || !permission)reasons.Add("BUILD_PERMISSION_OR_FOREIGN_TC");
                 var path=new RustNavMeshPath();bool complete=false;float pathLength=0,travelSeconds=0,remaining=deadline-Time.realtimeSinceStartup,reserve=homePhase=="SITE_SEARCH" && !homeSmoke?HomeGatherReserve:HomeBuildReserve;
                 if(reasons.Count==0) {
-                    complete=agent.CalculatePath(foot,path) && path.status==NavMeshPathStatus.PathComplete;
+                    complete=CalculateRoute(foot,path) && path.status==NavMeshPathStatus.PathComplete;
                     if(!complete)reasons.Add("NAV_PATH");
                     else {
                         pathLength=path.GetPathLength();travelSeconds=Mathf.Ceil(pathLength/3+30);
@@ -322,23 +322,28 @@ namespace Oxide.Plugins
         }
         private void HomeMove(Vector3 destination,string stage) {
             var path=new RustNavMeshPath();
-            if(!agent.CalculatePath(destination,path) || path.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV "+stage+" "+path.status);
-            homeTravelSeconds=Mathf.Ceil(path.GetPathLength()/3+30);
+            if(!CalculateRoute(destination,path) || path.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV "+stage+" "+path.status);
+            homeTravelSeconds=Mathf.Ceil(path.GetPathLength()/(localMotion==null?3:Mathf.Min(1.2f,agent.walkSpeed))+30);
             if(homeTravelSeconds>300)throw new InvalidOperationException("HOME_NAV travel bound exceeds300 seconds");
             homeNavStart=npc.transform.position;target=destination;homeLegTime=progressTime=Time.realtimeSinceStartup;progress=homeNavStart;repaths=0;
-            if(!agent.SetDestination(destination))throw new InvalidOperationException("Home SetDestination rejected");agent.isStopped=false;agent.speed=3;
+            if(localMotion!=null){if(!IssueTraversal(destination,"HOME_"+stage))throw new InvalidOperationException("Home checked movement rejected: "+localMotion.Reason);}
+            else{if(!agent.SetDestination(destination))throw new InvalidOperationException("Home SetDestination rejected");agent.isStopped=false;agent.speed=3;}
             navigating=true;homeNav.Add(new {Event="ISSUED",Stage=stage,Start=Point(homeNavStart),Target=Point(destination),Path=path.status.ToString(),Length=path.GetPathLength(),Time=homeLegTime});
         }
         private bool HomeArrived(float now) {
             float distance=Vector3.Distance(npc.transform.position,target);
-            if(distance<=0.3f) {
+            if(localMotion!=null && localMotion.Blocked)throw new InvalidOperationException("HOME_NAV checked movement blocked: "+localMotion.Reason);
+            if((localMotion==null || localMotion.Arrived) && distance<=0.3f) {
                 homeNav.Add(new {Event="ARRIVED",Start=Point(homeNavStart),Position=Point(npc.transform.position),Target=Point(target),Time=now,Path=agent.pathStatus.ToString(),agent.hasPath,agent.remainingDistance});
                 navigating=false;agent.isStopped=true;return true;
             }
-            if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV lost before physical arrival: "+agent.pathStatus+" distance="+distance);
+            if(localMotion==null){if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV lost before physical arrival: "+agent.pathStatus+" distance="+distance);}
+            else if(!localMotion.Active && !localMotion.Arrived)throw new InvalidOperationException("HOME_NAV checked route lost before physical arrival");
             if(Vector3.Distance(progress,npc.transform.position)>0.5f){progress=npc.transform.position;progressTime=now;}
             if(now-homeLegTime>homeTravelSeconds)throw new InvalidOperationException("HOME_NAV physical travel timeout");
-            if(now-progressTime>12){if(repaths++>=1)throw new InvalidOperationException("HOME_NAV bounded stuck");if(!agent.SetDestination(target))throw new InvalidOperationException("Home repath failed");agent.speed=3;progressTime=now;}
+            if(now-progressTime>12){if(repaths++>=1)throw new InvalidOperationException("HOME_NAV bounded stuck");
+                if(localMotion!=null){if(!IssueTraversal(target,"HOME_REPATH"))throw new InvalidOperationException("Home repath failed");}
+                else{if(!agent.SetDestination(target))throw new InvalidOperationException("Home repath failed");agent.speed=3;}progressTime=now;}
             return false;
         }
         private Socket_Base HomeSocket(BaseEntity entity,string suffix) {
@@ -567,7 +572,7 @@ namespace Oxide.Plugins
                 Mathf.Abs(p.y-floor.point.y)>0.25f?"OWN_FOUNDATION_FLOOR":water>0.15f?"WATER":blocking.Length>0?(ownBlock?"CAPSULE_OWN_STRUCTURE":"CAPSULE_FOREIGN"):
                 reach>c.maxplaceDistance?"DOOR_RANGE":!los?"DOOR_LOS":!permission?"PERMISSION":!agent.isOnNavMesh?"NAV_SAMPLE":"ACCEPTED";
             if(reason=="ACCEPTED") {
-                calculated=agent.CalculatePath(actualFoot,path);complete=calculated && path.status==NavMeshPathStatus.PathComplete;
+                calculated=CalculateRoute(actualFoot,path);complete=calculated && path.status==NavMeshPathStatus.PathComplete;
                 if(!complete)reason="PATH_PARTIAL";
                 else if(Time.realtimeSinceStartup+Mathf.Ceil(path.GetPathLength()/3+30)>deadline)reason="TIME_BUDGET";
             }
@@ -948,11 +953,11 @@ namespace Oxide.Plugins
             }
             if(dt<=0 || dt>1.5f || step>5 || step>6*dt+1)throw new InvalidOperationException("Discontinuous HOME_NAV trace");
             if(homePhase=="NAV") {
-                HomeCrossing(previous,position,now,false);
+                if(localMotion==null)HomeCrossing(previous,position,now,false);
                 bool admitted;
-                try{admitted=HomePhysicalSample(now);}catch{agent.isStopped=true;navigating=false;throw;}
+                try{admitted=localMotion!=null?!localMotion.Blocked:HomePhysicalSample(now);}catch{agent.isStopped=true;navigating=false;throw;}
                 if(!admitted){total+=step;previous=position;previousTime=now;Sample(now);return true;}
-                HomeCrossing(previous,position,now,true);
+                if(localMotion==null)HomeCrossing(previous,position,now,true);
             }
             total+=step;previous=position;previousTime=now;Sample(now);
             if(now>deadline)throw new InvalidOperationException("Bounded FirstHome deadline");
@@ -987,14 +992,19 @@ namespace Oxide.Plugins
                 if(!HomeInterior(out homeInside)){if(now>=homeWait)throw new InvalidOperationException("HOME_NAV native floor/clearance/sample unavailable after rebuild");return true;}
                 // Door placement may have used a proven current stand closer than the original site stand.
                 homeOutside=npc.transform.position;
-                HomeReadPortal();HomeOpenDoor(true);homePhase="DOOR_WAIT";homeWait=now+1.5f;return true;
+                HomeReadPortal();
+                if(traversalBench && !TraversalWallNegative()){TraversalStopScene("Native wall refusal not proven");return true;}
+                if(traversalBench && !TraversalDoorNegative()){TraversalStopScene("Native closed-door refusal not proven");return true;}
+                HomeOpenDoor(true);homePhase="DOOR_WAIT";homeWait=now+1.5f;return true;
             }
             if(homePhase=="DOOR_WAIT") {
                 if(now<homeWait)return true;
                 var current=DoorColliders();bool changed=JsonConvert.SerializeObject(homeDoorClosed)!=JsonConvert.SerializeObject(current);
                 homeNav.Add(new {Event="DOOR_COLLIDER",Time=now,Changed=changed,Closed=homeDoorClosed,Open=current});
                 if(!changed)throw new InvalidOperationException("Native door hinge collider did not move");
-                HomePhysicalSample(now);HomeMove(homeInside,"INSIDE_TC");homePhase="NAV";homeNavStage=0;HomeWatchPhysics(now);return true;
+                if(localMotion==null)HomePhysicalSample(now);
+                TraversalHomeBegin();HomeMove(homeInside,"INSIDE_TC");homePhase="NAV";homeNavStage=0;
+                if(localMotion==null)HomeWatchPhysics(now);return true;
             }
             if(homePhase=="NAV" && HomeArrived(now)) {
                 if(homeNavStage==0) {
@@ -1006,6 +1016,7 @@ namespace Oxide.Plugins
                 }else {
                     if(!homeCrossedOut)throw new InvalidOperationException("Physical exit portal crossing missing");HomeOpenDoor(false);homeNavComplete=true;
                     if(!Activate(product.uid) || !EquipmentValid())throw new InvalidOperationException("Home paid held axe lost");
+                    if(TraversalHomeComplete())return true;
                     if(homeSmoke)Finish("PARTIAL","BUILD_SMOKE_GREEN / DIAGNOSTIC_BUILD_ONLY; fixture is not natural survival or restore proof");
                     else{Save();Finish("GREEN","Native paid home/TC/upkeep and physical RustNav "+mode);}
                 }

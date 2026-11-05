@@ -16,8 +16,15 @@ $response = @('/nologo','/target:library','/nostdlib+','/langversion:7.3',('/out
 $response += Get-ChildItem -LiteralPath $managed -Filter '*.dll' | Where-Object {
     $_.BaseName -notin @('Newtonsoft.Json','protobuf-net','websocket-sharp')
 } | ForEach-Object { '/reference:"' + $_.FullName + '"' }
-$response += '"' + $plugin + '"'
-if($PluginName -eq 'RustBotsAvatarSurvival'){$response += '"' + (Join-Path $repo 'src\economy\EconomyJournal.cs') + '"';$response += '"' + (Join-Path $repo 'src\home\FirstHome.cs') + '"'}
+if($PluginName -eq 'RustBotsAvatarSurvival'){
+    $parts=@([IO.File]::ReadAllText($plugin))
+    foreach($part in @('src\economy\EconomyJournal.cs','src\home\FirstHome.cs','src\navigation\ObstacleTraversal.cs','src\navigation\TraversalBench.cs')){
+        $parts += [IO.File]::ReadAllText((Join-Path $repo $part))
+    }
+    $combined=Join-Path $out ($PluginName+'.combined.cs')
+    [IO.File]::WriteAllText($combined,[string]::Join([Environment]::NewLine,$parts),(New-Object Text.UTF8Encoding($false)))
+    $response += '"' + $combined + '"'
+}else{$response += '"' + $plugin + '"'}
 $rsp = Join-Path $out 'compile.rsp'
 $response | Set-Content -LiteralPath $rsp -Encoding UTF8
 & dotnet $compiler ('@' + $rsp)

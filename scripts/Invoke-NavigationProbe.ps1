@@ -3,8 +3,12 @@
 param([switch]$PreflightOnly, [ValidateRange(60,1800)][int]$StartupTimeoutSeconds = 900,
     [ValidateRange(60,2400)][int]$NavigationTimeoutSeconds = 900, [string]$FirewallLease,
     [ValidateRange(0,300)][int]$DiagnosticHoldSeconds = 0, [switch]$WorldRoam,
-    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft, [switch]$PlayerAvatar, [switch]$AvatarSurvival, [switch]$WorldEconomy, [switch]$FirstHome, [switch]$FirstHomeSmoke)
+    [ValidatePattern('^[0-9a-f]{32}$')][string]$RestoreFrom, [switch]$ResumeJourney, [switch]$SurvivalGather, [switch]$SurvivalCraft, [switch]$PlayerAvatar, [switch]$AvatarSurvival, [switch]$WorldEconomy, [switch]$FirstHome, [switch]$FirstHomeSmoke, [switch]$TraversalBench)
 $ErrorActionPreference = 'Stop'
+if($TraversalBench){
+    if($RestoreFrom -or $ResumeJourney -or $SurvivalGather -or $SurvivalCraft -or $PlayerAvatar -or $AvatarSurvival -or $WorldRoam -or $WorldEconomy -or $FirstHome -or $FirstHomeSmoke){throw 'TraversalBench cannot restore or combine scenario selectors'}
+    $FirstHomeSmoke=$true
+}
 . (Join-Path $PSScriptRoot 'ProbeSafety.ps1')
 . (Join-Path $PSScriptRoot 'ProbeCache.ps1')
 . (Join-Path $PSScriptRoot 'ProbeFirewall.ps1')
@@ -15,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'AvatarSurvivalValidation.ps1')
 . (Join-Path $PSScriptRoot 'EconomyValidation.ps1')
 . (Join-Path $PSScriptRoot 'FirstHomeValidation.ps1')
+. (Join-Path $PSScriptRoot 'TraversalValidation.ps1')
 if($FirstHomeSmoke){if($RestoreFrom -or $FirstHome){throw 'Diagnostic build smoke cannot restore or combine FirstHome modes'};$FirstHome=$true}
 if($FirstHome){
     if($WorldEconomy -or $AvatarSurvival){throw 'FirstHome already selects world-bound AvatarSurvival'};$WorldEconomy=$true
@@ -42,6 +47,7 @@ $oldResume = $env:RUST_BOTS_RESUME_JOURNEY
 $oldEconomy=$env:RUST_BOTS_WORLD_ECONOMY
 $oldHome=$env:RUST_BOTS_FIRST_HOME
 $oldHomeSmoke=$env:RUST_BOTS_FIRST_HOME_SMOKE
+$oldTraversalBench=$env:RUST_BOTS_TRAVERSAL_BENCH
 $isSurvival = $SurvivalGather -or $SurvivalCraft
 $scenario = if ($AvatarSurvival) {'AVATAR_SURVIVAL'} elseif ($PlayerAvatar) {'PLAYER_AVATAR'} elseif ($SurvivalCraft) {'SURVIVAL_CRAFT'} elseif ($SurvivalGather) {'SURVIVAL_GATHER'} elseif ($WorldRoam) {'WORLD_ROAM'} else {'NAVIGATION'}
 $pluginName = if ($AvatarSurvival) {'RustBotsAvatarSurvival'} elseif ($PlayerAvatar) {'RustBotsAvatarProbe'} elseif ($isSurvival) { 'RustBotsSurvival' } elseif ($WorldRoam) { 'RustBotsWorldRoam' } else { 'RustBotsNavigationProbe' }
@@ -116,6 +122,9 @@ try {
             $pluginPath=Join-Path $install ('oxide\plugins\'+$pluginName+'.cs')
             [IO.File]::AppendAllText($pluginPath,[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $repo 'src\economy\EconomyJournal.cs')),[Text.Encoding]::UTF8)
             [IO.File]::AppendAllText($pluginPath,[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $repo 'src\home\FirstHome.cs')),[Text.Encoding]::UTF8)
+            foreach($part in @('ObstacleTraversal.cs','TraversalBench.cs')){
+                [IO.File]::AppendAllText($pluginPath,[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $repo ('src\navigation\'+$part))),[Text.Encoding]::UTF8)
+            }
         }
         Copy-Item -LiteralPath (Join-Path $repo ('src\plugins\'+$pluginName+'.cs')) -Destination (Join-Path $runtime ($pluginName+'.cs'))
         if($AvatarSurvival){Copy-Item -LiteralPath $pluginPath -Destination (Join-Path $runtime ($pluginName+'.cs')) -Force}
@@ -130,6 +139,8 @@ try {
         $env:RUST_BOTS_WORLD_ECONOMY=if($WorldEconomy){'1'}else{''}
         $env:RUST_BOTS_FIRST_HOME=if($FirstHome){'1'}else{''}
         $env:RUST_BOTS_FIRST_HOME_SMOKE=if($FirstHomeSmoke){'1'}else{''}
+        $env:RUST_BOTS_TRAVERSAL_BENCH=if($TraversalBench){'1'}else{''}
+        $report['TraversalBench']=[bool]$TraversalBench
         $report['FirstHome']=[bool]$FirstHome
         $report['FirstHomeSmoke']=[bool]$FirstHomeSmoke
         if($FirstHomeSmoke){[IO.File]::WriteAllText((Join-Path $install 'rustbots-build-smoke.marker'),$runId)}
@@ -252,10 +263,12 @@ try {
                 Copy-Item -LiteralPath $navFile -Destination (Join-Path $runtime 'plugin-result.json')
                 try {
                     if ($AvatarSurvival) {
-                        if($FirstHomeSmoke){Assert-FirstHomeSmokeResult $nav}
+                        if($TraversalBench){Assert-TraversalResult $nav}
+                        elseif($FirstHomeSmoke){Assert-FirstHomeSmokeResult $nav}
                         elseif($FirstHome){Assert-FirstHomeResult $nav}
                         else{Assert-AvatarSurvivalResult $nav;if($RestoreFrom){Assert-AvatarSurvivalRestart $prior.Navigation $nav}}
-                        if($WorldEconomy){if(-not $FirstHome){Assert-EconomyResult $nav};if($nav.Status -eq 'GREEN' -or ($FirstHome -and $nav.FirstHome.SaveReady)){Assert-EconomyMapMatch $nav.Economy.World $report.EconomyMap}}
+                        if(-not $TraversalBench -and $nav.Traversal){Assert-TraversalFrames $nav.Traversal.Frames $nav.Actor.NetId $nav.Traversal.World}
+                        if($WorldEconomy){if(-not $FirstHome){Assert-EconomyResult $nav};if($TraversalBench -or $nav.Status -eq 'GREEN' -or ($FirstHome -and $nav.FirstHome.SaveReady)){Assert-EconomyMapMatch $nav.Economy.World $report.EconomyMap}}
                     } elseif ($PlayerAvatar) {
                         Assert-AvatarResult $nav
                     } elseif ($isSurvival) {
@@ -295,7 +308,8 @@ try {
                 }
                 $report.Status = $nav.Status
                 $report.Reason = $nav.Reason
-                if($FirstHomeSmoke){$report['BuildSmokeStatus']=if($nav.FirstHome.NavigationComplete){'BUILD_SMOKE_GREEN'}else{'PARTIAL'};$report['EvidenceClass']='DIAGNOSTIC_BUILD_ONLY'}
+                if($TraversalBench){$report['EvidenceClass']='DIAGNOSTIC_TRAVERSAL';$report['TraversalStatus']=if($nav.Traversal.Completed){'BENCH_COMPLETED_REQUIRES_PHYSICAL_REVIEW'}else{'PARTIAL'}}
+                elseif($FirstHomeSmoke){$report['BuildSmokeStatus']=if($nav.FirstHome.NavigationComplete){'BUILD_SMOKE_GREEN'}else{'PARTIAL'};$report['EvidenceClass']='DIAGNOSTIC_BUILD_ONLY'}
                 if ($nav.Status -ne 'GREEN' -and $DiagnosticHoldSeconds -gt 0) {
                     Save-Report
                     Write-Host ('Diagnostic hold for '+$DiagnosticHoldSeconds+' seconds; owned server will still stop automatically.')
@@ -357,6 +371,7 @@ try {
         $env:RUST_BOTS_WORLD_ECONOMY=$oldEconomy
         $env:RUST_BOTS_FIRST_HOME=$oldHome
         $env:RUST_BOTS_FIRST_HOME_SMOKE=$oldHomeSmoke
+        $env:RUST_BOTS_TRAVERSAL_BENCH=$oldTraversalBench
         if (-not $report.OwnedProcessAbsent -or $report.PortsReleased -eq $false) { $report.Status = 'FAILED' }
         if (($PlayerAvatar -or $AvatarSurvival) -and $report.Status -eq 'GREEN') {
             $report['AvatarCompletedSave']=Test-ProbeCompletedSave $report (Read-ProbeLog $log)

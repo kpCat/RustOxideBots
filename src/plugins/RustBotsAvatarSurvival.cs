@@ -207,6 +207,8 @@ namespace Oxide.Plugins
             if(!TestRoot()){Puts("Avatar survival inert: isolated marker/identity missing.");return;}
             firstHome=Environment.GetEnvironmentVariable("RUST_BOTS_FIRST_HOME")=="1";
             homeSmoke=Environment.GetEnvironmentVariable("RUST_BOTS_FIRST_HOME_SMOKE")=="1";
+            traversalBench=Environment.GetEnvironmentVariable("RUST_BOTS_TRAVERSAL_BENCH")=="1";
+            if(traversalBench && (!homeSmoke || !firstHome)){Finish("BLOCKED","Traversal bench requires isolated diagnostic home fixture");return;}
             if(homeSmoke && (!firstHome || Directory.GetParent(root).Name!=token || !File.Exists(Path.Combine(root,"rustbots-build-smoke.marker")) ||
                 File.ReadAllText(Path.Combine(root,"rustbots-build-smoke.marker"))!=token || Environment.GetEnvironmentVariable("RUST_BOTS_RESTORE")=="1")){
                 Finish("BLOCKED","Diagnostic fixture requires its own run-root marker and no restore");return;
@@ -222,7 +224,7 @@ namespace Oxide.Plugins
                 if(npc==null) {
                     var nav=RustNavigation.Instance;
                     if(ConVar.AI.useUnityNavmesh){Finish("BLOCKED","RustNav required");return;}
-                    if(nav!=null && nav.IsDefaultNavmeshBuilt()){Begin();return;}
+                    if(nav!=null && nav.IsDefaultNavmeshBuilt() && !nav.HasPendingTiles()){Begin();return;}
                     if(Time.realtimeSinceStartup-wait>600)Finish("BLOCKED","RustNav readiness timeout");
                 } else if(active)Tick();
             }catch(Exception ex){PrintError(ex.ToString());Finish(economicFailure?"FAILED":"PARTIAL",ex.GetType().Name+": "+ex.Message);} });
@@ -254,6 +256,8 @@ namespace Oxide.Plugins
             bool absent=!ItemManager.GetAllItems().Any(i=>before.Any(b=>b.Uid==i.uid.Value.ToString()));
             normalization=new {Before=before,AfterStrip=Contents(),RemovedAbsent=absent};
             if(Contents().Count!=0 || !absent)throw new InvalidOperationException("Default loadout not irreversibly stripped");
+            // Candidate actuator has not passed the physical promotion gate.
+            if(traversalBench)EnsureTraversal();
             recipe=ReadRecipe("stonehatchet");if(recipe==null || !recipe.Known || recipe.Workbench!=0 || recipe.Ingredients.Count!=2 || !recipe.Ingredients.Any(i=>i.Shortname=="wood") || !recipe.Ingredients.Any(i=>i.Shortname=="stones"))throw new InvalidOperationException("Loaded recipe unsupported");
             if(firstHome)PrepareHome();
             if(mode=="RESTORE"){Restore();return;}
@@ -270,7 +274,7 @@ namespace Oxide.Plugins
             if(melee==null)throw new InvalidOperationException("Starter rock BaseMelee missing");
             CraftGuard("stonehatchet","MISSING_INGREDIENTS");CraftGuard("rustbots.invalid.recipe","RECIPE_UNAVAILABLE");CraftGuard("rifle.ak","WORKBENCH_REQUIRED");
             previous=npc.transform.position;previousTime=Time.realtimeSinceStartup;deadline=previousTime+(firstHome?(homeSmoke?HomeSmokeSeconds:HomeJourneySeconds):900);Sample(previousTime);active=true;
-            if(homeSmoke){HomeIssueFixture();StartCraft();}else Discover();
+            if(homeSmoke){HomeIssueFixture();if(traversalBench)TraversalBegin();else StartCraft();}else Discover();
         }
         private bool Ground(Vector3 p,out Vector3 foot,bool clear=true) {
             foot=p;RaycastHit hit;
@@ -312,7 +316,7 @@ namespace Oxide.Plugins
                 float a=i*Mathf.PI/4,r=i<8?1.4f:i<16?1.8f:2.2f;var p=e.transform.position+new Vector3(Mathf.Cos(a),0,Mathf.Sin(a))*r;p.y=TerrainMeta.HeightMap.GetHeight(p);
                 NavMeshHit hit;Vector3 foot;var path=new RustNavMeshPath();
                 if(agent.SamplePosition(p,out hit,0.7f,false) && Ground(hit.position,out foot) && Vector3.Distance(foot,e.transform.position)<=Mathf.Min(2.3f,melee.maxDistance+0.25f) &&
-                    agent.CalculatePath(foot,path) && path.status==NavMeshPathStatus.PathComplete && path.GetPathLength()<=500){position=foot;return true;}
+                    CalculateRoute(foot,path) && path.status==NavMeshPathStatus.PathComplete && path.GetPathLength()<=500){position=foot;return true;}
             }position=Vector3.zero;return false;
         }
         private bool Reach(out float distance) {
@@ -341,7 +345,7 @@ namespace Oxide.Plugins
             }Finish("PARTIAL","Natural reachable "+need+" unavailable");
         }
         private void StartLeg() {
-            var path=new RustNavMeshPath();if(!agent.CalculatePath(goal,path) || path.status!=NavMeshPathStatus.PathComplete) {
+            var path=new RustNavMeshPath();if(!CalculateRoute(goal,path) || path.status!=NavMeshPathStatus.PathComplete) {
                 if(economy){RejectRoute("GOAL_PATH",new {Status=path.status.ToString()});return;}
                 throw new InvalidOperationException("Incomplete natural-source route");
             }
@@ -354,7 +358,7 @@ namespace Oxide.Plugins
                 NavMeshHit hit;var local=new RustNavMeshPath();
                 bool sampled=agent.SamplePosition(candidate,out hit,economy?2.5f:1f,false);
                 bool grounded=sampled && Ground(hit.position,out foot);
-                bool complete=grounded && agent.CalculatePath(foot,local) && local.status==NavMeshPathStatus.PathComplete && (!economy || local.GetPathLength()<=80);
+                bool complete=grounded && CalculateRoute(foot,local) && local.status==NavMeshPathStatus.PathComplete && (!economy || local.GetPathLength()<=80);
                 if(complete){chosen=true;break;}
                 reason=!sampled?"NAV_SAMPLE":!grounded?"GROUND":"LOCAL_PATH";
                 detail=new {Candidate=Point(candidate),Length=length,Sampled=sampled,Grounded=grounded,LocalStatus=local.status.ToString()};
@@ -365,18 +369,21 @@ namespace Oxide.Plugins
                 throw new InvalidOperationException("Local natural route unavailable");
             }
             legStart=progress=npc.transform.position;target=foot;legTime=progressTime=Time.realtimeSinceStartup;repaths=0;
-            speedBefore=agent.speed;agent.isStopped=false;if(!agent.SetDestination(target))throw new InvalidOperationException("SetDestination rejected");
-            // Installed native ResetPath clears speed; re-arm AFTER every SetDestination.
-            agent.speed=3;issuedSpeed=agent.speed;navigating=true;
+            speedBefore=agent.speed;
+            if(localMotion!=null){if(!IssueTraversal(target,"OUTDOOR_RESOURCE"))throw new InvalidOperationException("Checked local route rejected: "+localMotion.Reason);traversalOutdoor=true;issuedSpeed=agent.walkSpeed;}
+            else{agent.isStopped=false;if(!agent.SetDestination(target))throw new InvalidOperationException("SetDestination rejected");agent.speed=3;issuedSpeed=agent.speed;}
+            navigating=true;
         }
         private void RejectRoute(string reason,object detail) {
             // Reuse Survival's bounded source rejection; never debit an unreachable source.
             Log("ROUTE_REJECT",new {SourceId=sourceId,Reason=reason,Detail=detail,Discoveries=discoveries});
             rejected.Add(sourceId);navigating=false;agent.isStopped=true;
+            if(localMotion!=null)localMotion.Stop("SOURCE_ROUTE_REJECTED");
             source=null;dispenser=null;pool=null;state.Goal="NEED_RESOURCE";Discover();
         }
         private void Sample(float time) { samples.Add(new {Time=time,Position=Point(npc.transform.position),ActorNetId=Id(npc),ActiveUid=npc.GetActiveItem()==null?null:npc.GetActiveItem().uid.Value.ToString(),Speed=agent.speed,PathStatus=agent.pathStatus.ToString(),HasPath=agent.hasPath}); }
         private void Tick() {
+            if(TraversalTick())return;
             if(firstHome && HomeTick())return;
             if(npc.IsDestroyed)throw new InvalidOperationException("Avatar destroyed");float now=Time.realtimeSinceStartup;
             if(mode=="RESTORE" || state.Goal=="EQUIP") {
@@ -395,15 +402,19 @@ namespace Oxide.Plugins
             if(homeGather && HomeSwitchGatherTool())return;
             if(npc.GetActiveItem()!=(homeGather?homeGatherTool:rock) || npc.GetHeldEntity()!=melee)throw new InvalidOperationException("Real gathering tool selection lost");
             if(navigating) {
+                if(localMotion!=null && localMotion.Blocked)throw new InvalidOperationException("Checked local movement blocked: "+localMotion.Reason);
                 float distance=Vector3.Distance(npc.transform.position,target);
                 if(distance<=1.05f) {
                     legs.Add(new {Status="ARRIVED",SourceId=sourceId,Start=Point(legStart),End=Point(npc.transform.position),Target=Point(target),StartTime=legTime,EndTime=now,Planned="PathComplete",Arrival=agent.pathStatus.ToString(),HasPath=agent.hasPath,Remaining=agent.remainingDistance,SpeedBefore=speedBefore,IssuedSpeed=issuedSpeed,Repaths=repaths});navigating=false;
                     if(Vector3.Distance(npc.transform.position,goal)>1.05f){StartLeg();return;}
                     state.Goal="GATHER";nextAction=now;return;
                 }
-                if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("Route lost before arrival");
+                if(localMotion==null){if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("Route lost before arrival");}
+                else if(!localMotion.Active && !localMotion.Arrived)throw new InvalidOperationException("Checked route lost before arrival");
                 if(Vector3.Distance(progress,npc.transform.position)>=1){progress=npc.transform.position;progressTime=now;}
-                if(now-progressTime>=10){if(repaths++>=1)throw new InvalidOperationException("Avatar stuck after bounded repath");if(!agent.SetDestination(target))throw new InvalidOperationException("Repath rejected");agent.speed=3;progressTime=now;}
+                if(now-progressTime>=10){if(repaths++>=1)throw new InvalidOperationException("Avatar stuck after bounded repath");
+                    if(localMotion!=null){if(!IssueTraversal(target,"OUTDOOR_RESOURCE_REPATH"))throw new InvalidOperationException("Repath rejected");}
+                    else{if(!agent.SetDestination(target))throw new InvalidOperationException("Repath rejected");agent.speed=3;}progressTime=now;}
                 return;
             }
             if(now>=nextAction){nextAction=now+Mathf.Max(1,melee.repeatDelay);Harvest();}
@@ -687,6 +698,8 @@ namespace Oxide.Plugins
         }
         private void Finish(string status,string reason) {
             if(finished)return;finished=true;active=false;
+            StopTraversal("RESULT_"+status);
+            if(traversalBench)TraversalSceneEnd("NOT_PROVEN",reason);
             if(firstHome && !homeSmoke && status=="PARTIAL" && homeUpkeep!=null && homeIntent==null && !saved && equipmentChecks>=3) {
                 try{if(Activate(product.uid))Save();}catch(Exception ex){Log("HOME_CHECKPOINT_REFUSED",ex.Message);}
             }
@@ -698,13 +711,14 @@ namespace Oxide.Plugins
                 EquipmentChecks=equipmentChecks,Recipe=recipe,Craft=craft,Harvests=harvests,Negatives=negatives,Samples=samples,Legs=legs,TotalTraveled=total,
                 RestoreAudit=restoreAudit,EquipmentSamples=equipmentSamples,
                 FirstHome=HomeResult(),
+                Traversal=TraversalResult(),CheckedPositionWrites=localMotion==null?0:localMotion.Actuations,
                 Economy=economy?new {WorldKey=economyState==null?null:economyState.WorldKey,World=currentWorld,MapKey=currentWorld==null?null:currentWorld.MapKey(),State=economyState,InputSnapshotHealth=restoreInputHealth,Replays=sourceReplays,CraftReplay=economyReplay,
                     JournalSHA256=File.Exists(Data("economy.journal"))?RustBots.EconomyJournal.HashBytes(File.ReadAllBytes(Data("economy.journal"))):null,CrashAtomic="NOT_PROVEN",CrashRecovery="OFFLINE_ONLY"}:null,
                 Persistence=new {Saved=saved,Restored=restored,SourcePools=economy?"BOUNDED_DISK_INCARNATION":"NOT_IMPLEMENTED",CrashJournal=economy?"FAIL_CLOSED":"NOT_IMPLEMENTED"},Conservation=new {Ok=status=="GREEN" || firstHome && saved && !economicFailure,EconomicFailure=economicFailure}};
             File.WriteAllText(Data("result.json")+".tmp",JsonConvert.SerializeObject(result,Formatting.Indented));File.Move(Data("result.json")+".tmp",Data("result.json"));
             Puts("RUSTBOTS_RESULT "+(firstHome?JsonConvert.SerializeObject(new {RunId=token,Status=status,Reason=reason,Mode=mode,ResultFile=Data("result.json"),FullEvidenceInFile=true}):JsonConvert.SerializeObject(result)));
         }
-        private void Cleanup() { if(npc!=null && !npc.IsDestroyed){npc.UpdateActiveItem(default(ItemId));npc.inventory.Strip();npc.Kill();}npc=null; }
+        private void Cleanup() { StopTraversal("CLEANUP");if(npc!=null && !npc.IsDestroyed){npc.UpdateActiveItem(default(ItemId));npc.inventory.Strip();npc.Kill();}npc=null; }
         private void Unload() { Cleanup();if(journal!=null)journal.Dispose(); }
     }
 }
