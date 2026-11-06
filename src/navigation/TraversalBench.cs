@@ -13,6 +13,7 @@ namespace RustBots.Navigation
         }
         internal static ObstacleTraversal.TraversalClock ReadNativeClock(long observedSequence) {
             return new ObstacleTraversal.TraversalClock {
+                ClockPolicy=ObstacleTraversal.ClockPolicy,
                 WallTime=Time.realtimeSinceStartupAsDouble,FixedTime=Time.fixedTimeAsDouble,
                 FixedUnscaledTime=Time.fixedUnscaledTimeAsDouble,Delta=Time.fixedDeltaTime,
                 UnscaledDelta=Time.fixedUnscaledDeltaTime,TimeScale=Time.timeScale,MaximumDelta=Time.maximumDeltaTime,
@@ -183,17 +184,9 @@ namespace Oxide.Plugins
             if((string)frame["Event"]=="MOTION_WITNESS" && (string)frame["NativeResult"]=="OBSERVED") {
                 traversalAcceptedWitnesses++;traversalLastAcceptedWitness=frame;traversalLastWitnessNativeVelocity=npc.GetComponent<Rigidbody>().linearVelocity;
             }
-            object speed,acceleration,failure;
-            frame.TryGetValue("Speed",out speed);frame.TryGetValue("Acceleration",out acceleration);frame.TryGetValue("NativeAdmissionFailure",out failure);
-            // C retains the complete dictionary before invoking this sink; the
-            // final primary file contains every vector/cast/route/recovery row.
-            // Console JSON is a compact progress journal, avoiding duplicate
-            // full-frame allocations and console I/O inside the physics budget.
-            Log("TRAVERSAL",new {ConsolePolicy="COMPACT_CONSOLE_FULL_PRIMARY_V1",FullEvidenceInFile=true,
-                Event=frame["Event"],Command=frame["Command"],Stage=frame["Stage"],Time=frame["Time"],Tick=frame["Tick"],
-                Reason=frame["Reason"],NativeResult=frame["NativeResult"],Classification=frame["Classification"],
-                Speed=speed,Acceleration=acceleration,Clock=frame["Clock"],WallTelemetry=frame["WallTelemetry"],
-                Casts=frame["Casts"],QueryMilliseconds=frame["QueryMilliseconds"],NativeAdmissionFailure=failure});
+            // C already retains this complete dictionary, including mutations
+            // above and finally-recorded sink times. Optional console JSON/Puts
+            // must not block the checked physics callback; primary is authoritative.
         }
         private bool CalculateRoute(Vector3 destination,RustNavMeshPath path) {
             return localMotion==null?agent.CalculatePath(destination,path):agent.CalculatePath(new NavVector3(npc.transform.position),new NavVector3(destination),path);
@@ -217,7 +210,7 @@ namespace Oxide.Plugins
                 Start=Time.realtimeSinceStartupAsDouble,GlobalDeadline=deadline,Maximum=localMotion.NativeMaximumDeltaTime,BaseActuations=localMotion.Actuations,BodyKey=traversalWarmupBodyKey};
             if(w.Start>w.GlobalDeadline)return false;
             w.Contract=new {Start=w.Start,Position=Point(position),Body=body,NativeMaximumDelta=w.Maximum,MaxSeconds=20,MinWindowSeconds=2,MaxSamples=512,
-                NativeReadinessPolicy="NATIVE_NEW_GOAL_READINESS_V1",
+                NativeReadinessPolicy="NATIVE_NEW_GOAL_READINESS_V1",ClockPolicy=RustBots.Navigation.ObstacleTraversal.ClockPolicy,
                 GlobalDeadline=w.GlobalDeadline,Goal=Point(destination),Stage=stage,BaseActuations=w.BaseActuations,IssuedCommands=traversalIssuedCommands,AcceptedWitnesses=traversalAcceptedWitnesses,
                 MotorActive=localMotion.Active,MotorBlocked=localMotion.Blocked,MotorArrived=localMotion.Arrived,Velocity=Point(velocity),PriorRest=prior};
             traversalDestinations.Add(w);traversalDestination=w;return true;
@@ -229,7 +222,7 @@ namespace Oxide.Plugins
             traversalWarmupPose=npc.transform.position;
             var body=TraversalWarmupBody();traversalWarmupBodyKey=JsonConvert.SerializeObject(body);traversalWarmupMaximum=localMotion.NativeMaximumDeltaTime;
             traversalWarmupContract=new {Start=traversalWarmupStart,Position=Point(traversalWarmupPose),Body=body,NativeMaximumDelta=traversalWarmupMaximum,
-                MaxSeconds=20,MinWindowSeconds=2,MaxSamples=512};
+                MaxSeconds=20,MinWindowSeconds=2,MaxSamples=512,ClockPolicy=RustBots.Navigation.ObstacleTraversal.ClockPolicy};
         }
         private object TraversalWarmupBody() {
             var body=npc.GetComponent<Rigidbody>();
@@ -244,13 +237,14 @@ namespace Oxide.Plugins
             if(double.IsNaN(clock.WallTime) || double.IsInfinity(clock.WallTime) || double.IsNaN(clock.FixedTime) || double.IsInfinity(clock.FixedTime) ||
                 double.IsNaN(clock.FixedUnscaledTime) || double.IsInfinity(clock.FixedUnscaledTime) || !HomeFinite(clock.Delta) ||
                 clock.WallTime<start || clock.WallTime>observed || observed-clock.WallTime>0.1 || clock.FixedTime<0 || clock.FixedUnscaledTime<0 || clock.Sequence<=0 || clock.Frame<0 ||
-                !clock.InFixedStep || clock.PhysicsMode!="FixedUpdate" || clock.TimeScale!=1 || clock.Delta<=0 || clock.Delta>0.1f || clock.UnscaledDelta!=clock.Delta ||
+                !clock.InFixedStep || clock.PhysicsMode!="FixedUpdate" || clock.TimeScale!=1 || clock.Delta<=0 || clock.Delta>0.1f ||
+                clock.ClockPolicy!=RustBots.Navigation.ObstacleTraversal.ClockPolicy || !HomeFinite(clock.UnscaledDelta) || clock.UnscaledDelta<=0 || clock.UnscaledDelta>0.1f ||
                 !HomeFinite(clock.MaximumDelta) || clock.MaximumDelta<clock.Delta || clock.MaximumDelta!=maximum || clock.MaximumDelta!=Time.maximumDeltaTime)return "CLOCK_ENVELOPE";
             if(previous.HasValue) {
                 var before=previous.Value;double gap=clock.WallTime-before.WallTime;
                 if(gap<0 || gap>1.500001 || clock.MaximumDelta!=before.MaximumDelta || clock.Sequence!=before.Sequence+1 || clock.Frame<before.Frame ||
                     clock.Delta!=before.Delta || Math.Abs(clock.FixedTime-before.FixedTime-before.Delta)>0.000001 ||
-                    Math.Abs(clock.FixedUnscaledTime-before.FixedUnscaledTime-before.UnscaledDelta)>0.000001)return "CLOCK_CONTINUITY";
+                    Math.Abs(clock.FixedUnscaledTime-before.FixedUnscaledTime-clock.UnscaledDelta)>0.000001)return "CLOCK_CONTINUITY";
             }
             return null;
         }
@@ -326,7 +320,7 @@ namespace Oxide.Plugins
             var handoff=RustBots.Navigation.TraversalDriver.ReadNativeClock(clock.Sequence);
             position=npc.transform.position;velocity=npc.GetComponent<Rigidbody>().linearVelocity;body=TraversalWarmupBody();
             bool valid=accepted && handoff.WallTime>=commitEnd && handoff.WallTime<=w.Start+20 && handoff.WallTime<=w.GlobalDeadline && handoff.WallTime-clock.WallTime<=0.1 && handoff.Sequence==clock.Sequence && handoff.Frame==clock.Frame &&
-                handoff.FixedTime==clock.FixedTime && handoff.FixedUnscaledTime==clock.FixedUnscaledTime && handoff.Delta==clock.Delta && handoff.UnscaledDelta==clock.UnscaledDelta &&
+                handoff.ClockPolicy==clock.ClockPolicy && handoff.FixedTime==clock.FixedTime && handoff.FixedUnscaledTime==clock.FixedUnscaledTime && handoff.Delta==clock.Delta && handoff.UnscaledDelta==clock.UnscaledDelta &&
                 handoff.TimeScale==clock.TimeScale && handoff.MaximumDelta==clock.MaximumDelta && handoff.InFixedStep==clock.InFixedStep && handoff.PhysicsMode==clock.PhysicsMode &&
                 TraversalStationaryClockProblem(handoff,Time.realtimeSinceStartupAsDouble,w.Start,w.Maximum,null)==null &&
                 TraversalExactPose(position,w.Position) && TraversalExactZero(velocity) && JsonConvert.SerializeObject(body)==w.BodyKey && localMotion.Actuations==w.BaseActuations;
@@ -466,7 +460,7 @@ namespace Oxide.Plugins
                 TraversalSceneEnd("PASSED","Observed supported exterior detour around paid native wall");
                 traversalG4Complete=true;
                 TraversalFixtureTransition("G4_COMPLETE_RESUME_HOME","TC");
-                TraversalFixtureMove(traversalDoorStand,"FIXTURE_HOME_RETURN");return true;
+                traversalPhase="HOME";homePhase="BUILD_WAIT";homeWait=now;homeTilesDeadline=now+30;homeTilesPending=false;return true;
             }
             bool up=traversalPhase=="OUTDOOR_UP";
             float delta=npc.transform.position.y-traversalSceneStart.y;
@@ -652,6 +646,10 @@ namespace Oxide.Plugins
             var nav=RustNavigation.Instance;bool navigationReady=nav!=null && nav.DefaultNavmesh!=null && nav.IsDefaultNavmeshBuilt() && !nav.HasPendingTiles() && agent.isOnNavMesh;
             traversalFoundationAdmission["NavigationReady"]=navigationReady;
             if(!navigationReady)throw new InvalidOperationException("Native foundation build readiness changed before payment");
+            object traffic;
+            bool trafficClear=RustBots.Navigation.ObstacleTraversal.ObserveTraffic(homeSite,homeSite,5,npc,0,out traffic);
+            traversalFoundationAdmission["DynamicSite"]=traffic;
+            if(!trafficClear)throw new InvalidOperationException("Foundation dynamic occupancy changed before payment");
             TraversalRequireFoundationRest();double gate=Time.realtimeSinceStartupAsDouble;traversalFoundationAdmission["GateTime"]=gate;
             if(gate-(double)traversalFoundationAdmission["StartedWall"]>0.5)throw new InvalidOperationException("Foundation prepay admission budget exceeded");
             traversalFoundationAdmission["PrepayAccepted"]=true;traversalFoundationAdmission["Accepted"]=true;Log("TRAVERSAL_FOUNDATION_ADMISSION",traversalFoundationAdmission);
@@ -834,9 +832,10 @@ namespace Oxide.Plugins
         }
         private object TraversalResult() {
             return localMotion==null?null:new {Schema=1,Mode=traversalBench?"TRAVERSAL_BENCH":"SHARED_RUNTIME",World=(currentWorld??ReadCurrentWorld()).WorldKey(),
+                SourceSnapshotConsolePolicy="PRIMARY_ONLY_FIXED_CALLBACK_V1",
                 Frames=localMotion.Evidence,Scenes=traversalScenes,Actuations=localMotion.Actuations,Components=traversalComponents,Warmup=traversalWarmupReceipt,SpawnSupport=traversalSpawnSupport,
                 WarmupPolicy="STATIONARY_CLOCK_WINDOW_V1",WarmupContract=traversalWarmupContract,WarmupObservations=traversalWarmupObservations,WarmupObservationCount=traversalWarmupObservations.Count,
-                Order="OWNED_NATIVE_TEST_FIXTURE",SequencePolicy="G4_PRIORITY_V1",DestinationPolicy="STATIONARY_DESTINATION_WINDOW_V1",
+                Order="OWNED_NATIVE_TEST_FIXTURE",SequencePolicy="G4_PRIORITY_V1",DestinationPolicy="STATIONARY_DESTINATION_WINDOW_V1",TrafficPolicy="OBSERVED_TRAFFIC_V1",
                 DestinationReadinessPolicy="NATIVE_NEW_GOAL_READINESS_V1",
                 DestinationWindows=traversalDestinations.Select(w=>new {w.Id,w.Stage,Goal=Point(w.Goal),w.BaseActuations,w.Outcome,w.EndWall,w.Reason,w.SetDestinationCalls,Contract=w.Contract,
                     Observations=w.Observations,ObservationCount=w.Observations.Count,Receipt=w.Receipt,Commit=w.Commit,Handoff=w.Handoff}).ToArray(),

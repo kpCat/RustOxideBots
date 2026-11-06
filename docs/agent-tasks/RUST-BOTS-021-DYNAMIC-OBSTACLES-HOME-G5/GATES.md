@@ -1,0 +1,11 @@
+# Gates — positive progress without cheating / no artificial launch cap
+
+- **G0:** exact public/local/tracking master check, `AGENTS`, owner 3086-SHA/protected baseline, private source/runtime/historical history, no foreign Rust/Steam PID. Private physical test installations, Job Object, firewall, no writable links.
+- **G1:** inspect Wolf2 START10 actual original witness/issue + source, installed API/IL, native dynamic classification. Pseudohistorical "wolf moved" is UNKNOWN unless actual two-pose data. Offline intentional negative + full Test-All/C#7.3/independent review before live.
+- **G2:** fresh diagnostic native paid minimal fixture with dynamic-cleared legal site and native original Item costs/owner; same real body. Do NOT rerun lengthy 018 outdoor positive regression as a target.
+- **G3:** native G5 physical continuation: TC auth/CanBuild, Wood upkeep≥60 min, remaining 3 Wood structural pieces, exactly 8 roles, native open Door, continuous body IN→TC→OUT and Door.Close. No access through physical lip collision and no G5 on partial structure.
+- **G4 regression (if source changed):** full named wall/closed Door read-only PROBE_REFUSED, no actuation, independent short physical exterior detour, full validation. 020 G4 can be cited historically only with matching invariants; if no new proof after changed motor, no overall GREEN.
+- **G5 terminal:** `G5_DIAGNOSTIC_HOME_GREEN` if complete private fixture, `GREEN_TRAVERSAL_CORE` only if new G5+fully valid G4/018 proof and identical/source-compatible core. Neither implies NATURAL/RESTORE nor default enablement. `PARTIAL/G5_COLLIDER` when unproven, `PARTIAL/DYNAMIC_UNSAFE` for new animals, or `BLOCKED_ENGINE` only on actual fundamental barrier.
+- **G6:** original raw audit+safe-prefix independent validation, Test-All, installed compiler/live Oxide, owner/historical hash 0 deltas, privacy+2 separate Cyrillic checks, exact-path ordinary push+clean remote. Every individual live run safe cleanup.
+
+**No fixed 3/5-start ceiling in021** following explicit owner's 020 override; nonetheless every restart requires distinct material finding/repair plus prelive evidence and no repeated unchanged failure. Native crash/unsafe contact ends its current run and is never relabeled PASS. Codex autonomously controls scripts and fresh tests; no indefinite series of ungrounded reruns.

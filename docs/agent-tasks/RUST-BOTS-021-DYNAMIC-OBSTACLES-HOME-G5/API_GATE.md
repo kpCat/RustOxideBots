@@ -1,0 +1,11 @@
+# Installed API and source gates
+
+Read **installed version**, not guesses. 020 report says installed Assembly-CSharp SHA256 `04FB89520F18A1920C1B1A350B82DD24A4258F31D97B82496971A9CC7A49DCB7`, Unity PhysicsModule `8C14EB5CB74477ABBD1F043F26D9A4E58BB3E4ED7DDA1B81937E59D08967EA11`; verify actual files. C#7.3/PS5.1. No packages or server upgrade.
+
+- Native animal identification: use real installed `BaseCombatEntity`, `BaseAnimalNPC`, `NPCPlayer`, `BaseVehicle`, `Collider.GetComponentInParent<>`, entity `PrefabName`, networkable ID, authoritative transform/velocity properties **where present**, `Collider.bounds`, `isTrigger`, `attachedRigidbody`. A collider may be in an NPC without attached Rigidbody; don't falsely classify as STATIC.
+- Unity: `Physics.OverlapCapsule`, `ComputePenetration`, `CapsuleCastAll`, `SphereCastAll`, `Time.fixedTimeAsDouble`, actual `FixedUpdate` and `Rigidbody.MovePosition` semantics. A dynamic obstacle can move between precheck and next physics witness; cannot claim deterministic collision-free travel based only on initial sample.
+- RustNav: committed exact mesh, actor `CalculatePath`, polyRefs/corners, `IsValidPolyRef`, TileChangeVersion/TileDataVersion, global `HasPendingTiles`, installed `BuildParams`; never fabricate route-local pending. Preserve current 019 `NATIVE_CURRENT_ROUTE_V1` and 020 recovery/epoch series/strict timing.
+- Native building: `Planner.DoBuild` (actual `Construction.Target`), loaded `Construction.CostToBuild`/Wood upgrade payment, native `BuildingPrivlidge`, `Door.SetOpen`, `GetProtectedMinutes(true)`, owner+permissions, socket stability, `HomeRebuildAtRest` bench synchronous boundary, real native oil/surface/road/site gate.
+- Snapshot the actual source/variant of `TRAVERSAL_PRIMARY_REFERENCE_V1` and `Read-ProbeReportNavigation` without large recursive JSON. START10 reference derivative is not native success; originals immutable.
+
+**Document `API_DECISION.md`:** for each claimed method/signature: installed DLL evidence (STATIC), offline fixture (OFFLINE_ONLY), native run (LIVE), uncertainty (UNKNOWN). If future dynamic-collision safe handling would need a different motor or physics group policy, stop for **owner architecture decision** before modifying C. Existing source guard/physics constraints remain absolute.

@@ -305,6 +305,8 @@ namespace Oxide.Plugins
                 // Reject every above-ground collider, including natural resources. Never delete it to fit.
                 int collisions=Physics.OverlapBox(p+Vector3.up*1.6f,new Vector3(2.5f,1.45f,2.5f),rot,Physics.DefaultRaycastLayers,QueryTriggerInteraction.Ignore).Count(c=>c.GetComponentInParent<BaseEntity>()!=npc);
                 if(collisions!=0)reasons.Add("COLLISION");
+                object dynamicSite=null;
+                if(traversalBench && !RustBots.Navigation.ObstacleTraversal.ObserveTraffic(p,p,5,npc,0,out dynamicSite))reasons.Add("DYNAMIC_SITE_OCCUPIED");
                 var privilege=npc.GetBuildingPrivilege(siteObb,false,1f,null,false);bool permission=npc.CanBuild(siteObb,false);
                 if(privilege!=null || !permission)reasons.Add("BUILD_PERMISSION_OR_FOREIGN_TC");
                 var path=new RustNavMeshPath();bool complete=false;float pathLength=0,travelSeconds=0,remaining=deadline-Time.realtimeSinceStartup,reserve=homePhase=="SITE_SEARCH" && !homeSmoke?HomeGatherReserve:HomeBuildReserve;
@@ -319,12 +321,12 @@ namespace Oxide.Plugins
                 }
                 homeAdmissionReason=string.Join(",",reasons.ToArray());
                 if(reasons.Count!=0){homeSites.Add(new {Phase=homePhase,Candidate=Point(p),Reasons=reasons,PathLength=pathLength,TravelSeconds=travelSeconds,DeadlineRemaining=remaining,PhaseReserve=reserve,HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,Water=water,Topology=topology,NativePreview=nativePreview,Sampled=sampled,Path=path.status.ToString(),Complete=complete,Collisions=collisions,
-                    MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,ForeignId=Id(nearest),ForeignType=nearest==null?null:nearest.GetType().Name,PrivilegeId=Id(privilege),RoadDistance=roadDistance});return false;}
+                    MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,ForeignId=Id(nearest),ForeignType=nearest==null?null:nearest.GetType().Name,PrivilegeId=Id(privilege),RoadDistance=roadDistance,DynamicSite=dynamicSite});return false;}
                 homeSite=p;homeRotation=rot;homeOutside=foot;
                 homeSiteReceipt=new {Position=Point(p),Rotation=new[] {rot.x,rot.y,rot.z,rot.w},HeightRange=max-min,FoundationDepth=depth,EntryDelta=entryDelta,OutsideDelta=outsideDelta,NativePreview=nativePreview,
                     Water=false,Topology=topology,ForbiddenTopology=deny,Monument=false,Road=false,Foreign=false,Collision=false,Permission=true,Path=path.status.ToString(),
                     MonumentOriginDistance=monumentOrigin,MonumentBoundsDistance=monumentBounds,PreventBuilding=preventBuilding,ForeignDistance=foreignDistance,RoadDistance=roadDistance,
-                    PrivilegeChecked=true,PermissionCached=false,PrivilegeId=Id(privilege),PathLength=pathLength,TravelSeconds=travelSeconds,DeadlineRemaining=remaining,PhaseReserve=reserve,SearchLimit=HomeSearchLimit,SearchIndex=homeSearchIndex};
+                    PrivilegeChecked=true,PermissionCached=false,PrivilegeId=Id(privilege),PathLength=pathLength,TravelSeconds=travelSeconds,DeadlineRemaining=remaining,PhaseReserve=reserve,SearchLimit=HomeSearchLimit,SearchIndex=homeSearchIndex,DynamicSite=dynamicSite};
                 Log("HOME_SITE",homeSiteReceipt);return true;
         }
         private void HomeSurface(Vector3 p,Quaternion rotation,out float min,out float max,out bool water) {

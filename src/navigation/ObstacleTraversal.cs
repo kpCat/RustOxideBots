@@ -19,7 +19,7 @@ namespace RustBots.Navigation
             public double WallTime, FixedTime, FixedUnscaledTime;
             public float Delta, UnscaledDelta, TimeScale, MaximumDelta;
             public bool InFixedStep;
-            public string PhysicsMode;
+            public string PhysicsMode, ClockPolicy;
             public long Sequence;
             public int Frame;
         }
@@ -27,6 +27,7 @@ namespace RustBots.Navigation
         private const int Mask = -1, MaxEvidence = 16384, MaxCasts = 64;
         private const float Numerical = 0.001f, MaxTick = 0.1f, MaxAcceleration = 4f;
         private const double ClockPrecision = 0.000001;
+        public const string ClockPolicy = "NATIVE_FIXED_INTERVAL_V1";
         private const string NativeAdmissionPolicy = "NATIVE_CURRENT_ROUTE_V1";
         private const string RecoveryPolicy = "MEASURED_BRAKE_V1";
         private const int MaxBrakeSteps = 8;
@@ -185,6 +186,20 @@ namespace RustBots.Navigation
         private object brakeReceipt;
         private bool diagnosticRecoveryQueued;
         private long diagnosticRecoverySequence;
+        private const string TrafficPolicy = "OBSERVED_TRAFFIC_V1";
+        private FrozenStationaryBody trafficRestBody;
+        private FrozenStationaryBody witnessedRestBody;
+        private double trafficWaitStarted;
+        private int trafficObservations, trafficClearSamples;
+        private int trafficWaitAttempts;
+        private long trafficClearSequence;
+        private Vector3 trafficClearFrom, trafficClearTo;
+        private sealed class StaticContactScreen
+        {
+            public float Limit;
+            public bool Contact, OnlyStatic;
+            public object Row;
+        }
 
         private sealed class SupportResult
         {
@@ -194,6 +209,7 @@ namespace RustBots.Navigation
             public float Length, Distance, FootY, Gap, PlaneClearance;
             public string Kind = "SURFACE";
             public object EdgeSource, EdgeTop;
+            public List<object> RejectedEdges;
             public object[] Hits = new object[0];
         }
 
@@ -229,7 +245,10 @@ namespace RustBots.Navigation
                 NavClimb = build.agentMaxClimb, NavSlope = build.agentMaxSlope, NavRadius = build.agentRadius,
                 NavHeight = build.agentHeight, NativeStepCeiling = BaseNavigator.maxStepUpDistance,
                 Capability = "CUSTOM_CHECKED_CONTROLLER_NOT_NATIVE_STEP_PROOF", NativeAdmissionPolicy = NativeAdmissionPolicy, FinalVelocityPolicy = "NATIVE_POST_SINK_VELOCITY_V1",
-                EpochRevalidationPolicy = "SAME_COMMITTED_ROUTE_EPOCH_V2", StationaryReplanPolicy = "MEASURED_STATIONARY_NATIVE_V1" };
+                EpochRevalidationPolicy = "SAME_COMMITTED_ROUTE_EPOCH_V2", StationaryReplanPolicy = "MEASURED_STATIONARY_NATIVE_V1",
+                TrafficPolicy = TrafficPolicy, FinalPhysicalPolicy = "POST_SINK_PHYSICAL_V1",
+                StaticScreenPolicy = "STATIC_CONTACT_SPEED_HINT_V2", EdgeDiagnosticsPolicy = "STEP_EDGE_REJECTED_RAYS_V1", ClockPolicy = ClockPolicy,
+                StepEdgePolicy = "NATIVE_BOUNDED_BEVEL_V1" };
             agent.isStopped = true; agent.updatePosition = false; agent.updateRotation = false; agent.ResetPath();
             string invalid = BodyProblem();
             if (invalid != null || !Finite(maxStep) || maxStep <= 0 || !Finite(maxSlope) || maxSlope <= 0 ||
@@ -602,7 +621,7 @@ namespace RustBots.Navigation
 
         private bool SetDestinationCore(Vector3 destination, string stage, double? absoluteGlobalDeadline)
         {
-            if (StationaryWaiting) return false; // Reject another intent before any state/budget mutation.
+            if (StationaryWaiting || trafficRestBody != null) return false; // Reject another intent before any state/budget mutation.
             if (pending || unobservedTerminal) { Stop("UNOBSERVED_COMMAND"); return false; }
             if (acquiring) { Stop("ACQUISITION_ALREADY_ACTIVE_OR_FAILED"); return false; }
             if (braking || lastVelocity.sqrMagnitude != 0 || body.linearVelocity.sqrMagnitude != 0) { Stop("DESTINATION_CHANGE_BEFORE_OBSERVED_REST"); return false; }
@@ -618,6 +637,9 @@ namespace RustBots.Navigation
             epochProofAttempts = 0; lastEpochAttemptSequence = 0; epochProofJournal.Clear(); epochProof = null;
             recoveryAttempts = brakeStep = 0; braking = commandBraking = replanAfterRest = false; brakeReceipt = null;
             diagnosticRecoveryQueued = false;
+            trafficRestBody = null; trafficObservations = trafficClearSamples = 0;
+            trafficWaitAttempts = 0;
+            witnessedRestBody = null;
             if (!Finite(destination) || BodyProblem() != null || !Plan(destination))
             { Stop("UNKNOWN_ROUTE_OR_BODY"); return false; }
             supportDirection = Horizontal(route[routeIndex] - lastPosition).normalized;
@@ -665,6 +687,7 @@ namespace RustBots.Navigation
                     frame["PosePrevious"] = P(lastPosition); frame["PosePreviousTime"] = lastTime; frame["ObservedVelocity"] = P(Vector3.zero);
                     sessionBaselineClock = clock; sessionBaselineBody = BodyRow(); sessionBaselineFrozenBody = CaptureStationaryBody();
                     sessionBaselinePosition = actual; sessionBaselineRigidbodyPosition = body.position;
+                    witnessedRestBody = sessionBaselineFrozenBody;
                     Emit("CLOCK_BASELINE", frame);
                     if (!ControlCurrent()) return;
                     lastPosition = actual; lastTime = (float)clock.WallTime; clockReady = true; return;
@@ -696,7 +719,9 @@ namespace RustBots.Navigation
                 frame["ObservedVelocity"] = P((actual - lastPosition) / (float)(currentClock.FixedTime - previousClock.FixedTime));
                 Block(frame, "UNKNOWN", "CLOCK_UNOBSERVED_ACTIVE_HOLD"); return;
             }
-            supportDirection = pending ? Horizontal(commanded - commandFrom).normalized : routeIndex < route.Count ? Horizontal(route[routeIndex] - actual).normalized : Horizontal(destination - actual).normalized;
+            Vector3 horizontalChord = pending ? Horizontal(commanded - commandFrom) : Vector3.zero;
+            supportDirection = horizontalChord.sqrMagnitude > 0 ? horizontalChord.normalized :
+                routeIndex < route.Count ? Horizontal(route[routeIndex] - actual).normalized : Horizontal(destination - actual).normalized;
             var support = Support(actual);
             frame["Support"] = SupportRow(support);
             var overlaps = new List<object>();
@@ -767,6 +792,7 @@ namespace RustBots.Navigation
                 string witnessClockProblem = ClockProblem(currentClock);
                 if (witnessClockProblem != null) { Stop("CLOCK_BEFORE_WITNESS_ACCEPT:" + witnessClockProblem); return; }
                 pending = false; pendingFrame = null;
+                witnessedRestBody = ExactZero(velocity) && ExactZero(body.linearVelocity) ? CaptureStationaryBody() : null;
                 if (sessionGlobalDeadline.HasValue && commandBraking && ExactZero(velocity) && ExactZero(body.linearVelocity) && acceptedBrakeZeroBody == null) {
                     acceptedBrakeZeroBody = CaptureStationaryBody(); acceptedBrakeZeroSession = motionSession; acceptedBrakeZeroCommand = command;
                     acceptedBrakeZeroSequence = currentClock.Sequence;
@@ -884,6 +910,7 @@ namespace RustBots.Navigation
             Vector3 requested = actual;
             SupportResult landing = null;
             bool candidate = false;
+            StaticContactScreen staticScreen = null;
             // Shrink distance, never the body. Each retry is a fresh exact geometry query.
             for (int attempt = 0; attempt < 6; attempt++)
             {
@@ -911,7 +938,26 @@ namespace RustBots.Navigation
                     { horizontalDistance *= Mathf.Max(0f, maxSpeed - Numerical) / velocity.magnitude; continue; }
                     if (SupportedAt(landing, requested) && Mathf.Abs(requested.y - actual.y) <= (requested.y >= actual.y ? maxStep : maxDrop) &&
                         velocity.magnitude <= maxSpeed && (velocity - lastVelocity).magnitude / dt <= MaxAcceleration + Numerical)
-                    { candidate = true; break; }
+                    {
+                        staticScreen = ScreenStaticContact(actual, requested, support, dt);
+                        frame["StaticScreen"] = staticScreen.Row;
+                        if (staticScreen.Contact && !staticScreen.OnlyStatic) {
+                            Obstacle(frame, "DYNAMIC_BLOCKED", "STATIC_SCREEN_NONSTATIC_UNCERTAIN"); return;
+                        }
+                        if (velocity.magnitude > staticScreen.Limit) {
+                            horizontalDistance *= Mathf.Max(0, staticScreen.Limit - Numerical) / velocity.magnitude; continue;
+                        }
+                        var candidateSweeps = new List<object>(); var candidateOverlaps = new List<object>();
+                        bool candidateClear = Sweep(actual, requested, support, candidateSweeps) && Overlaps(requested, landing, candidateOverlaps);
+                        if (!candidateClear) {
+                            frame["Sweeps"] = candidateSweeps.ToArray(); frame["LandingOverlaps"] = candidateOverlaps.ToArray();
+                            if (staticScreen.Contact && staticScreen.OnlyStatic && !dynamicHit && !closedDoorHit &&
+                                !ExactZero(lastVelocity) && LowStaticSpeed(dt)) { requested = actual; candidate = true; break; }
+                            if (!ExactZero(lastVelocity)) { Obstacle(frame, "SOLID_BLOCKED", "STATIC_SHORT_CHORD_REFUSED"); return; }
+                            horizontalDistance *= 0.5f; continue;
+                        }
+                        candidate = true; break;
+                    }
                 }
                 horizontalDistance *= 0.5f;
             }
@@ -926,6 +972,14 @@ namespace RustBots.Navigation
             List<object> overlaps, bool overlapClear, bool permission, float waterDepth, bool hold, bool brakingMotion)
         {
             var frame = Frame(now, actual);
+            StaticContactScreen issueScreen = null;
+            if (!brakingMotion) {
+                issueScreen = ScreenStaticContact(actual, requested, support, dt);
+                frame["StaticScreen"] = issueScreen.Row;
+                if (issueScreen.Contact && !issueScreen.OnlyStatic || (requested - actual).magnitude / dt > issueScreen.Limit + Numerical) {
+                    Obstacle(frame, "SOLID_BLOCKED", "STATIC_SCREEN_CHANGED_BEFORE_ISSUE"); return;
+                }
+            }
             // Rebind the landing measurement to the final commanded pose rather
             // than retaining the exploratory same-height sphere-cast origin.
             var landing = Support(requested);
@@ -935,6 +989,7 @@ namespace RustBots.Navigation
             bool endClear = Overlaps(requested, landing, landingOverlaps);
             string classification = Classify(actual, requested, support, landing);
             frame = Frame(now, actual);
+            if (issueScreen != null) frame["StaticScreen"] = issueScreen.Row;
             frame["From"] = P(actual); frame["Requested"] = P(requested); frame["Support"] = SupportRow(support);
             frame["Landing"] = SupportRow(landing); frame["Sweeps"] = sweeps.ToArray(); frame["Overlaps"] = overlaps.ToArray();
             Conditions(frame, actual, support, overlapClear, permission, waterDepth);
@@ -948,6 +1003,11 @@ namespace RustBots.Navigation
             frame["LandingPermission"] = landingPermission; frame["LandingWaterDepth"] = landingWater;
             frame["LandingSupportAccepted"] = Supported(landing);
             if (brakingMotion) frame["Recovery"] = brakeReceipt;
+            object traffic;
+            CountCast();
+            bool trafficClear = ObserveTraffic(actual, requested, brakingMotion ? skin : skin + lastVelocity.sqrMagnitude / (2f * BrakeAcceleration) + lastVelocity.magnitude * dt,
+                npc, currentClock.Sequence, out traffic);
+            frame["Traffic"] = traffic;
             double probeSinkStarted = Time.realtimeSinceStartupAsDouble;
             Emit("OBSTACLE_PROBE", frame);
             double probeSinkSeconds = Time.realtimeSinceStartupAsDouble - probeSinkStarted;
@@ -957,6 +1017,10 @@ namespace RustBots.Navigation
                 Emit("PHYSICAL_CONTACT", frame);
                 if (!ControlCurrent()) return;
                 Obstacle(frame, closedDoorHit ? "DOOR_CLOSED" : dynamicHit ? "DYNAMIC_BLOCKED" : "SOLID_BLOCKED", "FULL_VOLUME_OR_PERMISSION_BLOCKED"); return;
+            }
+            if (!trafficClear || trafficRestBody != null) {
+                if (brakingMotion) { UnsafeBrake(frame, "DYNAMIC_BRAKE_CORRIDOR_UNCERTAIN"); return; }
+                if (!WaitForTraffic(frame, trafficClear)) return;
             }
             if (Vector3.Distance(actual, requested) < 0.00001f && !hold) { Block(frame, "UNKNOWN", "NO_PROGRESS"); return; }
             if (classification != "CLEAR") { Emit("STEP_ATTEMPT", frame); if (!ControlCurrent()) return; }
@@ -978,6 +1042,7 @@ namespace RustBots.Navigation
             frame["MotionMode"] = hold ? "BRAKE_HOLD" : brakingMotion ? "ACTUAL_BRAKE" : "SUPPORTED_ADVANCE";
             frame["DecisionPublishedWall"] = Time.realtimeSinceStartupAsDouble;
             if (!PublishDecision(frame, actual, requested)) return;
+            if (!FinalPhysicalCurrent(frame, actual, requested, false)) { RejectNativeIntent(frame, "PHYSICAL_OR_TRAFFIC_CHANGED_BEFORE_WRITER"); return; }
             if (!NativeAdmissionCurrent(actual, requested, true)) { RejectNativeIntent(frame, "NATIVE_ROUTE_CHANGED_BEFORE_WRITER"); return; }
             frame["FinalAdmission"] = finalNativeAdmission;
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = classification; commandHold = hold; commandAcquisition = false; commandBraking = brakingMotion;
@@ -992,6 +1057,106 @@ namespace RustBots.Navigation
             lastPosition = actual; lastTime = now;
         }
 
+        private bool LowStaticSpeed(float dt)
+        {
+            var native = body.linearVelocity;
+            if (!Finite(native) || !Finite(lastVelocity) || lastVelocity.magnitude > MaxAcceleration * 0.5f * dt ||
+                native.magnitude > MaxAcceleration * 0.5f * dt || Vector3.Distance(native, lastVelocity) > Numerical) return false;
+            return !ExactZero(lastVelocity) || ExactZero(native) && witnessedRestBody != null && SameStationaryBody(witnessedRestBody);
+        }
+        private StaticContactScreen ScreenStaticContact(Vector3 actual, Vector3 requested, SupportResult support, float dt)
+        {
+            double started = Time.realtimeSinceStartupAsDouble;
+            Vector3 delta = requested - actual, direction = delta.sqrMagnitude > 0 ? delta.normalized : supportDirection;
+            if (!Finite(direction) || direction.sqrMagnitude < 0.99f) throw new InvalidOperationException("STATIC_SCREEN_DIRECTION_UNKNOWN");
+            float acceleration = MaxAcceleration * 0.5f;
+            float span = maxSpeed * maxSpeed / (2f * acceleration) + maxSpeed * dt + skin;
+            var sweeps = new List<object>(); float nearest;
+            Sweep(actual, actual + direction * span, support, sweeps, out nearest, true);
+            bool clear = float.IsPositiveInfinity(nearest);
+            bool onlyStatic = !dynamicHit && !closedDoorHit;
+            float limit = clear ? maxSpeed : acceleration * (Mathf.Sqrt(dt * dt + 2f * Mathf.Max(0, nearest - skin) / acceleration) - dt);
+            bool low = !clear && onlyStatic && LowStaticSpeed(dt);
+            float applied = Mathf.Min(maxSpeed, Mathf.Max(limit, low ? Mathf.Max(0, acceleration * dt - Numerical) : 0));
+            var result = new StaticContactScreen { Limit = applied, Contact = !clear, OnlyStatic = onlyStatic };
+            result.Row = new { Policy = "STATIC_CONTACT_SPEED_HINT_V2", CertifiesFuture = false, From = P(actual), Direction = P(direction),
+                ReferenceSpeed = maxSpeed, ReferenceAcceleration = acceleration, Span = span, StartedWall = started,
+                CompletedWall = Time.realtimeSinceStartupAsDouble, Sequence = currentClock.Sequence, NearestDistance = clear ? (float?)null : nearest,
+                OnlyStatic = onlyStatic, RawLimit = Mathf.Min(maxSpeed, limit), AppliedLimit = applied, LowSpeedEligible = low,
+                NativeVelocity = P(body.linearVelocity),
+                RestBody = low && ExactZero(lastVelocity) ? StationaryBodyRow(witnessedRestBody) : null, Sweeps = sweeps.ToArray() };
+            return result;
+        }
+        private bool WaitForTraffic(Dictionary<string, object> frame, bool clear)
+        {
+            if (!ExactZero(lastVelocity) || !ExactZero(body.linearVelocity) || acquiring || braking) {
+                if (trafficRestBody != null) { Block(frame, "DYNAMIC_BLOCKED", "DYNAMIC_REST_LOST"); return false; }
+                RequestBrake(frame, "DYNAMIC_BLOCKED", "DYNAMIC_UNCERTAIN"); return false;
+            }
+            if (trafficRestBody == null) {
+                if (++trafficWaitAttempts > 1) { Block(frame, "DYNAMIC_BLOCKED", "DYNAMIC_WAIT_EXHAUSTED"); return false; }
+                if (witnessedRestBody == null || !SameStationaryBody(witnessedRestBody)) { Block(frame, "DYNAMIC_BLOCKED", "DYNAMIC_REST_LINEAGE_UNKNOWN"); return false; }
+                trafficRestBody = witnessedRestBody; trafficWaitStarted = currentClock.WallTime;
+                trafficObservations = trafficClearSamples = 0;
+            }
+            if (!SameStationaryBody(trafficRestBody) || !Supported(Support(npc.transform.position)) ||
+                ++trafficObservations > 128 || currentClock.WallTime - trafficWaitStarted > 8 ||
+                sessionGlobalDeadline.HasValue && currentClock.WallTime >= sessionGlobalDeadline.Value) {
+                Block(frame, "DYNAMIC_BLOCKED", "DYNAMIC_WAIT_BOUND_OR_REST_LOST"); return false;
+            }
+            var fromRow = (float[])frame["From"]; var toRow = (float[])frame["Requested"];
+            var from = new Vector3(fromRow[0], fromRow[1], fromRow[2]); var to = new Vector3(toRow[0], toRow[1], toRow[2]);
+            bool same = trafficClearSequence + 1 == currentClock.Sequence && ExactVector(trafficClearFrom, from) && ExactVector(trafficClearTo, to);
+            trafficClearSamples = clear ? same ? trafficClearSamples + 1 : 1 : 0;
+            trafficClearSequence = currentClock.Sequence; trafficClearFrom = from; trafficClearTo = to;
+            frame["TrafficWait"] = new { StartedWall = trafficWaitStarted, Observation = trafficObservations, ClearSamples = trafficClearSamples,
+                MaxSeconds = 8, MaxObservations = 128, Body = StationaryBodyRow(trafficRestBody), NativeVelocity = P(body.linearVelocity),
+                Ready = trafficClearSamples >= 2 };
+            frame["NativeResult"] = "STATIONARY_OBSERVATION"; frame["Reason"] = clear ? "DYNAMIC_CLEAR_OBSERVATION" : "DYNAMIC_UNCERTAIN";
+            var observation = Copy(frame); observation["Command"] = command;
+            Emit("DYNAMIC_WAIT", observation);
+            if (!ControlCurrent()) return false;
+            if (!SameStationaryBody(trafficRestBody) || !ExactZero(body.linearVelocity) || ClockProblem(currentClock) != null) {
+                Block(frame, "DYNAMIC_BLOCKED", "DYNAMIC_WAIT_CHANGED_AFTER_SINK"); return false;
+            }
+            if (trafficClearSamples < 2) return false;
+            trafficRestBody = null;
+            return true; // Per-command fresh native path admission still follows.
+        }
+        private bool FinalPhysicalCurrent(Dictionary<string, object> frame, Vector3 from, Vector3 requested, bool acquisition)
+        {
+            double started = Time.realtimeSinceStartupAsDouble;
+            var support = Support(from); var landing = Support(requested);
+            var overlaps = new List<object>(); var end = new List<object>(); var sweeps = new List<object>();
+            bool clear = Overlaps(from, support, overlaps), swept = Sweep(from, requested, support, sweeps), endpoint = Overlaps(requested, landing, end);
+            bool permission = Permission(from), landingPermission = Permission(requested);
+            float water = WaterLevel.GetWaterSurface(from, true, true, null) - from.y, landingWater = WaterLevel.GetWaterSurface(requested, true, true, null) - requested.y;
+            object traffic; CountCast();
+            bool trafficClear = ObserveTraffic(from, requested, braking || acquisition ? skin : skin + lastVelocity.sqrMagnitude / (2f * BrakeAcceleration) + lastVelocity.magnitude * currentClock.Delta,
+                npc, currentClock.Sequence, out traffic);
+            object brakeTraffic = null; bool brakeClear = true;
+            if (braking) {
+                float required = lastVelocity.sqrMagnitude / (2f * BrakeAcceleration) + lastVelocity.magnitude * currentClock.Delta + skin;
+                CountCast(); brakeClear = ObserveTraffic(from, from + lastVelocity.normalized * (required + Numerical), skin, npc, currentClock.Sequence, out brakeTraffic);
+            }
+            bool currentSupport = acquisition ? AcquisitionSupported(from, support) : Supported(support);
+            bool nextSupport = acquisition ? AcquisitionSupported(requested, landing) : Supported(landing);
+            StaticContactScreen staticScreen = !braking && !acquisition ? ScreenStaticContact(from, requested, support, currentClock.Delta) : null;
+            bool staticAccepted = staticScreen == null || (!staticScreen.Contact || staticScreen.OnlyStatic) &&
+                (requested - from).magnitude / currentClock.Delta <= staticScreen.Limit + Numerical;
+            bool accepted = currentSupport && nextSupport && clear && swept && endpoint && trafficClear && brakeClear &&
+                staticAccepted && permission && landingPermission && Finite(water) && water <= 0.15f && Finite(landingWater) && landingWater <= 0.15f;
+            object beforeTraffic; frame.TryGetValue("Traffic", out beforeTraffic);
+            frame["FinalPhysical"] = new { Kind = "POST_SINK_PHYSICAL_V1", Accepted = accepted, StartedWall = started,
+                CompletedWall = Time.realtimeSinceStartupAsDouble, Sequence = currentClock.Sequence, From = P(from), Requested = P(requested),
+                Support = SupportRow(support), Landing = SupportRow(landing), Sweeps = sweeps.ToArray(), Overlaps = overlaps.ToArray(), LandingOverlaps = end.ToArray(),
+                Permission = permission, WaterDepth = water, LandingPermission = landingPermission, LandingWaterDepth = landingWater,
+                SupportAccepted = currentSupport, LandingSupportAccepted = nextSupport, OverlapClear = clear, Traffic = traffic, PreTraffic = beforeTraffic,
+                BrakeTraffic = brakeTraffic, StaticScreen = staticScreen == null ? null : staticScreen.Row, StaticAccepted = staticAccepted };
+            if (!accepted) finalNativeAdmission = new { Kind = "POST_SINK_NATIVE_GUARD_V1", Accepted = false, Error = "POST_SINK_PHYSICAL_REFUSED",
+                Sequence = currentClock.Sequence, StartedWall = started, CheckedWall = Time.realtimeSinceStartupAsDouble, From = P(npc.transform.position), Requested = P(requested) };
+            return accepted;
+        }
         private object RecoveryRow(object[] corridor = null, float required = 0)
         {
             return new { Kind = RecoveryPolicy, Trigger = brakeReason, Session = motionSession, Attempt = recoveryAttempts, StartSequence = brakeClock.Sequence, StartWall = brakeClock.WallTime,
@@ -1250,7 +1415,7 @@ namespace RustBots.Navigation
         private bool BrakeFloorCurrent(SupportResult s)
         {
             var entity = brakeFloor == null ? null : brakeFloor.GetComponentInParent<BaseEntity>();
-            return brakeFloor != null && brakeFloor.attachedRigidbody == null && !(entity is Door) && !(entity is BasePlayer) && !(entity is BaseVehicle) &&
+            return brakeFloor != null && StaticFloor(brakeFloor) &&
                 s.Collider == brakeFloor && Supported(s) &&
                 BrakeFloorFingerprint(brakeFloor) == brakeFloorFingerprint &&
                 brakeFloor.bounds.center == brakeFloorCenter && brakeFloor.bounds.size == brakeFloorSize;
@@ -1307,11 +1472,12 @@ namespace RustBots.Navigation
             bool currentClear = Overlaps(from, support, overlaps), endClear = Overlaps(to, landing, landingOverlaps);
             bool sweptClear = Sweep(from, to, support, sweeps), permission = Permission(from), landingPermission = Permission(to);
             float water = WaterLevel.GetWaterSurface(from, true, true, null) - from.y, landingWater = WaterLevel.GetWaterSurface(to, true, true, null) - to.y;
+            object traffic; CountCast(); bool trafficClear = ObserveTraffic(from, to, skin, npc, currentClock.Sequence, out traffic);
             row = new { Kind = kind, From = P(from), Requested = P(to), PriorVelocity = P(prior), Velocity = P(velocity), Dt = dt,
                 Support = SupportRow(support), Landing = SupportRow(landing), Sweeps = sweeps.ToArray(), Overlaps = overlaps.ToArray(), LandingOverlaps = landingOverlaps.ToArray(),
                 Permission = permission, WaterDepth = water, SupportAccepted = Supported(support), OverlapClear = currentClear,
-                LandingPermission = landingPermission, LandingWaterDepth = landingWater, LandingSupportAccepted = Supported(landing) };
-            return BrakeFloorCurrent(support) && BrakeFloorCurrent(landing) && currentClear && endClear && sweptClear && permission && landingPermission &&
+                LandingPermission = landingPermission, LandingWaterDepth = landingWater, LandingSupportAccepted = Supported(landing), Traffic = traffic };
+            return trafficClear && BrakeFloorCurrent(support) && BrakeFloorCurrent(landing) && currentClear && endClear && sweptClear && permission && landingPermission &&
                 Finite(water) && water <= 0.15f && Finite(landingWater) && landingWater <= 0.15f &&
                 Mathf.Abs(to.y - from.y) <= (to.y >= from.y ? maxStep : maxDrop);
         }
@@ -1371,8 +1537,7 @@ namespace RustBots.Navigation
         {
             var entity = s.Collider == null ? null : s.Collider.GetComponentInParent<BaseEntity>();
             return s.Found && s.Kind == "SURFACE" && s.Collider != null && s.Collider.enabled && !s.Collider.isTrigger &&
-                !(entity is Door) && !(entity is BasePlayer) && !(entity is BaseVehicle) &&
-                s.Collider.attachedRigidbody == null && s.Hits.Length == 1 && s.Normal.y >= Mathf.Cos(maxSlope * Mathf.Deg2Rad) &&
+                StaticFloor(s.Collider) && s.Hits.Length == 1 && s.Normal.y >= Mathf.Cos(maxSlope * Mathf.Deg2Rad) &&
                 s.PlaneClearance >= 0;
         }
 
@@ -1432,9 +1597,12 @@ namespace RustBots.Navigation
             frame["Landing"] = SupportRow(landing); frame["Sweeps"] = sweeps.ToArray(); frame["LandingOverlaps"] = endOverlaps.ToArray();
             frame["LandingPermission"] = landingPermission; frame["LandingWaterDepth"] = landingWater;
             frame["LandingSupportAccepted"] = Supported(landing);
+            object traffic; CountCast();
+            bool trafficClear = ObserveTraffic(actual, requested, skin, npc, currentClock.Sequence, out traffic);
+            frame["Traffic"] = traffic;
             Emit("OBSTACLE_PROBE", frame);
             if (!ControlCurrent()) return;
-            if (!sweepClear || !endpointClear || !AcquisitionSupported(requested, landing) || !landingPermission || !Finite(landingWater) || landingWater > 0.15f)
+            if (!trafficClear || !sweepClear || !endpointClear || !AcquisitionSupported(requested, landing) || !landingPermission || !Finite(landingWater) || landingWater > 0.15f)
             { Emit("PHYSICAL_CONTACT", frame); if (!ControlCurrent()) return; Block(frame, "UNKNOWN", "ACQUISITION_TRAJECTORY_UNSAFE"); return; }
             if (!NavEpochMatches() || evidence.Count >= MaxEvidence - 8)
             { Block(frame, "UNKNOWN", "ACQUISITION_NAV_OR_EVIDENCE_BUDGET"); return; }
@@ -1446,6 +1614,7 @@ namespace RustBots.Navigation
             frame["NativeResult"] = "PRECHECKED"; frame["IssuedClock"] = ClockRow(currentClock);
             frame["DecisionPublishedWall"] = Time.realtimeSinceStartupAsDouble;
             if (!PublishDecision(frame, actual, requested)) return;
+            if (!FinalPhysicalCurrent(frame, actual, requested, true)) { RejectNativeIntent(frame, "ACQUISITION_PHYSICAL_OR_TRAFFIC_CHANGED_BEFORE_WRITER"); return; }
             if (!NativeAdmissionCurrent(actual, requested, true)) { RejectNativeIntent(frame, "ACQUISITION_NATIVE_ROUTE_CHANGED_BEFORE_WRITER"); return; }
             frame["FinalAdmission"] = finalNativeAdmission;
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = "CLEAR";
@@ -1519,7 +1688,7 @@ namespace RustBots.Navigation
         {
             if (!Finite(c.FixedTime) || !Finite(c.FixedUnscaledTime) || !Finite(c.Delta) || !Finite(c.UnscaledDelta) || !Finite(c.TimeScale) ||
                 c.FixedTime < 0 || c.FixedUnscaledTime < 0 || c.Delta <= 0 || c.Delta > MaxTick || c.UnscaledDelta <= 0 || c.UnscaledDelta > MaxTick ||
-                c.TimeScale != 1f || Math.Abs(c.Delta - c.UnscaledDelta) > ClockPrecision || !c.InFixedStep || c.Sequence <= 0 || c.Frame < 0 ||
+                c.TimeScale != 1f || c.ClockPolicy != ClockPolicy || !c.InFixedStep || c.Sequence <= 0 || c.Frame < 0 ||
                 c.PhysicsMode != "FixedUpdate" || !Finite(c.MaximumDelta) || c.MaximumDelta != nativeMaximumDelta)
                 return "INVALID_DECLARED_PHYSICS_CLOCK";
             // The driver reports the native callback; independently bind its
@@ -1532,19 +1701,22 @@ namespace RustBots.Navigation
                 c.Frame != Time.frameCount || c.PhysicsMode != Physics.simulationMode.ToString() ||
                 c.MaximumDelta != Time.maximumDeltaTime) return "NATIVE_CLOCK_BINDING";
             if (!clockReady) return null;
+            // Simulation dt remains the issued physics horizon. Unity's real
+            // fixed interval can differ after maximumDeltaTime clamps a frame;
+            // its CURRENT value explains the current real-clock increment.
             if (previousClock.Sequence == long.MaxValue || c.Sequence != previousClock.Sequence + 1 || c.Frame < previousClock.Frame ||
-                c.Delta != previousClock.Delta || c.UnscaledDelta != previousClock.UnscaledDelta || c.TimeScale != previousClock.TimeScale ||
+                c.Delta != previousClock.Delta || c.TimeScale != previousClock.TimeScale ||
                 c.PhysicsMode != previousClock.PhysicsMode ||
                 c.FixedTime <= previousClock.FixedTime || c.FixedUnscaledTime <= previousClock.FixedUnscaledTime ||
                 Math.Abs(c.FixedTime - previousClock.FixedTime - previousClock.Delta) > ClockPrecision ||
-                Math.Abs(c.FixedUnscaledTime - previousClock.FixedUnscaledTime - previousClock.UnscaledDelta) > ClockPrecision)
+                Math.Abs(c.FixedUnscaledTime - previousClock.FixedUnscaledTime - c.UnscaledDelta) > ClockPrecision)
                 return "SKIPPED_CHANGED_OR_NONADVANCING_PHYSICS_STEP";
             return null;
         }
 
         private object ClockRow(TraversalClock c)
         {
-            return new { Schema = 2, WallTime = c.WallTime, FixedTime = c.FixedTime, FixedUnscaledTime = c.FixedUnscaledTime,
+            return new { Schema = 2, ClockPolicy = c.ClockPolicy, WallTime = c.WallTime, FixedTime = c.FixedTime, FixedUnscaledTime = c.FixedUnscaledTime,
                 Delta = c.Delta, UnscaledDelta = c.UnscaledDelta, TimeScale = c.TimeScale, InFixedStep = c.InFixedStep,
                 Sequence = c.Sequence, Frame = c.Frame, PhysicsMode = c.PhysicsMode, MaximumDelta = c.MaximumDelta };
         }
@@ -1890,7 +2062,12 @@ namespace RustBots.Navigation
             // Distinguish that geometry from a slope/wall by measuring both a
             // source floor and a walkable top on this very collider. The later
             // full-volume sweep still vetoes every chord that enters the edge.
-            if (topDirection.sqrMagnitude < 0.99f) return false;
+            if (topDirection.sqrMagnitude < 0.99f) {
+                if (result.RejectedEdges == null) result.RejectedEdges = new List<object>();
+                if (result.RejectedEdges.Count < 2) result.RejectedEdges.Add(new { Policy = "STEP_EDGE_REJECTED_RAYS_V1", Position = P(position), Direction = P(topDirection),
+                    Corner = RayRow(corner), Source = (object)null, Top = (object)null, Failed = new[] { "DIRECTION" } });
+                return false;
+            }
             float lift = maxStep + skin + 0.05f, length = maxStep + maxDrop + skin + 0.1f;
             Vector3 sourceOrigin = position + Vector3.up * lift;
             Vector3 topOrigin = position + topDirection * radius + Vector3.up * lift;
@@ -1902,10 +2079,32 @@ namespace RustBots.Navigation
                 .Where(h => !Self(h.collider)).OrderBy(h => h.distance).ToArray();
             var source = sourceHits.FirstOrDefault(h => h.normal.y >= Mathf.Cos(maxSlope * Mathf.Deg2Rad) && h.point.y <= position.y + Numerical);
             var top = topHits.FirstOrDefault(); // An intervening surface is never skipped.
-            if (source.collider == null || top.collider != corner.collider || top.normal.y < Mathf.Cos(maxSlope * Mathf.Deg2Rad) ||
-                !Finite(source.point) || !Finite(top.point) || Mathf.Abs(source.normal.sqrMagnitude - 1) > Numerical || Mathf.Abs(top.normal.sqrMagnitude - 1) > Numerical ||
+            if (source.collider == null || !StaticFloor(source.collider) || !StaticFloor(corner.collider) ||
+                top.collider != corner.collider || top.normal.y < Mathf.Cos(maxSlope * Mathf.Deg2Rad) ||
+                !Finite(source.point) || !Finite(top.point) || !Finite(source.normal) || !Finite(top.normal) ||
+                Mathf.Abs(source.normal.sqrMagnitude - 1) > Numerical || Mathf.Abs(top.normal.sqrMagnitude - 1) > Numerical ||
                 top.point.y <= source.point.y || top.point.y - source.point.y > maxStep ||
-                Mathf.Abs(top.point.y - corner.point.y) > Numerical || position.y - source.point.y > maxDrop + supportTolerance) return false;
+                corner.point.y < source.point.y || corner.point.y > top.point.y || position.y - source.point.y > maxDrop + supportTolerance) {
+                var failed = new List<string>();
+                if (source.collider == null) failed.Add("SOURCE_MISSING");
+                if (source.collider != null && !StaticFloor(source.collider)) failed.Add("SOURCE_STATIC");
+                if (!StaticFloor(corner.collider)) failed.Add("CORNER_STATIC");
+                if (top.collider != corner.collider) failed.Add("TOP_COLLIDER");
+                if (top.normal.y < Mathf.Cos(maxSlope * Mathf.Deg2Rad)) failed.Add("TOP_SLOPE");
+                if (!Finite(source.point) || !Finite(top.point)) failed.Add("POINT_NONFINITE");
+                if (!Finite(source.normal) || Mathf.Abs(source.normal.sqrMagnitude - 1) > Numerical) failed.Add("SOURCE_NORMAL");
+                if (!Finite(top.normal) || Mathf.Abs(top.normal.sqrMagnitude - 1) > Numerical) failed.Add("TOP_NORMAL");
+                if (top.point.y <= source.point.y) failed.Add("NOT_RAISED");
+                if (top.point.y - source.point.y > maxStep) failed.Add("STEP_HEIGHT");
+                if (corner.point.y < source.point.y || corner.point.y > top.point.y) failed.Add("CORNER_RANGE");
+                if (position.y - source.point.y > maxDrop + supportTolerance) failed.Add("SOURCE_DROP");
+                if (result.RejectedEdges == null) result.RejectedEdges = new List<object>();
+                if (result.RejectedEdges.Count < 2) result.RejectedEdges.Add(new { Policy = "STEP_EDGE_REJECTED_RAYS_V1", Position = P(position), Direction = P(topDirection),
+                    Corner = RayRow(corner), Source = RayRow(source), Top = RayRow(top), Failed = failed.ToArray(),
+                    SourceOrigin = P(sourceOrigin), TopOrigin = P(topOrigin), Length = length,
+                    SourceHits = sourceHits.Select(RayRow).ToArray(), TopHits = topHits.Select(RayRow).ToArray() });
+                return false;
+            }
             result.Kind = "STEP_EDGE";
             result.EdgeSource = new { Origin = P(sourceOrigin), Length = length, Point = P(source.point), Normal = P(source.normal), Distance = source.distance,
                 Collider = ColliderRow(source.collider), Hits = sourceHits.Select(RayRow).ToArray() };
@@ -1916,12 +2115,12 @@ namespace RustBots.Navigation
 
         private object RayRow(RaycastHit h) { return new { Collider = ColliderRow(h.collider), Point = P(h.point), Normal = P(h.normal), Distance = h.distance }; }
 
-        private bool Supported(SupportResult s) { return s.Found && s.Gap >= -Numerical && s.Gap <= supportTolerance && s.PlaneClearance >= -Numerical; }
+        private bool Supported(SupportResult s) { return s.Found && StaticFloor(s.Collider) && s.Gap >= -Numerical && s.Gap <= supportTolerance && s.PlaneClearance >= -Numerical; }
         private bool SupportedAt(SupportResult s, Vector3 p)
         {
             Vector3 a, b; Endpoints(p, out a, out b);
             float gap = p.y - s.FootY;
-            return s.Found && gap >= 0 && gap <= supportTolerance && Vector3.Dot(a - s.Point, s.Normal) - radius >= -Numerical;
+            return s.Found && StaticFloor(s.Collider) && gap >= 0 && gap <= supportTolerance && Vector3.Dot(a - s.Point, s.Normal) - radius >= -Numerical;
         }
 
         private bool Overlaps(Vector3 position, SupportResult support, List<object> rows)
@@ -1946,6 +2145,12 @@ namespace RustBots.Navigation
 
         private bool Sweep(Vector3 from, Vector3 to, SupportResult support, List<object> rows)
         {
+            float nearest;
+            return Sweep(from, to, support, rows, out nearest);
+        }
+        private bool Sweep(Vector3 from, Vector3 to, SupportResult support, List<object> rows, out float nearest, bool forecastSupport = false)
+        {
+            nearest = float.PositiveInfinity;
             closedDoorHit = dynamicHit = false;
             CountCast(); Vector3 a, b; Endpoints(from, out a, out b); Vector3 delta = to - from;
             bool clear = true;
@@ -1964,12 +2169,23 @@ namespace RustBots.Navigation
                     (h.normal.y >= Mathf.Cos(maxSlope * Mathf.Deg2Rad) || support.Kind == "STEP_EDGE" && Vector3.Distance(h.normal, support.Normal) <= Numerical) &&
                     Mathf.Abs(plane) <= Numerical && Vector3.Dot(delta, h.normal) >= -0.00001f;
                 bool blocking = !tangent;
+                // A straight advisory horizon does not follow a curved floor.
+                // Keep its physical Blocking result: only the speed hint omits
+                // a future walkable face of this exact current static floor.
+                bool forecastSurface = forecastSupport && blocking && !intersects && support.Found && h.collider == support.Collider &&
+                    StaticFloor(h.collider) && Finite(h.distance) && h.distance > Numerical && Finite(h.normal) &&
+                    Mathf.Abs(h.normal.sqrMagnitude - 1f) <= Numerical && h.normal.y >= Mathf.Cos(maxSlope * Mathf.Deg2Rad);
                 var door = h.collider.GetComponentInParent<Door>();
                 if (blocking && door != null && !door.IsOpen()) closedDoorHit = true;
-                if (blocking && h.collider.attachedRigidbody != null && h.collider.attachedRigidbody != body) dynamicHit = true;
+                if (blocking && !StaticFloor(h.collider)) dynamicHit = true;
                 hitRows.Add(new { Collider = ColliderRow(h.collider), Point = P(h.point), Normal = P(h.normal), Distance = h.distance, Blocking = blocking,
-                    InitialIntersects = intersects, InitialDepth = depth, InitialDirection = P(mtd), PlaneClearance = plane, SupportTangent = tangent });
+                    InitialIntersects = intersects, InitialDepth = depth, InitialDirection = P(mtd), PlaneClearance = plane, SupportTangent = tangent,
+                    ForecastSurface = forecastSurface });
                 if (blocking) clear = false;
+                if (blocking && !forecastSurface) {
+                    if (!Finite(h.distance) || h.distance < 0) throw new InvalidOperationException("STATIC_SCREEN_CONTACT_DISTANCE_UNKNOWN");
+                    nearest = Mathf.Min(nearest, h.distance);
+                }
             }
             rows.Add(new { From = P(from), To = P(to), A = P(a), B = P(b), Radius = radius, Distance = delta.magnitude, Mask = Mask, Triggers = "Ignore", Hits = hitRows.ToArray() });
             return clear;
@@ -2027,13 +2243,87 @@ namespace RustBots.Navigation
         {
             return new { Found = s.Found, Collider = s.Found ? ColliderRow(s.Collider) : null, Origin = P(s.Origin), Radius = radius, Length = s.Length,
                 Point = P(s.Point), Normal = P(s.Normal), Distance = s.Distance, Center = P(s.Center), FootY = s.FootY, Gap = s.Gap, PlaneClearance = s.PlaneClearance,
-                Kind = s.Kind, EdgeSource = s.EdgeSource, EdgeTop = s.EdgeTop, Hits = s.Hits };
+                Kind = s.Kind, EdgeSource = s.EdgeSource, EdgeTop = s.EdgeTop, Hits = s.Hits,
+                RejectedEdges = s.RejectedEdges == null ? new object[0] : s.RejectedEdges.ToArray() };
+        }
+        // Unknown entities and world shapes are never certified as static just
+        // because attachedRigidbody is null. Gen2 animals are not BaseAnimalNPC.
+        internal static string Mobility(Collider c)
+        {
+            if (c == null) return "UNKNOWN";
+            var e = c.GetComponentInParent<BaseEntity>();
+            if (e is BasePlayer) return "PLAYER";
+            if (e is BaseVehicle) return "VEHICLE";
+            if (e is Rust.Ai.Gen2.BaseNPC2 || e is BaseAnimalNPC) return "ANIMAL";
+            if (e is Door) return "DOOR";
+            if (c.attachedRigidbody != null) return "RIGIDBODY";
+            if (e is BuildingBlock || e is BuildingPrivlidge) return "STATIC_BUILDING";
+            if (e == null && c is TerrainCollider) return "STATIC_TERRAIN";
+            return "UNKNOWN";
+        }
+        private static bool StaticFloor(Collider c)
+        {
+            string category = Mobility(c);
+            return category == "STATIC_TERRAIN" || category == "STATIC_BUILDING";
+        }
+        private static bool NativeTraffic(BaseEntity e)
+        {
+            return e is BasePlayer || e is BaseVehicle || e is Rust.Ai.Gen2.BaseNPC2 || e is BaseAnimalNPC;
+        }
+        // Current observed occupancy only. Padding is actor stopping reserve,
+        // not a made-up maximum wildlife speed or a change to collision geometry.
+        internal static bool ObserveTraffic(Vector3 from, Vector3 to, float padding, BaseEntity self, long sequence, out object receipt)
+        {
+            double started = Time.realtimeSinceStartupAsDouble;
+            if (!Finite(from) || !Finite(to) || !Finite(padding) || padding < 0 || padding > 8) throw new InvalidOperationException("TRAFFIC_GEOMETRY_UNKNOWN");
+            var volume = new Bounds(from + Vector3.up * 0.9f, new Vector3(1, 1.8f, 1));
+            volume.Encapsulate(new Bounds(to + Vector3.up * 0.9f, new Vector3(1, 1.8f, 1))); volume.Expand(padding * 2);
+            var rows = new List<object>(); int actors = 0, colliders = 0;
+            var nativeColliders = new List<Collider>(); // Reused only within this fresh scan, never a temporal cache.
+            foreach (var e in BaseNetworkable.serverEntities.OfType<BaseEntity>().Where(e => e != self && NativeTraffic(e)))
+            {
+                if (++actors > 512) throw new InvalidOperationException("TRAFFIC_NATIVE_SCAN_BUDGET");
+                var bounds = e.WorldSpaceBounds().ToBounds();
+                if (!Finite(bounds.center) || !Finite(bounds.size)) throw new InvalidOperationException("TRAFFIC_NATIVE_BOUNDS_UNKNOWN");
+                if (volume.Intersects(bounds)) rows.Add(new { Source = "NATIVE_ENTITY", Entity = e.net == null ? null : e.net.ID.Value.ToString(),
+                    EntityType = e.GetType().FullName, Prefab = e.PrefabName, Position = P(e.transform.position), BoundsCenter = P(bounds.center), BoundsSize = P(bounds.size), Velocity = (float[])null, VelocityKnown = false });
+                // Entity bounds and physics broadphase may disagree. Read actual
+                // enabled colliders as well; neither representation clears another.
+                nativeColliders.Clear();
+                e.GetComponentsInChildren<Collider>(false, nativeColliders);
+                foreach (var c in nativeColliders)
+                {
+                    if (!c.enabled || c.isTrigger) continue;
+                    if (!Finite(c.bounds.center) || !Finite(c.bounds.size)) throw new InvalidOperationException("TRAFFIC_COLLIDER_BOUNDS_UNKNOWN");
+                    if (volume.Intersects(c.bounds)) rows.Add(new { Source = "NATIVE_COLLIDER", Instance = c.GetInstanceID(), EntityType = e.GetType().FullName,
+                        Position = P(c.transform.position), Rotation = new[] { c.transform.rotation.x, c.transform.rotation.y, c.transform.rotation.z, c.transform.rotation.w },
+                        BoundsCenter = P(c.bounds.center), BoundsSize = P(c.bounds.size), Rigidbody = c.attachedRigidbody == null ? (int?)null : c.attachedRigidbody.GetInstanceID(), VelocityKnown = false });
+                }
+            }
+            var middle = (from + to) * 0.5f;
+            float broadRadius = 0.5f + padding + Vector3.Distance(from, to) * 0.5f;
+            foreach (var c in Physics.OverlapCapsule(middle + Vector3.up * 0.5f, middle + Vector3.up * 1.3f, broadRadius, Mask, QueryTriggerInteraction.Ignore))
+            {
+                if (++colliders > 128) throw new InvalidOperationException("TRAFFIC_COLLIDER_SCAN_BUDGET");
+                var e = c.GetComponentInParent<BaseEntity>();
+                string category = Mobility(c);
+                // Doors retain exact full-volume queries (including actual hinge)
+                // below. A coarse box around an open leaf is not a closed door.
+                if (e == self || category == "DOOR" || StaticFloor(c)) continue;
+                rows.Add(new { Source = "PHYSICS", Instance = c.GetInstanceID(), Mobility = category, Position = P(c.transform.position),
+                    BoundsCenter = P(c.bounds.center), BoundsSize = P(c.bounds.size), VelocityKnown = false });
+            }
+            if (rows.Count > 128) throw new InvalidOperationException("TRAFFIC_EVIDENCE_BUDGET");
+            receipt = new { Policy = TrafficPolicy, From = P(from), To = P(to), Padding = padding, StartedWall = started,
+                CompletedWall = Time.realtimeSinceStartupAsDouble, FixedTime = Time.fixedTimeAsDouble, Sequence = sequence,
+                Clear = rows.Count == 0, Rows = rows.ToArray(), NativeActorsScanned = actors, CollidersScanned = colliders };
+            return rows.Count == 0;
         }
         private object ColliderRow(Collider c)
         {
             if (c == null) return null; var entity = c.GetComponentInParent<BaseEntity>(); var door = entity as Door; var rigid = c.attachedRigidbody;
             return new { Instance = c.GetInstanceID(), Type = c.GetType().Name, Entity = entity == null || entity.net == null ? null : entity.net.ID.Value.ToString(),
-                EntityType = entity == null ? null : entity.GetType().Name, MovingEntity = entity is Door || entity is BasePlayer || entity is BaseVehicle,
+                EntityType = entity == null ? null : entity.GetType().Name, Mobility = Mobility(c), MovingEntity = !StaticFloor(c),
                 Prefab = entity == null ? null : entity.PrefabName, Owner = entity == null ? null : entity.OwnerID.ToString(), Enabled = c.enabled, Trigger = c.isTrigger, Layer = c.gameObject.layer,
                 BoundsCenter = P(c.bounds.center), BoundsSize = P(c.bounds.size), DoorOpen = door == null ? (bool?)null : door.IsOpen(),
                 RigidbodyInstance = rigid == null ? (int?)null : rigid.GetInstanceID(), Kinematic = rigid == null ? (bool?)null : rigid.isKinematic };
@@ -2087,7 +2377,10 @@ namespace RustBots.Navigation
                         clockReady && currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision ? "PHYSICS_CONTIGUOUS_WITH_WALL_LAG" : "ON_TIME" } };
                 row["WallTelemetry"] = telemetry;
             }
-            evidence.Add(row); if (sink != null) sink(row);
+            evidence.Add(row);
+            row["SinkStartedWall"] = Time.realtimeSinceStartupAsDouble;
+            try { if (sink != null) sink(row); }
+            finally { row["SinkCompletedWall"] = Time.realtimeSinceStartupAsDouble; }
         }
         private void CountCast() { if (++casts > MaxCasts) throw new InvalidOperationException("PHYSICS_QUERY_BUDGET"); }
         private static Dictionary<string, object> Copy(Dictionary<string, object> row) { return new Dictionary<string, object>(row); }
