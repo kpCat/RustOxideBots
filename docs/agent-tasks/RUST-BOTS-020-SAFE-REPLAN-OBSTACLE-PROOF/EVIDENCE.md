@@ -1,0 +1,26 @@
+# EVIDENCE — raw vs published report, required proof and audit
+
+- Before each live start: `git rev-parse HEAD`, `origin/master`, actual public master via connector/HTTPS, status/exact allowlist, native DLL/IL hash, C#7.3 plugin compile, full Test-All/PS5.1, independent review, owner3086+protected 019 history/cache SHA, safe ports/process ownership/firewall preflight. Frozen combined source SHA and full installed Oxide source binding. 019 run IDs remain immutable and not used as 020 fresh live.
+- Every motion witness: exact wall+fixed clocks and sequence, actor ID/world ID, original capsule/radius/height/Rigidbody, before/command/after pose, 3D speed/acceleration and native linearVelocity, full sweeps/overlaps/penetration/ground/support/permissions/water, current route/poly refs, epochs and global PendingTiles, pending/outcome, `Rigidbody.MovePosition` issue and actual witness. No synthetic movement evidence.
+- Replan evidence: current `lastVelocity`, reason `UNSUPPORTED_GAP`, available actual safe deceleration distance/support, desired vector, actual calculated braking trajectory and acceptance per step; events `BRAKE_REQUESTED/ISSUED/WITNESSED`, measured ACTUAL_REST and `REPATH_AFTER_REST`, or exact `BLOCKED_NO_SAFE_BRAKING` without further actuation. Fail if replan omits command while moving. Show blocked wall at stopping distance negative fixture.
+- Native construction: account explicit TEST_FIXTURE input UIDs/amounts, first foundation before/after, exact native paid costs, native Planner placement calls/registered entity ID/owner/buildingID/grade/health/support, wall/door/TC/roof inventory; no free resources or restore. Geometry must be native real collider in isolated world, not fabricated test mesh.
+- G4: exact target wall/closed-door collider IDs and state, probe before/after control-state snapshots, no actuation on refused probe, full sweeps; exterior detour real route + physical actual samples, never enters inside closed house, target reached at rest and blocked direct segment. G5: actual native own TC upkeep/itemUID, owner auth, hinge open/close, live portal crossing and LOS/TC range original full body no tunnel.
+- P2: complete immutable plugin `plugin-result.json` plus new wrapper `result.json` from offline source; exact deep `RoutePlan` vectors numeric shape, revalidation status. Preserve frozen 019 files, compare old checksum. If choosing reference wrapper, each reference content SHA exact and compatible consumers documented. **Do not publish private raw values**.
+- Security: owner and protected SHA/length before/after, installed binaries and runner unchanged unless approved, native graceful quit exit code fact not hidden, own jobs/processes/ports/firewall/brokers/leases/locks all absent, secrets/Steam IDs/real IPs test; separate mojibake and escaped Cyrillic scans; exact path git staged diff and published SHA. Raw under ignored `.local/runtime` and `.local/audit/traversal020`, public sanitized `RESULT.md` per gate including negative and failed starts.
+
+## Final measured receipts
+
+Ten isolated native starts were used; the owner removed the initial cap after START2. Original raw100 files remain unchanged. Native10 is PARTIAL: G4 is physically proven, optional TC access stops on unsafe1572 with a recorded foreign Wolf2 SphereCollider. No full GREEN or home completion is credited. The original secondary remains a stale startup header after export OOM; independent cleanup is separate evidence and the missing native exit code stays UNKNOWN.
+
+The safe prefix contains7809 original frames/1571 accepted witnesses. Wall and closed-Door probes preserve controller state and are followed by642 and433 accepted witnesses. The blocked direct probe is followed by the real two-leg exterior detour:105 physical witnesses/4.91809563m, closed Door throughout, original capsule outside the foundation footprint and measured rest. Full3D route length5.06194162m exceeds direct3.95332026m. A corrected horizontal read-only aim check does not change physical guards.
+
+| Private receipt | SHA256 / scope |
+|---|---|
+| Live combined C# | `6D878E246DE49942FA51E2D7A179ED2EC4D236CFA1B78FB334A212A8CACAD275`;451125 bytes; final C# and compile input unchanged |
+| Original native10 raw manifest | `147FD57D42D8ADE6545A3F65507BE36FDBC4C17999CE02A60F357F1731D52ED6`; ten original files |
+| First audit prefix receipt | `F58A9AAAFFD1DF0F9D121429819BFBD5A821F38ABEEEBEFBC19B55C895D72912`; full result rejected,1571 safe witnesses pass, later old aim check fails |
+| Final physical scene audit | `729B1C7868DB364EAE8C9BD15B7894D631EA047C3D6D2D1E2A61E32C35832487`; G4 PASS, unsafe1572 no success credit, G5 blocked |
+| Two-phase completion | `BEF4C0FF425FBB854B06222327ACCD5972B664CBAF42EA5DFF3435D58F3658E1`; total primary audit parses2, identical raw and83 unrelated validator bodies |
+| P2 final reference binding | `ECD767D9E5555CA1A5802DF707B75E51D08BB73FCB15D774A13BF09748D65850`; immutable268801868-byte primary/new1034-byte envelope, original stale wrapper unchanged |
+
+All receipts/raw remain ignored and private. Published values above are sanitized metrics/hashes, without owner identities, coordinates, secrets or raw dumps. Final build, review, scans, safety and exact Git delivery are detailed in RESULT.md and bound by the private delivery receipt.

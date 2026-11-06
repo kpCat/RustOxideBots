@@ -1,0 +1,31 @@
+# RUST-BOTS-020 — safe moving replan, paid native obstruction and report correctness
+
+## Main outcome
+
+Deliver meaningful G4 wall/closed-Door/refusal/real detour, ideally G5 home. Prerequisite: fix `NO_BOUNDED_SUPPORTED_TRAJECTORY -> REPATH -> CLOCK_UNOBSERVED_ACTIVE_HOLD` observed after 649 commands / 34.1714m / native paid Wood FOUNDATION in 019. **Never weaken this active-hold safety guard.** `GREEN_TRAVERSAL_CORE` requires all scene proofs; slope-only and paid foundation alone remain PARTIAL.
+
+## A. Contract for moving recovery (first priority)
+
+Read full `REPLAN_DESIGN.md`. Add a strictly bounded FSM or equivalent verified transitions. When controller's last accepted actual velocity !=0, an obstacle/repath decision must **never silently skip issuing a next safe command** and then expect a clock reset. Choose only supported `DIRECT_CONTINUATION`, `ACTUAL_BRAKE` with native full-body projected safe braking corridor, or explicit BLOCKED_NO_SAFE_BRAKE. Track pending/witness, exact current clocks/epochs/path and original body. Native `Rigidbody.MovePosition` only in full checked motion; independent next-frame witness mandatory. Real braking produces decreasing speed within max4 accel and maxSpeed <= native speed; observed rest required before changing direction/committing replan. No synthetic stationary event/teleport/zeroing lastVelocity. No replay of paid build or native commands, no unlimited detours. `SetDestination` outside Tick while moving still guarded. Explicit event taxonomy for offline and live: BRAKE_REQUESTED, BRAKE_ISSUED, BRAKE_WITNESSED, ACTUAL_REST, REPATH_AFTER_REST, BLOCKED_UNSAFE_BRAKING. Do not reclassify existing 019 raw as safe.
+
+Negative contracts must include a correct STOP where impossible to brake before a solid wall, unsupported landing, foreign blocking object or closed door. Treat unknown as no new actuation (not soft collision). Same `NATIVE_CURRENT_ROUTE_V1` freshness/epochs/public poly, global pending metadata and original Tick/Wall clock checks; no default promotion.
+
+## B. Reproducible native fixture / G4 first
+
+Read `NATIVE_FIXTURE.md`, 019 fixture source, 011–013 proven actual build. Real TEST_FIXTURE material goes to native PlayerInventory, built with native `Planner.DoBuild`, actual loaded cost/Item UID debit, native ownership, buildingID, stability, support, grade and save registrations. Dynamic legal site/stand from actual map; no fixed coords or fake renderer. Preflight post-Foundation step/path/brake envelope to avoid 019 immediate unsupported continuation, then after native placement recheck actual surface/geometry and only legitimate safe controlled motion. Don't duplicate 018 30+m terrain demonstration. Build a real native wall, doorway/hinged Door in one isolated run before attempting full TC/upkeep if static/native rules allow minimal fixture; otherwise reuse honest full FirstHome construction. If collision still disallows build approach, record root and stop rather than force placement.
+
+Test read-only `ProbeDisplacement` native wall and closed Door independently, grounded named collider IDs and actual casts, no actuation/no poisoned controller; then actual supported exterior path around finite wall/closed house with original actor. All negative probes must be separate from motor BLOCKED events and actual detour not allowed through sealed interior. Only if G4 passes, attempt native home TC/Upkeep and IN/OUT/close with body-level contact checks. Do not count a requested path as the actual detour.
+
+## C. P2 runner secondary report (offline-only)
+
+Read `P2_REPORT.md`; fix where practical with focused PowerShell 5.1 deep JSON test using immutable frozen 019 primary as input. Runner `Save-Report` uses `ConvertTo-Json -Depth 8`, nested `Navigation.RoutePlan[].NativeCorners[]` loses numeric triple shape in secondary report. Must preserve or explicitly reference exact primary without breaking existing WorldRoam/Avatar/FirstHome/RESTORE contexts. Never rewrite frozen raw, expose private secrets, or consume PID for P2. Report exactly whether secondary deep fidelity is proven by independent validator. If safe fix requires broad schema redesign, defer as P2 and keep primary reliable rather than derail G4.
+
+## D. Safety, Git and independent gate
+
+Authorised Git for task020 only: read-only HEAD/status/repo verification, exact-path staged allowlist and **ordinary** non-force `push origin master`. No reset/clean/rebase/stash/force, no `git add .`, no foreign file staging, no automatic owner configs/Server. Use installed compiler/C#7.3 PS5.1, native IL, `Test-All`, independent pre-live and final source/raw reviews, strict UTF8/NUL, separate mojibake and escaped Cyrillic scans and actual RCON/owner/SteamID/privacy scans.
+
+Owner `Server/` read-only (019 audit 3086 files), history 001–019/old frozen `.local` raw/cache untouched; no owner BAT/updater/SteamCMD/foreign PID kill; test runtime physically isolated, own Job Object and firewall deny, no cache promotion. 0 owned PIDs/ports/firewall rules/brokers/locks/leases on shutdown. Max **three new live starts** only for this task.
+
+Owner override after START2: the owner explicitly removed the number-of-starts limit and prioritized a real positive result. The original three-start ceiling above is superseded. Every later start still needs a distinct evidence-based correction, offline/build/review gates and full isolation/cleanup; safety and architecture requirements are unchanged. PLAN records each actual start.
+
+Expected public paths: `src/navigation/ObstacleTraversal.cs`, `src/navigation/TraversalBench.cs`, `scripts/TraversalValidation.ps1`, `scripts/Test-Traversal.ps1`, possible `src/home/FirstHome.cs`, possible `scripts/Invoke-NavigationProbe.ps1` and exact new task docs. Do not change `EconomyJournal`, `AGENTS.md`, installed DLL or owner code. Define exact allowlist in PLAN. Review all product source diffs. Prepare `PLAN.md`, `API_DECISION.md`, `RESULT.md`, full per-gate raw receipt labels and exact Git commands, publish only evidence-derived claims. If fundamental C controller/actuator change necessary, discuss alternatives with user BEFORE implementation; routine braking/replan/P2 fixture work autonomous.

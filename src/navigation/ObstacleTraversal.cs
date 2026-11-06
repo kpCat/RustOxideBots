@@ -28,6 +28,9 @@ namespace RustBots.Navigation
         private const float Numerical = 0.001f, MaxTick = 0.1f, MaxAcceleration = 4f;
         private const double ClockPrecision = 0.000001;
         private const string NativeAdmissionPolicy = "NATIVE_CURRENT_ROUTE_V1";
+        private const string RecoveryPolicy = "MEASURED_BRAKE_V1";
+        private const int MaxBrakeSteps = 8;
+        private const float BrakeAcceleration = 3f, MaxBrakeSeconds = 1f;
         private const int NativePathCapacity = 256; // Installed RustNavMeshPath constructor.
         private readonly ScientistNPC npc;
         private readonly RustNavMeshAgent agent;
@@ -64,10 +67,95 @@ namespace RustBots.Navigation
             public Dictionary<string, object> Row;
         }
         private NativeRouteReceipt nativeAdmission;
+        private sealed class NativeEpochProof
+        {
+            public RustNavmesh Mesh;
+            public IntPtr Handle;
+            public int Session, Command, Index, OldChange, OldData, Change, Data, Suffix, Ordinal, PreviousOrdinal, PreviousCommand, PriorChange, PriorData, BeforeStep;
+            public long PreviousSequence;
+            public double PreviousCompleted;
+            public bool Filter, Sealed, StartsBrake;
+            public bool? PendingBefore, PendingAfterNative, PendingAtSeal;
+            public bool? OriginalObjectMatched, CurrentObjectMatched;
+            public double Started, NativeCompleted, Completed, RouteStarted;
+            public float Required;
+            public TraversalClock Clock, BrakeClock;
+            public Vector3 From, Goal, Actual, Velocity, NativeVelocity, FloorCenter, FloorSize, BrakeOrigin, BrakeVelocity;
+            public int RecoveryAttempt;
+            public Vector3[] Corners, CurrentCorners, CorridorPoints;
+            public ulong[] Polys, CurrentPolys;
+            public Collider Floor;
+            public SupportResult Anchor;
+            public string FloorFingerprint, Failure;
+            public object Body, FloorRow, OriginalQuery, CurrentQuery, Row, BuildBefore, BuildAfter;
+            public object[] CommittedPlan, OldRefsBefore, OldRefsAfter, CurrentRefsBefore, CurrentRefsAfter, Corridor;
+        }
+        private NativeEpochProof epochProof;
+        private int epochProofAttempts;
+        private long lastEpochAttemptSequence;
+        private readonly List<object> epochProofJournal = new List<object>();
+        private sealed class BrakeRestContext
+        {
+            public int Session, Step, Attempt, Command;
+            public TraversalClock Clock, StartClock;
+            public Vector3 Actual, RigidbodyPosition, Goal, Origin, Velocity;
+            public object Admission, LastGuard;
+            public FrozenStationaryBody FrozenBody;
+        }
+        private sealed class StationaryNativeState
+        {
+            public RustNavmesh Mesh;
+            public IntPtr Handle;
+            public int? Change, Data;
+            public bool? Available, MeshAvailable, Built, Pending, OnMesh, ProfileMatched, FilterMatched, SameSpanObject;
+            public bool Ready, ComparedToSpan;
+            public double Started, Completed;
+            public string Reason;
+        }
+        private sealed class StationaryReplanContext
+        {
+            public int Session, Command, BaseActuations, RetryBefore, Observation, Span, SpanRestarts, OriginalIndex;
+            public string Entry, State, FloorFingerprint, PlanPhase;
+            public double Started, RouteStarted, GlobalDeadline, Deadline, PlanStarted, PlanCompleted;
+            public bool HasFirst, PlanAccepted, NativeQueriesStarted;
+            public int PlanCalls, FirstWriterCommand;
+            public TraversalClock EntryClock, FirstClock;
+            public Vector3 Actual, RigidbodyPosition, Goal, FloorCenter, FloorSize, AnchorPoint, AnchorNormal;
+            public Quaternion Rotation;
+            public Collider Floor;
+            public RustNavmesh OriginalMesh;
+            public IntPtr OriginalHandle;
+            public int OriginalChange, OriginalData;
+            public bool Filter;
+            public object[] OriginalPlan;
+            public object OriginalNavigation, NewNavigation, OriginalBody, FloorRow, Anchor, Ready, LastGuard, PlanGuard, Failure;
+            public BrakeRestContext BrakeRest;
+            public StationaryNativeState First, Last;
+            public FrozenStationaryBody FrozenBody;
+        }
+        private sealed class FrozenStationaryBody
+        {
+            public Vector3 Position, RigidbodyPosition, CapsulePosition, Scale, Center, A, B;
+            public Quaternion Rotation, CapsuleRotation;
+            public float Radius, Height;
+            public int Capsule, Rigidbody, Direction, Layer;
+            public bool Enabled, Trigger, Kinematic, Gravity, Detect, AgentStopped, AgentPosition, AgentRotation;
+            public string CollisionMode;
+        }
+        private StationaryReplanContext stationary;
+        private double? sessionGlobalDeadline;
+        private int sessionBaseActuations, sessionBaseCommand;
+        private TraversalClock? sessionBaselineClock;
+        private object sessionBaselineBody;
+        private FrozenStationaryBody sessionBaselineFrozenBody;
+        private FrozenStationaryBody acceptedBrakeZeroBody;
+        private int acceptedBrakeZeroSession, acceptedBrakeZeroCommand;
+        private long acceptedBrakeZeroSequence;
+        private Vector3 sessionBaselinePosition, sessionBaselineRigidbodyPosition;
         private object finalNativeAdmission;
         private readonly Stopwatch queryClock = new Stopwatch();
         private readonly List<object> evidence = new List<object>();
-        private int routeIndex, ticks, casts, command, retries, actuations, heightWitnesses, unchangedWitnesses;
+        private int routeIndex, ticks, casts, command, retries, actuations, heightWitnesses, unchangedWitnesses, motionSession;
         private float lastTime, commandTime;
         private double startWallTime;
         private TraversalClock currentClock, previousClock, commandClock, acquisitionRestClock;
@@ -86,6 +174,17 @@ namespace RustBots.Navigation
         private float acquisitionStartTime, acquisitionStartGap, acquisitionFloorY, acquisitionRestTime;
         private Collider acquisitionFloor;
         private Dictionary<string, object> pendingFrame;
+        private bool braking, commandBraking, replanAfterRest;
+        private int recoveryAttempts, brakeStep;
+        private TraversalClock brakeClock;
+        private Vector3 brakeOrigin, brakeVelocity, brakeFloorCenter, brakeFloorSize;
+        private Collider brakeFloor;
+        private string brakeFloorFingerprint;
+        private object brakeFloorRow;
+        private string brakeClassification, brakeReason;
+        private object brakeReceipt;
+        private bool diagnosticRecoveryQueued;
+        private long diagnosticRecoverySequence;
 
         private sealed class SupportResult
         {
@@ -129,7 +228,8 @@ namespace RustBots.Navigation
                 MaxAcceleration = MaxAcceleration, MaxTick = MaxTick, MaxWallStall = maxWallStall, NativeMaximumDelta = nativeMaximumDelta, Skin = skin, SupportTolerance = supportTolerance,
                 NavClimb = build.agentMaxClimb, NavSlope = build.agentMaxSlope, NavRadius = build.agentRadius,
                 NavHeight = build.agentHeight, NativeStepCeiling = BaseNavigator.maxStepUpDistance,
-                Capability = "CUSTOM_CHECKED_CONTROLLER_NOT_NATIVE_STEP_PROOF", NativeAdmissionPolicy = NativeAdmissionPolicy };
+                Capability = "CUSTOM_CHECKED_CONTROLLER_NOT_NATIVE_STEP_PROOF", NativeAdmissionPolicy = NativeAdmissionPolicy, FinalVelocityPolicy = "NATIVE_POST_SINK_VELOCITY_V1",
+                EpochRevalidationPolicy = "SAME_COMMITTED_ROUTE_EPOCH_V2", StationaryReplanPolicy = "MEASURED_STATIONARY_NATIVE_V1" };
             agent.isStopped = true; agent.updatePosition = false; agent.updateRotation = false; agent.ResetPath();
             string invalid = BodyProblem();
             if (invalid != null || !Finite(maxStep) || maxStep <= 0 || !Finite(maxSlope) || maxSlope <= 0 ||
@@ -146,6 +246,278 @@ namespace RustBots.Navigation
         public int Actuations { get { return actuations; } }
         public string ReadinessPolicy { get { return NativeAdmissionPolicy; } }
         public float NativeMaximumDeltaTime { get { return nativeMaximumDelta; } }
+
+        private bool StationaryWaiting { get { return stationary != null && stationary.State != "COMMITTED" && stationary.State != "WRITTEN" && stationary.State != "TERMINAL"; } }
+
+        // Existing caller heartbeat only. Never a physics callback or a planner retry.
+        public void PollStationaryReplanTimeout()
+        {
+            if (!StationaryWaiting || !ControlCurrent()) return;
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (!Finite(now) || now < stationary.Started || now > stationary.Deadline) {
+                StationaryFailure("STATIONARY_REPLAN_DEADLINE", "TIMEOUT_HEARTBEAT");
+                Stop("STATIONARY_REPLAN_DEADLINE");
+            }
+        }
+
+        private void StationaryFailure(string why, string phase)
+        {
+            var s = stationary;
+            if (s == null || s.FirstWriterCommand != 0 || pending || actuations != s.BaseActuations) return;
+            if (s.Failure == null) s.Failure = new { Reason = why, Phase = phase, Time = Time.realtimeSinceStartupAsDouble,
+                Clock = clockContext ? ClockRow(currentClock) : null, Actual = P(npc.transform.position), Body = BodyRow() };
+            s.State = "TERMINAL";
+        }
+
+        private StationaryNativeState ReadStationaryNative(StationaryReplanContext s)
+        {
+            var n = new StationaryNativeState { Started = Time.realtimeSinceStartupAsDouble };
+            try {
+                var nav = RustNavigation.Instance; n.Available = nav != null;
+                n.Mesh = nav == null ? null : nav.DefaultNavmesh;
+                n.MeshAvailable = n.Mesh != null;
+                n.Built = nav == null ? (bool?)null : nav.IsDefaultNavmeshBuilt();
+                n.Pending = nav == null ? (bool?)null : nav.HasPendingTiles(); n.OnMesh = agent.isOnNavMesh;
+                n.FilterMatched = agent.npcDoorsWillOpen == (s == null ? routeFilter : s.Filter);
+                if (n.Mesh != null) {
+                    n.Handle = n.Mesh.NavMeshHandle; n.Change = n.Mesh.TileChangeVersion; n.Data = n.Mesh.TileDataVersion;
+                    var p = n.Mesh.BuildParams;
+                    n.ProfileMatched = p.agentMaxClimb == navClimb && p.agentMaxSlope == navSlope && p.agentRadius == navRadius && p.agentHeight == navHeight;
+                }
+                n.ComparedToSpan = s != null && s.HasFirst;
+                n.SameSpanObject = n.ComparedToSpan ? (bool?)object.ReferenceEquals(n.Mesh, s.First.Mesh) : null;
+                n.Ready = n.Available == true && n.Mesh != null && n.Handle != IntPtr.Zero && n.Built == true && n.Pending == false &&
+                    n.OnMesh == true && n.ProfileMatched == true && n.FilterMatched == true;
+                n.Reason = n.Ready ? null : n.Available != true ? "NATIVE_UNAVAILABLE" : n.Mesh == null ? "NATIVE_MESH_UNKNOWN" :
+                    n.Built != true ? "NATIVE_UNBUILT" : n.Pending != false ? "NATIVE_PENDING_OR_UNKNOWN" : n.OnMesh != true ? "NATIVE_OFFMESH" : "NATIVE_PROFILE_FILTER_OR_HANDLE";
+            } catch (Exception ex) { n.Ready = false; n.Reason = "NATIVE_OBSERVATION_EXCEPTION:" + ex.GetType().Name; }
+            n.Completed = Time.realtimeSinceStartupAsDouble; return n;
+        }
+
+        private object StationaryNativeRow(StationaryNativeState n)
+        {
+            return n == null ? null : new { StartedWall = n.Started, CompletedWall = n.Completed, Available = n.Available,
+                DefaultMesh = n.MeshAvailable, Handle = n.Handle == IntPtr.Zero ? null : n.Handle.ToString(), Built = n.Built, PendingTiles = n.Pending,
+                OnMesh = n.OnMesh, ProfileMatched = n.ProfileMatched, FilterMatched = n.FilterMatched, Change = n.Change, Data = n.Data,
+                ComparedToSpan = n.ComparedToSpan, SameSpanObject = n.SameSpanObject, Ready = n.Ready, Reason = n.Reason };
+        }
+
+        private bool SameStationaryNative(StationaryReplanContext s, StationaryNativeState n)
+        {
+            return s.HasFirst && n.Ready && object.ReferenceEquals(n.Mesh, s.First.Mesh) && n.Handle == s.First.Handle &&
+                n.Change == s.First.Change && n.Data == s.First.Data && n.ProfileMatched == true && n.FilterMatched == true;
+        }
+
+        private FrozenStationaryBody CaptureStationaryBody()
+        {
+            Vector3 a, b; Endpoints(npc.transform.position, out a, out b);
+            return new FrozenStationaryBody { Position = npc.transform.position, RigidbodyPosition = body.position, CapsulePosition = capsule.transform.position,
+                Rotation = npc.transform.rotation, CapsuleRotation = capsule.transform.rotation, Scale = capsule.transform.lossyScale, Center = capsule.center,
+                A = a, B = b, Radius = capsule.radius, Height = capsule.height, Capsule = capsule.GetInstanceID(), Rigidbody = body.GetInstanceID(),
+                Direction = capsule.direction, Layer = capsule.gameObject.layer, Enabled = capsule.enabled, Trigger = capsule.isTrigger,
+                Kinematic = body.isKinematic, Gravity = body.useGravity, Detect = body.detectCollisions, CollisionMode = body.collisionDetectionMode.ToString(),
+                AgentStopped = agent.isStopped, AgentPosition = agent.updatePosition, AgentRotation = agent.updateRotation };
+        }
+
+        private static bool ExactVector(Vector3 a, Vector3 b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+        private static bool ExactRotation(Quaternion a, Quaternion b) { return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w; }
+        private bool SameStationaryBody(FrozenStationaryBody f)
+        {
+            if (f == null || BodyProblem() != null) return false;
+            Vector3 a, b; Endpoints(npc.transform.position, out a, out b);
+            return ExactVector(f.Position, npc.transform.position) && ExactVector(f.RigidbodyPosition, body.position) &&
+                ExactVector(f.CapsulePosition, capsule.transform.position) && ExactRotation(f.Rotation, npc.transform.rotation) &&
+                ExactRotation(f.CapsuleRotation, capsule.transform.rotation) && ExactVector(f.Scale, capsule.transform.lossyScale) &&
+                ExactVector(f.Center, capsule.center) && ExactVector(f.A, a) && ExactVector(f.B, b) &&
+                f.Radius == capsule.radius && f.Height == capsule.height && f.Capsule == capsule.GetInstanceID() && f.Rigidbody == body.GetInstanceID() &&
+                f.Direction == capsule.direction && f.Layer == capsule.gameObject.layer && f.Enabled == capsule.enabled && f.Trigger == capsule.isTrigger &&
+                f.Kinematic == body.isKinematic && f.Gravity == body.useGravity && f.Detect == body.detectCollisions &&
+                f.CollisionMode == body.collisionDetectionMode.ToString() && f.AgentStopped == agent.isStopped &&
+                f.AgentPosition == agent.updatePosition && f.AgentRotation == agent.updateRotation;
+        }
+
+        private object StationaryBodyRow(FrozenStationaryBody f)
+        {
+            return f == null ? null : new { Position = P(f.Position), RigidbodyPosition = P(f.RigidbodyPosition), CapsulePosition = P(f.CapsulePosition),
+                Rotation = new[] { f.Rotation.x, f.Rotation.y, f.Rotation.z, f.Rotation.w },
+                CapsuleRotation = new[] { f.CapsuleRotation.x, f.CapsuleRotation.y, f.CapsuleRotation.z, f.CapsuleRotation.w },
+                Scale = P(f.Scale), Center = P(f.Center), A = P(f.A), B = P(f.B), Radius = f.Radius, Height = f.Height,
+                Capsule = f.Capsule, Rigidbody = f.Rigidbody, Direction = f.Direction, Layer = f.Layer, Enabled = f.Enabled, Trigger = f.Trigger,
+                Kinematic = f.Kinematic, Gravity = f.Gravity, Detect = f.Detect, CollisionMode = f.CollisionMode,
+                AgentStopped = f.AgentStopped, AgentPosition = f.AgentPosition, AgentRotation = f.AgentRotation };
+        }
+
+        private bool BeginStationaryReplan(Dictionary<string, object> frame, SupportResult support, object[] overlaps, bool clear, bool permission, float water, BrakeRestContext rest = null)
+        {
+            if (!sessionGlobalDeadline.HasValue || stationary != null || !ControlCurrent() || pending || acquiring ||
+                !ExactZero(lastVelocity) || !ExactZero(body.linearVelocity) || retries >= 1 || support.Collider == null || support.Collider.attachedRigidbody != null ||
+                !Supported(support)) return false;
+            bool baseline = rest == null;
+            if (baseline && (braking || !sessionBaselineClock.HasValue || actuations != sessionBaseActuations || command != sessionBaseCommand ||
+                !SameStationaryBody(sessionBaselineFrozenBody) ||
+                (npc.transform.position - sessionBaselinePosition).sqrMagnitude != 0 || (body.position - sessionBaselineRigidbodyPosition).sqrMagnitude != 0)) return false;
+            if (!baseline && (rest.Admission == null || rest.Session != motionSession || rest.Command != command || !SameStationaryBody(rest.FrozenBody) || !BrakeFloorCurrent(support) ||
+                (npc.transform.position - rest.Actual).sqrMagnitude != 0 || (body.position - rest.RigidbodyPosition).sqrMagnitude != 0)) return false;
+            var entity = support.Collider.GetComponentInParent<BaseEntity>();
+            if (entity is Door || entity is BasePlayer || entity is BaseVehicle) return false;
+            double started = Time.realtimeSinceStartupAsDouble;
+            stationary = new StationaryReplanContext { Session = motionSession, Command = command, BaseActuations = actuations, RetryBefore = retries++,
+                Entry = baseline ? "BASELINE_BEFORE_FIRST_WRITER" : "ACKNOWLEDGED_BRAKE_REST", State = "WAITING", Started = started,
+                RouteStarted = startWallTime, GlobalDeadline = sessionGlobalDeadline.Value,
+                Deadline = Math.Min(started + 20, Math.Min(startWallTime + 120, sessionGlobalDeadline.Value)), EntryClock = currentClock,
+                Actual = npc.transform.position, RigidbodyPosition = body.position, Rotation = npc.transform.rotation, Goal = destination,
+                Floor = support.Collider, FloorFingerprint = BrakeFloorFingerprint(support.Collider), FloorCenter = support.Collider.bounds.center,
+                FloorSize = support.Collider.bounds.size, AnchorPoint = support.Point, AnchorNormal = support.Normal,
+                OriginalBody = BodyRow(), FrozenBody = baseline ? sessionBaselineFrozenBody : rest.FrozenBody,
+                FloorRow = ColliderRow(support.Collider), Anchor = SupportRow(support), OriginalNavigation = NavigationRow(),
+                OriginalMesh = routeMesh, OriginalHandle = routeMeshHandle, OriginalChange = routeTileChangeVersion, OriginalData = routeTileDataVersion,
+                OriginalPlan = routePlanLegs, OriginalIndex = routeIndex, Filter = routeFilter, BrakeRest = rest };
+            if (!baseline) { braking = commandBraking = false; replanAfterRest = true; }
+            if (!StationaryContextCurrent(stationary, "ENTRY", support, overlaps, clear, permission, water)) {
+                Block(frame, "UNKNOWN", "STATIONARY_ENTRY_CONTEXT_OR_CLOCK"); return false;
+            }
+            frame["NativeResult"] = "STATIONARY_OBSERVATION"; frame["WriterCalled"] = false;
+            Emit("STATIONARY_REPLAN_STARTED", frame); return ControlCurrent();
+        }
+
+        private bool StationaryContextCurrent(StationaryReplanContext s, string phase, SupportResult support, object[] overlaps, bool clear, bool permission, float water)
+        {
+            var actual = npc.transform.position; var rigid = body.position; var q = npc.transform.rotation;
+            var measured = (actual - s.Actual) / currentClock.Delta;
+            bool context = ControlCurrent() && s.Session == motionSession && s.Command == command && s.BaseActuations == actuations && !pending &&
+                !acquiring && !braking && retries == s.RetryBefore + 1 && s.RouteStarted == startWallTime && sessionGlobalDeadline == s.GlobalDeadline &&
+                routePlanLegs == s.OriginalPlan && routeMesh == s.OriginalMesh && routeMeshHandle == s.OriginalHandle &&
+                routeTileChangeVersion == s.OriginalChange && routeTileDataVersion == s.OriginalData && routeIndex == s.OriginalIndex && routeFilter == s.Filter &&
+                (destination - s.Goal).sqrMagnitude == 0 && (actual - s.Actual).sqrMagnitude == 0 && (rigid - s.RigidbodyPosition).sqrMagnitude == 0 &&
+                q.x == s.Rotation.x && q.y == s.Rotation.y && q.z == s.Rotation.z && q.w == s.Rotation.w &&
+                ExactZero(measured) && ExactZero(lastVelocity) && ExactZero(body.linearVelocity) && SameStationaryBody(s.FrozenBody);
+            bool floor = s.Floor != null && s.Floor.attachedRigidbody == null && BrakeFloorFingerprint(s.Floor) == s.FloorFingerprint &&
+                (s.Floor.bounds.center - s.FloorCenter).sqrMagnitude == 0 && (s.Floor.bounds.size - s.FloorSize).sqrMagnitude == 0 &&
+                support.Collider == s.Floor && Supported(support) && (support.Point - s.AnchorPoint).sqrMagnitude == 0 && (support.Normal - s.AnchorNormal).sqrMagnitude == 0;
+            var bodyRow = BodyRow(); double checkedWall = Time.realtimeSinceStartupAsDouble;
+            bool clock = ClockProblem(currentClock) == null;
+            bool accepted = context && floor && clear && permission && Finite(water) && water <= 0.15f && clock && checkedWall >= s.Started &&
+                checkedWall <= s.Deadline && checkedWall >= currentClock.WallTime && checkedWall - currentClock.WallTime <= MaxTick;
+            s.LastGuard = new { Phase = phase, Accepted = accepted, CheckedWall = checkedWall, Clock = ClockRow(currentClock), Body = bodyRow,
+                FrozenBody = StationaryBodyRow(CaptureStationaryBody()),
+                Actual = P(actual), RigidbodyPosition = P(rigid), NativeVelocity = P(body.linearVelocity), MeasuredVelocity = P(measured), ContextMatched = context,
+                FloorCurrent = floor, Support = SupportRow(support), Overlaps = overlaps, QueriesExecuted = true, OverlapClear = clear, Permission = permission, WaterDepth = water, ClockAccepted = clock,
+                ControlActive = active, ControlBlocked = blocked, ControlArrived = arrived, UnobservedTerminal = unobservedTerminal };
+            return accepted;
+        }
+
+        private bool StationaryQueryGuard(StationaryReplanContext s, string phase)
+        {
+            var actual = npc.transform.position; var support = Support(actual); var overlaps = new List<object>();
+            bool clear = Overlaps(actual, support, overlaps); bool permission = Permission(actual);
+            float water = WaterLevel.GetWaterSurface(actual, true, true, null) - actual.y;
+            bool physical = StationaryContextCurrent(s, phase, support, overlaps.ToArray(), clear, permission, water); var physicalRow = s.LastGuard;
+            s.Last = ReadStationaryNative(s);
+            bool native = SameStationaryNative(s, s.Last), unchanged = StationaryPoseCurrent(s); var row = BodyRow();
+            bool clock = ClockProblem(currentClock) == null; double checkedWall = Time.realtimeSinceStartupAsDouble;
+            bool accepted = physical && native && unchanged && clock && checkedWall >= currentClock.WallTime && checkedWall - currentClock.WallTime <= MaxTick && checkedWall <= s.Deadline;
+            s.LastGuard = new { Phase = phase, Accepted = accepted, CheckedWall = checkedWall, Clock = ClockRow(currentClock), Body = row,
+                Physical = physicalRow, Native = StationaryNativeRow(s.Last), NativeAccepted = native, Unchanged = unchanged, ClockAccepted = clock };
+            return accepted;
+        }
+
+        private bool StationaryPoseCurrent(StationaryReplanContext s)
+        {
+            var q = npc.transform.rotation;
+            return ControlCurrent() && !pending && actuations == s.BaseActuations && command == s.Command && motionSession == s.Session &&
+                (npc.transform.position - s.Actual).sqrMagnitude == 0 && (body.position - s.RigidbodyPosition).sqrMagnitude == 0 &&
+                q.x == s.Rotation.x && q.y == s.Rotation.y && q.z == s.Rotation.z && q.w == s.Rotation.w &&
+                ExactZero(lastVelocity) && ExactZero(body.linearVelocity) && SameStationaryBody(s.FrozenBody) && s.Floor != null && s.Floor.attachedRigidbody == null &&
+                BrakeFloorFingerprint(s.Floor) == s.FloorFingerprint && (s.Floor.bounds.center - s.FloorCenter).sqrMagnitude == 0 &&
+                (s.Floor.bounds.size - s.FloorSize).sqrMagnitude == 0;
+        }
+
+        private void ObserveStationaryReplan(Dictionary<string, object> frame, SupportResult support, object[] overlaps, bool clear, bool permission, float water)
+        {
+            var s = stationary;
+            if (!StationaryWaiting || !ControlCurrent()) return;
+            if (s.Observation >= 512 || !StationaryContextCurrent(s, "OBSERVATION", support, overlaps, clear, permission, water)) {
+                Block(frame, "UNKNOWN", "STATIONARY_REPLAN_CONTEXT_OR_BOUND"); return;
+            }
+            s.Observation++; var n = ReadStationaryNative(s); s.Last = n; string outcome;
+            bool changed = s.HasFirst && !SameStationaryNative(s, n);
+            if (!n.Ready || changed) {
+                outcome = "WAIT";
+                if (s.HasFirst) s.SpanRestarts++;
+                s.HasFirst = false; s.First = null;
+            } else {
+                outcome = s.HasFirst ? "WINDOW_ADVANCE" : "WINDOW_START";
+                if (!s.HasFirst) { s.HasFirst = true; s.First = n; s.FirstClock = currentClock; s.Span++; }
+                if (currentClock.WallTime - s.FirstClock.WallTime >= 2 && currentClock.FixedTime - s.FirstClock.FixedTime >= 2 &&
+                    currentClock.FixedUnscaledTime - s.FirstClock.FixedUnscaledTime >= 2 && n.Completed - s.First.Completed >= 2) outcome = "READY";
+            }
+            if (ClockProblem(currentClock) != null || Time.realtimeSinceStartupAsDouble > s.Deadline) {
+                Block(frame, "UNKNOWN", "STATIONARY_REPLAN_OBSERVATION_STALE"); return;
+            }
+            frame["NativeResult"] = "STATIONARY_OBSERVATION"; frame["WriterCalled"] = false; frame["MotionMode"] = "STATIONARY_NATIVE_WAIT";
+            frame["ObservedVelocity"] = P((npc.transform.position - s.Actual) / currentClock.Delta);
+            frame["StationaryObservation"] = new { Outcome = outcome, Reason = changed && n.Ready ? "NATIVE_OBJECT_OR_VERSION_CHANGED" : n.Reason,
+                Native = StationaryNativeRow(n), Guard = s.LastGuard };
+            if (outcome == "READY") {
+                s.State = "READY"; s.Ready = new { Clock = ClockRow(currentClock), FirstClock = ClockRow(s.FirstClock), Observation = s.Observation,
+                    Span = s.Span, SpanRestarts = s.SpanRestarts, FirstNative = StationaryNativeRow(s.First), LastNative = StationaryNativeRow(n) };
+            }
+            Emit("STATIONARY_REPLAN_OBSERVATION", frame);
+            if (!ControlCurrent()) return;
+            if (!StationaryPoseCurrent(s) || ClockProblem(currentClock) != null || Time.realtimeSinceStartupAsDouble > s.Deadline) {
+                Block(frame, "UNKNOWN", "STATIONARY_REPLAN_CHANGED_AFTER_OBSERVATION"); return;
+            }
+            if (outcome != "READY") return;
+            s.State = "PLANNING"; s.PlanStarted = Time.realtimeSinceStartupAsDouble; s.PlanCalls++;
+            bool accepted = Plan(s.Goal, null, s);
+            s.PlanCompleted = Time.realtimeSinceStartupAsDouble; s.PlanAccepted = accepted; s.PlanGuard = s.LastGuard;
+            if (!accepted) { Block(frame, "UNKNOWN", "STATIONARY_SINGLE_NATIVE_PLAN_REFUSED"); return; }
+            s.NewNavigation = NavigationRow(); s.Last = ReadStationaryNative(s);
+            if (!StationaryPoseCurrent(s) || !SameStationaryNative(s, s.Last) || ClockProblem(currentClock) != null || Time.realtimeSinceStartupAsDouble > s.Deadline) {
+                Block(frame, "UNKNOWN", "STATIONARY_COMMIT_CONTEXT_CHANGED"); return;
+            }
+            s.State = "COMMITTED"; frame["Navigation"] = s.NewNavigation;
+            frame["NativeResult"] = "ROUTE_REBOUND"; frame["Reason"] = "STATIONARY_NATIVE_ELIGIBILITY";
+            Emit("STATIONARY_REPLAN_COMMITTED", frame); if (!ControlCurrent()) return;
+            if (s.BrakeRest != null) {
+                frame["RestAdmission"] = s.BrakeRest.Admission;
+                frame["Recovery"] = brakeReceipt; // Original completed physical brake, never an extended recovery.
+                frame["RestReplan"] = new { Kind = "STATIONARY_PLAN", Accepted = true, Guard = s.PlanGuard, Time = s.PlanCompleted };
+                Emit("REPATH_AFTER_REST", frame); if (!ControlCurrent()) return; replanAfterRest = false;
+            }
+            Emit("REPATH", frame); // The next real FixedUpdate owns the first checked writer.
+        }
+
+        private object StationaryReplanSnapshot()
+        {
+            var s = stationary;
+            if (s == null) return null;
+            return new { Policy = "MEASURED_STATIONARY_NATIVE_V1", Id = s.Session, Entry = s.Entry, State = s.State, Session = s.Session,
+                Command = s.Command, BaseActuations = s.BaseActuations, CurrentCommand = command, CurrentActuations = actuations, CurrentPending = pending,
+                RetryBefore = s.RetryBefore, RetryAfter = s.RetryBefore + 1,
+                StartedWall = s.Started, RouteStartedWall = s.RouteStarted, RouteDeadline = s.RouteStarted + 120, GlobalDeadline = s.GlobalDeadline,
+                Deadline = s.Deadline, MaxSeconds = 20, MinStableSeconds = 2, MaxSamples = 512, Observation = s.Observation, Span = s.Span, SpanRestarts = s.SpanRestarts,
+                EntryClock = ClockRow(s.EntryClock), BaselineClock = sessionBaselineClock.HasValue ? ClockRow(sessionBaselineClock.Value) : null,
+                BaselineBody = sessionBaselineBody, BaselineFrozenBody = StationaryBodyRow(sessionBaselineFrozenBody), OriginalBody = s.OriginalBody,
+                FrozenBody = StationaryBodyRow(s.FrozenBody), Actual = P(s.Actual), RigidbodyPosition = P(s.RigidbodyPosition),
+                Goal = P(s.Goal), Floor = s.FloorRow, FloorCenter = P(s.FloorCenter), FloorSize = P(s.FloorSize), Anchor = s.Anchor,
+                OriginalNavigation = s.OriginalNavigation, OriginalBrakeRest = s.BrakeRest == null ? null : s.BrakeRest.Admission,
+                Ready = s.Ready, Native = StationaryNativeRow(s.Last), LastGuard = s.LastGuard,
+                Plan = s.PlanCalls == 0 ? null : new { CallCount = s.PlanCalls, NativeQueriesStarted = s.NativeQueriesStarted, Phase = s.PlanPhase,
+                    StartedWall = s.PlanStarted, CompletedWall = s.PlanCompleted, Accepted = s.PlanAccepted, Guard = s.PlanGuard, Navigation = s.NewNavigation },
+                FirstWriterCommand = s.FirstWriterCommand, Failure = s.Failure };
+        }
+
+        // Bench-only caller may request one measured recovery from its accepted
+        // moving witness callback. This queues intent and never actuates, plans,
+        // changes destination or resets a clock/velocity/budget.
+        public bool QueueMeasuredReplan()
+        {
+            if (!clockContext || pending || !active || arrived || blocked || acquiring || braking || diagnosticRecoveryQueued || recoveryAttempts != 0 ||
+                command <= 0 || commandClock.Sequence + 1 != currentClock.Sequence || body.linearVelocity.sqrMagnitude == 0 || ClockProblem(currentClock) != null)
+                return false;
+            diagnosticRecoveryQueued = true; diagnosticRecoverySequence = currentClock.Sequence; return true;
+        }
 
         // A bounded read-only production probe, also usable before door actions.
         // It cannot move, manufacture a successful witness or resolve a step.
@@ -218,14 +590,34 @@ namespace RustBots.Navigation
 
         public bool SetDestination(Vector3 destination, string stage)
         {
+            return SetDestinationCore(destination, stage, null);
+        }
+
+        public bool SetDestination(Vector3 destination, string stage, double absoluteGlobalDeadline)
+        {
+            if (!Finite(absoluteGlobalDeadline) || absoluteGlobalDeadline <= Time.realtimeSinceStartupAsDouble)
+                throw new ArgumentOutOfRangeException("absoluteGlobalDeadline", "EXPLICIT_GLOBAL_DEADLINE_INVALID");
+            return SetDestinationCore(destination, stage, absoluteGlobalDeadline);
+        }
+
+        private bool SetDestinationCore(Vector3 destination, string stage, double? absoluteGlobalDeadline)
+        {
+            if (StationaryWaiting) return false; // Reject another intent before any state/budget mutation.
             if (pending || unobservedTerminal) { Stop("UNOBSERVED_COMMAND"); return false; }
             if (acquiring) { Stop("ACQUISITION_ALREADY_ACTIVE_OR_FAILED"); return false; }
-            if (lastVelocity.magnitude > Numerical) { Stop("DESTINATION_CHANGE_BEFORE_OBSERVED_REST"); return false; }
+            if (braking || lastVelocity.sqrMagnitude != 0 || body.linearVelocity.sqrMagnitude != 0) { Stop("DESTINATION_CHANGE_BEFORE_OBSERVED_REST"); return false; }
             this.destination = destination; this.stage = stage ?? "UNSPECIFIED";
             active = true; arrived = blocked = false; reason = "ROUTE"; retries = 0; heightWitnesses = 0; unchangedWitnesses = 0;
             startWallTime = Time.realtimeSinceStartupAsDouble; lastTime = (float)startWallTime; lastPosition = npc.transform.position;
             clockReady = false; // A destination can be issued outside a physics callback.
+            sessionGlobalDeadline = absoluteGlobalDeadline; stationary = null; sessionBaselineClock = null; sessionBaselineBody = null; sessionBaselineFrozenBody = null;
+            acceptedBrakeZeroBody = null; acceptedBrakeZeroSession = acceptedBrakeZeroCommand = 0; acceptedBrakeZeroSequence = 0;
+            sessionBaseActuations = actuations; sessionBaseCommand = command;
             nativeAdmission = null;
+            motionSession++;
+            epochProofAttempts = 0; lastEpochAttemptSequence = 0; epochProofJournal.Clear(); epochProof = null;
+            recoveryAttempts = brakeStep = 0; braking = commandBraking = replanAfterRest = false; brakeReceipt = null;
+            diagnosticRecoveryQueued = false;
             if (!Finite(destination) || BodyProblem() != null || !Plan(destination))
             { Stop("UNKNOWN_ROUTE_OR_BODY"); return false; }
             supportDirection = Horizontal(route[routeIndex] - lastPosition).normalized;
@@ -234,6 +626,7 @@ namespace RustBots.Navigation
 
         public void Stop(string reason)
         {
+            StationaryFailure(reason, "STOP");
             agent.isStopped = true; agent.updatePosition = false; agent.updateRotation = false;
             if (pending) { reason = "UNOBSERVED_COMMAND:" + reason; unobservedTerminal = true; }
             active = false; arrived = false; blocked = true; this.reason = reason;
@@ -270,7 +663,10 @@ namespace RustBots.Navigation
                     { Block(frame, "UNKNOWN", problem ?? "CLOCK_BASELINE_NOT_STATIONARY"); return; }
                     frame["Classification"] = "CLEAR"; frame["NativeResult"] = "CLOCK_BASELINE";
                     frame["PosePrevious"] = P(lastPosition); frame["PosePreviousTime"] = lastTime; frame["ObservedVelocity"] = P(Vector3.zero);
+                    sessionBaselineClock = clock; sessionBaselineBody = BodyRow(); sessionBaselineFrozenBody = CaptureStationaryBody();
+                    sessionBaselinePosition = actual; sessionBaselineRigidbodyPosition = body.position;
                     Emit("CLOCK_BASELINE", frame);
+                    if (!ControlCurrent()) return;
                     lastPosition = actual; lastTime = (float)clock.WallTime; clockReady = true; return;
                 }
                 TickCore((float)clock.WallTime);
@@ -337,6 +733,7 @@ namespace RustBots.Navigation
             }
             if (pending)
             {
+                if (commandBraking) frame["Recovery"] = brakeReceipt;
                 var observedSweeps = new List<object>();
                 bool clear = Sweep(commandFrom, actual, support, observedSweeps);
                 float elapsed = (float)(currentClock.FixedTime - commandClock.FixedTime);
@@ -350,28 +747,37 @@ namespace RustBots.Navigation
                 frame["Distance"] = Vector3.Distance(commandFrom, actual); frame["Speed"] = speed; frame["Acceleration"] = acceleration;
                 frame["Sweeps"] = observedSweeps.ToArray(); frame["Classification"] = commandClass;
                 frame["NativeResult"] = "OBSERVED";
-                frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
+                frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : commandBraking ? "ACTUAL_BRAKE" : "SUPPORTED_ADVANCE";
                 frame["ObservedVelocity"] = P(velocity);
                 float nativeVelocityError = Vector3.Distance(body.linearVelocity, velocity);
                 bool nativeVelocityMatches = Finite(body.linearVelocity) && nativeVelocityError <= Numerical;
                 frame["NativeVelocityError"] = nativeVelocityError; frame["NativeVelocityMatches"] = nativeVelocityMatches;
-                if (!currentSafe || !clear || elapsed <= 0 || elapsed > MaxTick || Vector3.Distance(actual, commanded) > Numerical ||
+                if (!currentSafe || commandBraking && !BrakeFloorCurrent(support) || !clear || elapsed <= 0 || elapsed > MaxTick || Vector3.Distance(actual, commanded) > Numerical ||
                     !Finite(speed) || speed > maxSpeed + Numerical || acceleration > MaxAcceleration + Numerical ||
                     !nativeVelocityMatches || currentClock.Sequence != commandClock.Sequence + 1 ||
                     Math.Abs(currentClock.FixedTime - commandClock.FixedTime - commandClock.Delta) > ClockPrecision ||
                     commandAcquisition && (actual.x != commandFrom.x || actual.z != commandFrom.z || actual.y > commandFrom.y))
                 {
                     pending = false; pendingFrame = null; frame["NativeResult"] = "OBSERVED_UNSAFE";
-                    Emit("MOTION_WITNESS", frame); Emit("PHYSICAL_CONTACT", frame);
-                    Block(frame, "UNKNOWN", !clear || !overlapClear ? "KINEMATIC_CLIP" : !currentSafe ? "ACTUAL_SUPPORT_OR_PERMISSION_LOST" :
+                    Emit("MOTION_WITNESS", frame); if (!ControlCurrent()) return;
+                    Emit("PHYSICAL_CONTACT", frame); if (!ControlCurrent()) return;
+                    Block(frame, "UNKNOWN", commandBraking && !BrakeFloorCurrent(support) ? "BRAKE_SUPPORT_CHANGED" : !clear || !overlapClear ? "KINEMATIC_CLIP" : !currentSafe ? "ACTUAL_SUPPORT_OR_PERMISSION_LOST" :
                         !nativeVelocityMatches ? "NATIVE_VELOCITY_HORIZON_MISMATCH" : "ACTUATOR_DIVERGENCE_OR_CONTINUITY"); return;
                 }
                 string witnessClockProblem = ClockProblem(currentClock);
                 if (witnessClockProblem != null) { Stop("CLOCK_BEFORE_WITNESS_ACCEPT:" + witnessClockProblem); return; }
                 pending = false; pendingFrame = null;
+                if (sessionGlobalDeadline.HasValue && commandBraking && ExactZero(velocity) && ExactZero(body.linearVelocity) && acceptedBrakeZeroBody == null) {
+                    acceptedBrakeZeroBody = CaptureStationaryBody(); acceptedBrakeZeroSession = motionSession; acceptedBrakeZeroCommand = command;
+                    acceptedBrakeZeroSequence = currentClock.Sequence;
+                    frame["AcceptedBrakeZeroBody"] = StationaryBodyRow(acceptedBrakeZeroBody);
+                }
                 Emit("MOTION_WITNESS", frame);
-                if (currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision)
-                    Emit("SCHEDULER_LAG_ACCEPTED_PHYSICS_WITNESS", frame);
+                lastVelocity = velocity; lastPosition = actual; lastTime = now;
+                if (!ControlCurrent()) return;
+                if (currentClock.WallTime - previousClock.WallTime > MaxTick + ClockPrecision) {
+                    Emit("SCHEDULER_LAG_ACCEPTED_PHYSICS_WITNESS", frame); if (!ControlCurrent()) return;
+                }
                 unchangedWitnesses = !commandHold && Vector3.Distance(actual, commandFrom) <= 0.00001f ? unchangedWitnesses + 1 : 0;
                 if (unchangedWitnesses >= 3)
                 { Block(frame, "UNKNOWN", "STUCK_ACTUAL_POSE"); return; }
@@ -380,12 +786,26 @@ namespace RustBots.Navigation
                 {
                     if (heightClass != commandClass) { heightClass = commandClass; heightWitnesses = 0; }
                     heightWitnesses++;
-                    if (heightWitnesses == 2) Emit("STEP_RESOLVED", frame);
+                    if (heightWitnesses == 2) { Emit("STEP_RESOLVED", frame); if (!ControlCurrent()) return; }
                 }
                 else { heightWitnesses = 0; heightClass = null; }
-                lastVelocity = velocity; lastPosition = actual; lastTime = now;
+                if (commandBraking) { Emit("BRAKE_WITNESSED", frame); if (!ControlCurrent()) return; }
                 // A command's witness is the only work that can precede the next
                 // command; the initial decision below uses fresh sensor results.
+            }
+            if (braking && commandBraking && ExactZero(lastVelocity)) {
+                AcknowledgeBrakeRest(frame, actual); return;
+            }
+            if (StationaryWaiting) {
+                ObserveStationaryReplan(frame, support, overlaps.ToArray(), overlapClear, permission, waterDepth); return;
+            }
+            if (sessionGlobalDeadline.HasValue && stationary == null && sessionBaselineClock.HasValue && !braking && !acquiring &&
+                command == sessionBaseCommand && actuations == sessionBaseActuations && ExactZero(lastVelocity) && ExactZero(body.linearVelocity)) {
+                var readiness = ReadStationaryNative(null);
+                if (!readiness.Ready || !NavEpochMatches()) {
+                    if (!BeginStationaryReplan(frame, support, overlaps.ToArray(), overlapClear, permission, waterDepth)) { if (ControlCurrent()) Block(frame, "UNKNOWN", "STATIONARY_BASELINE_ENTRY_REFUSED"); return; }
+                    ObserveStationaryReplan(frame, support, overlaps.ToArray(), overlapClear, permission, waterDepth); return;
+                }
             }
             if (RustNavigation.Instance == null || RustNavigation.Instance.DefaultNavmesh == null ||
                 !RustNavigation.Instance.IsDefaultNavmeshBuilt() || !agent.isOnNavMesh)
@@ -394,8 +814,30 @@ namespace RustBots.Navigation
             {
                 frame["NavigationEpoch"] = new { OldChange = routeTileChangeVersion, OldData = routeTileDataVersion,
                     NewChange = RustNavigation.Instance.DefaultNavmesh.TileChangeVersion, NewData = RustNavigation.Instance.DefaultNavmesh.TileDataVersion };
+                if (lastVelocity.sqrMagnitude != 0 || braking) {
+                    RequestEpochBrake(frame, actual, support);
+                    return;
+                }
                 if (retries++ >= 1 || !Plan(destination)) { Block(frame, "UNKNOWN", "NAV_EPOCH_REPATH_FAILED_OR_EXHAUSTED"); return; }
                 frame["Navigation"] = NavigationRow(); frame["Reason"] = "NATIVE_NAV_EPOCH_CHANGED"; Emit("REPATH", frame);
+                if (!ControlCurrent()) return;
+            }
+            if (diagnosticRecoveryQueued)
+            {
+                diagnosticRecoveryQueued = false;
+                if (diagnosticRecoverySequence != currentClock.Sequence || pending || lastVelocity.sqrMagnitude == 0 || !currentSafe)
+                { UnsafeBrake(frame, "DIAGNOSTIC_RECOVERY_WITNESS_CONTEXT_LOST"); return; }
+                frame["Reason"] = "DIAGNOSTIC_PLANNED_REPLAN"; Emit("DIAGNOSTIC_REPLAN_CONSUMED", frame);
+                if (!ControlCurrent()) return;
+                RequestBrake(frame, "UNKNOWN", "DIAGNOSTIC_PLANNED_REPLAN"); return;
+            }
+            if (braking)
+            {
+                // Retain a genuinely accepted physical witness above, but never
+                // turn a late recovery completion into rest/replan success.
+                if (currentClock.WallTime - brakeClock.WallTime > MaxBrakeSeconds)
+                { Block(frame, "UNKNOWN", "BRAKE_RECOVERY_TIME_BUDGET"); return; }
+                IssueBrake(now, dt, actual); return;
             }
             if (acquiring)
             {
@@ -403,6 +845,7 @@ namespace RustBots.Navigation
                 {
                     frame["NativeResult"] = "OBSERVED"; frame["Reason"] = "ACTUAL_SUPPORTED_REST";
                     Emit("FLOOR_ACQUIRED", frame);
+                    if (!ControlCurrent()) return;
                     acquiring = false; commandAcquisition = false;
                     // This is the one initial route binding after floor capture,
                     // not a new recovery/repath budget or a cached surface.
@@ -476,9 +919,16 @@ namespace RustBots.Navigation
             { frame["Landing"] = landing == null ? null : SupportRow(landing); Obstacle(frame, "UNSUPPORTED_GAP", "NO_BOUNDED_SUPPORTED_TRAJECTORY"); return; }
             bool hold = Vector3.Distance(actual, requested) < 0.00001f && lastVelocity.magnitude <= MaxAcceleration * dt;
             if (hold) requested = actual; // Issue and witness exact rest, including vertical velocity.
+            IssueSupportedMotion(now, dt, actual, requested, support, overlaps, overlapClear, permission, waterDepth, hold, false);
+        }
+
+        private void IssueSupportedMotion(float now, float dt, Vector3 actual, Vector3 requested, SupportResult support,
+            List<object> overlaps, bool overlapClear, bool permission, float waterDepth, bool hold, bool brakingMotion)
+        {
+            var frame = Frame(now, actual);
             // Rebind the landing measurement to the final commanded pose rather
             // than retaining the exploratory same-height sphere-cast origin.
-            landing = Support(requested);
+            var landing = Support(requested);
             if (!Supported(landing)) { frame["Landing"] = SupportRow(landing); Obstacle(frame, "UNSUPPORTED_GAP", "FINAL_LANDING_INVALID"); return; }
             var sweeps = new List<object>(); var landingOverlaps = new List<object>();
             bool sweptClear = Sweep(actual, requested, support, sweeps);
@@ -497,29 +947,40 @@ namespace RustBots.Navigation
             float landingWater = WaterLevel.GetWaterSurface(requested, true, true, null) - requested.y;
             frame["LandingPermission"] = landingPermission; frame["LandingWaterDepth"] = landingWater;
             frame["LandingSupportAccepted"] = Supported(landing);
+            if (brakingMotion) frame["Recovery"] = brakeReceipt;
+            double probeSinkStarted = Time.realtimeSinceStartupAsDouble;
             Emit("OBSTACLE_PROBE", frame);
+            double probeSinkSeconds = Time.realtimeSinceStartupAsDouble - probeSinkStarted;
+            if (!ControlCurrent()) return;
             if (!sweptClear || !endClear || !landingPermission || !Finite(landingWater) || landingWater > 0.15f)
             {
                 Emit("PHYSICAL_CONTACT", frame);
+                if (!ControlCurrent()) return;
                 Obstacle(frame, closedDoorHit ? "DOOR_CLOSED" : dynamicHit ? "DYNAMIC_BLOCKED" : "SOLID_BLOCKED", "FULL_VOLUME_OR_PERMISSION_BLOCKED"); return;
             }
             if (Vector3.Distance(actual, requested) < 0.00001f && !hold) { Block(frame, "UNKNOWN", "NO_PROGRESS"); return; }
-            if (classification != "CLEAR") Emit("STEP_ATTEMPT", frame);
+            if (classification != "CLEAR") { Emit("STEP_ATTEMPT", frame); if (!ControlCurrent()) return; }
             if (evidence.Count >= MaxEvidence - 8) { Block(frame, "UNKNOWN", "EVIDENCE_BUDGET"); return; }
+            string probeClockProblem = ClockProblem(currentClock);
+            if (probeClockProblem != null) {
+                frame["NativeAdmissionFailure"] = new { Reason = "CLOCK_AFTER_PROBE:" + probeClockProblem, ProbeSinkSeconds = probeSinkSeconds,
+                    CheckedWall = Time.realtimeSinceStartupAsDouble, NativeQueryStarted = false };
+                Block(frame, "UNKNOWN", "CLOCK_AFTER_PROBE:" + probeClockProblem); return;
+            }
             if (!NavEpochMatches()) { Block(frame, "UNKNOWN", "NAV_EPOCH_CHANGED_DURING_PROBE"); return; }
-            if (!PrepareNativeAdmission(frame, actual, requested)) { Block(frame, "UNKNOWN", "NATIVE_ROUTE_ADMISSION:" + nativePathReason); return; }
+            if (!PrepareNativeAdmission(frame, actual, requested)) { frame["ProbeSinkSeconds"] = probeSinkSeconds; Block(frame, "UNKNOWN", "NATIVE_ROUTE_ADMISSION:" + nativePathReason); return; }
             string issueClockProblem = ClockProblem(currentClock);
             if (issueClockProblem != null) { Block(frame, "UNKNOWN", "CLOCK_BEFORE_ISSUE:" + issueClockProblem); return; }
             if (!Finite(body.linearVelocity) || Vector3.Distance(body.linearVelocity, lastVelocity) > Numerical)
             { Block(frame, "UNKNOWN", "NATIVE_VELOCITY_BEFORE_ISSUE"); return; }
             frame["NativeResult"] = "PRECHECKED";
             frame["IssuedClock"] = ClockRow(currentClock);
-            frame["MotionMode"] = hold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
+            frame["MotionMode"] = hold ? "BRAKE_HOLD" : brakingMotion ? "ACTUAL_BRAKE" : "SUPPORTED_ADVANCE";
             frame["DecisionPublishedWall"] = Time.realtimeSinceStartupAsDouble;
-            Emit("MOVE_DECISION", frame);
+            if (!PublishDecision(frame, actual, requested)) return;
             if (!NativeAdmissionCurrent(actual, requested, true)) { RejectNativeIntent(frame, "NATIVE_ROUTE_CHANGED_BEFORE_WRITER"); return; }
             frame["FinalAdmission"] = finalNativeAdmission;
-            command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = classification; commandHold = hold; commandAcquisition = false;
+            command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = classification; commandHold = hold; commandAcquisition = false; commandBraking = brakingMotion;
             commandClock = currentClock;
             pendingFrame = Copy(frame); pending = true;
             // This is the sole position actuator. No native collision response is
@@ -529,6 +990,381 @@ namespace RustBots.Navigation
             PublishNativeIssue(frame);
             acquisitionEligible = false;
             lastPosition = actual; lastTime = now;
+        }
+
+        private object RecoveryRow(object[] corridor = null, float required = 0)
+        {
+            return new { Kind = RecoveryPolicy, Trigger = brakeReason, Session = motionSession, Attempt = recoveryAttempts, StartSequence = brakeClock.Sequence, StartWall = brakeClock.WallTime,
+                StartPosition = P(brakeOrigin), StartVelocity = P(brakeVelocity), Step = brakeStep, MaxSteps = MaxBrakeSteps, MaxSeconds = MaxBrakeSeconds,
+                Deceleration = BrakeAcceleration, Floor = brakeFloor == null ? 0 : brakeFloor.GetInstanceID(),
+                FloorCenter = P(brakeFloorCenter), FloorSize = P(brakeFloorSize), FloorCollider = brakeFloorRow, Corridor = corridor ?? new object[0], RequiredDistance = required };
+        }
+
+        private void UnsafeBrake(Dictionary<string, object> frame, string why)
+        {
+            frame["Recovery"] = brakeReceipt ?? RecoveryRow(); frame["Reason"] = why;
+            frame["NativeResult"] = "NOT_ISSUED"; frame["RetainedVelocity"] = P(lastVelocity);
+            Emit("BLOCKED_UNSAFE_BRAKING", frame);
+            braking = false;
+            if (!ControlCurrent()) return;
+            Block(frame, "UNKNOWN", "NO_SAFE_BRAKING_TRAJECTORY:" + why);
+        }
+
+        private void RequestBrake(Dictionary<string, object> frame, string classification, string why)
+        {
+            if (!ControlCurrent()) return;
+            if (braking || recoveryAttempts != 0 || acquiring || !clockContext || pending || !NavEpochMatches())
+            { UnsafeBrake(frame, "RECOVERY_CONTEXT_OR_BUDGET_EXHAUSTED"); return; }
+            CaptureBrakeContext(classification, why, Support(npc.transform.position));
+            frame["Recovery"] = brakeReceipt; frame["Reason"] = "ROUTE_NO_SAFE_CANDIDATE:" + why; Emit("BRAKE_REQUESTED", frame);
+            if (!ControlCurrent()) return;
+            braking = true;
+            IssueBrake((float)currentClock.WallTime, currentClock.Delta, brakeOrigin);
+        }
+
+        private void CaptureBrakeContext(string classification, string why, SupportResult support)
+        {
+            brakeClock = currentClock; brakeOrigin = npc.transform.position; brakeVelocity = lastVelocity;
+            brakeStep = 0; recoveryAttempts++; brakeClassification = classification; brakeReason = why;
+            brakeFloor = support.Collider;
+            if (brakeFloor != null) { brakeFloorCenter = brakeFloor.bounds.center; brakeFloorSize = brakeFloor.bounds.size; }
+            brakeFloorFingerprint = BrakeFloorFingerprint(brakeFloor); brakeFloorRow = ColliderRow(brakeFloor);
+            brakeReceipt = RecoveryRow();
+        }
+
+        private void RequestEpochBrake(Dictionary<string, object> frame, Vector3 actual, SupportResult support)
+        {
+            if (!ControlCurrent()) return;
+            bool starts = !braking;
+            if (epochProofAttempts >= MaxBrakeSteps || lastEpochAttemptSequence == currentClock.Sequence || acquiring || !clockContext || pending ||
+                ExactZero(lastVelocity) || ClockProblem(currentClock) != null || commandClock.Sequence + 1 != currentClock.Sequence ||
+                (starts ? recoveryAttempts != 0 : recoveryAttempts != 1 || !commandBraking || brakeStep < 1 || brakeStep >= MaxBrakeSteps ||
+                    currentClock.Sequence != brakeClock.Sequence + brakeStep || currentClock.WallTime - brakeClock.WallTime > MaxBrakeSeconds))
+            { UnsafeBrake(frame, "EPOCH_PROOF_CONTEXT_OR_BUDGET_EXHAUSTED"); return; }
+            if (starts) CaptureBrakeContext("UNKNOWN", "NATIVE_EPOCH_REVALIDATED_BRAKE", support);
+            epochProofAttempts++; lastEpochAttemptSequence = currentClock.Sequence;
+            var p = new NativeEpochProof { Mesh = routeMesh, Handle = routeMeshHandle, Session = motionSession, Command = command, Index = routeIndex,
+                OldChange = routeTileChangeVersion, OldData = routeTileDataVersion, Filter = routeFilter, From = routeFrom, Goal = destination,
+                Actual = actual, Velocity = lastVelocity, NativeVelocity = body.linearVelocity, Corners = route.ToArray(), Polys = routePolys.ToArray(),
+                CommittedPlan = routePlanLegs, Started = Time.realtimeSinceStartupAsDouble, RouteStarted = startWallTime, Clock = currentClock,
+                Body = BodyRow(), Floor = brakeFloor, FloorCenter = brakeFloorCenter, FloorSize = brakeFloorSize,
+                FloorFingerprint = brakeFloorFingerprint, FloorRow = brakeFloorRow, Anchor = support, StartsBrake = starts, BeforeStep = brakeStep,
+                Ordinal = epochProofAttempts, PreviousOrdinal = epochProof == null ? 0 : epochProof.Ordinal,
+                PreviousCommand = epochProof == null ? 0 : epochProof.Command, PreviousSequence = epochProof == null ? 0 : epochProof.Clock.Sequence,
+                PreviousCompleted = epochProof == null ? 0 : epochProof.Completed, PriorChange = AdmissionChange, PriorData = AdmissionData,
+                BrakeClock = brakeClock, BrakeOrigin = brakeOrigin, BrakeVelocity = brakeVelocity, RecoveryAttempt = recoveryAttempts };
+            string failure = null;
+            try { if (!PrepareEpochProof(p)) failure = p.Failure ?? nativePathReason; }
+            catch (Exception ex) { failure = "EPOCH_NATIVE_EXCEPTION:" + ex.GetType().Name; }
+            if (failure != null) { RefuseEpochProof(frame, p, failure); return; }
+            braking = true;
+            IssueBrake((float)currentClock.WallTime, currentClock.Delta, actual, p);
+        }
+
+        private bool EpochProofContextMatches(NativeEpochProof p)
+        {
+            return ControlCurrent() && p != null && p.Session == motionSession && p.Mesh == routeMesh && p.Handle == routeMeshHandle &&
+                p.OldChange == routeTileChangeVersion && p.OldData == routeTileDataVersion && p.Filter == routeFilter && p.Index == routeIndex &&
+                p.CommittedPlan == routePlanLegs && p.RouteStarted == startWallTime && p.RecoveryAttempt == recoveryAttempts &&
+                p.BrakeClock.Sequence == brakeClock.Sequence && p.BrakeClock.WallTime == brakeClock.WallTime && p.BrakeClock.FixedTime == brakeClock.FixedTime &&
+                (p.BrakeOrigin - brakeOrigin).sqrMagnitude == 0 && (p.BrakeVelocity - brakeVelocity).sqrMagnitude == 0 && (p.From - routeFrom).sqrMagnitude == 0 &&
+                (p.Goal - destination).sqrMagnitude == 0 && p.Polys.SequenceEqual(routePolys) && p.Corners.SequenceEqual(route) &&
+                p.Floor != null && p.Floor.attachedRigidbody == null && p.Floor == brakeFloor && BrakeFloorFingerprint(p.Floor) == p.FloorFingerprint &&
+                (p.Floor.bounds.center - p.FloorCenter).sqrMagnitude == 0 && (p.Floor.bounds.size - p.FloorSize).sqrMagnitude == 0;
+        }
+
+        private bool EpochNativeStateCurrent(NativeEpochProof p, bool initial)
+        {
+            var nav = RustNavigation.Instance;
+            p.OriginalObjectMatched = p.Mesh == routeMesh; p.CurrentObjectMatched = nav != null && nav.DefaultNavmesh == p.Mesh;
+            if (!EpochProofContextMatches(p) || nav == null || nav.DefaultNavmesh != p.Mesh || p.Handle == IntPtr.Zero ||
+                p.Mesh.NavMeshHandle != p.Handle || !nav.IsDefaultNavmeshBuilt() || !agent.isOnNavMesh || agent.npcDoorsWillOpen != p.Filter ||
+                p.Mesh.TileChangeVersion != p.Change || p.Mesh.TileDataVersion != p.Data || BodyProblem() != null || ClockProblem(currentClock) != null) return false;
+            var build = p.Mesh.BuildParams;
+            if (build.agentMaxClimb != navClimb || build.agentMaxSlope != navSlope || build.agentRadius != navRadius || build.agentHeight != navHeight) return false;
+            return !initial || currentClock.Sequence == p.Clock.Sequence && (npc.transform.position - p.Actual).sqrMagnitude == 0 &&
+                (lastVelocity - p.Velocity).sqrMagnitude == 0 && (body.linearVelocity - p.NativeVelocity).sqrMagnitude == 0;
+        }
+
+        private object[] EpochRefs(RustNavmesh mesh, ulong[] refs, out bool valid)
+        {
+            var rows = new List<object>(); valid = true;
+            foreach (var r in refs) { bool current = r != 0 && mesh.IsValidPolyRef(r); valid &= current; rows.Add(new { Ref = r.ToString(), Valid = current }); }
+            return rows.ToArray();
+        }
+
+        private bool PrepareEpochProof(NativeEpochProof p)
+        {
+            p.Failure = "EPOCH_COMMITTED_CONTEXT_UNKNOWN";
+            var nav = RustNavigation.Instance;
+            if (p.Mesh == null || nav == null || nav.DefaultNavmesh != p.Mesh || p.Handle == IntPtr.Zero || p.Mesh.NavMeshHandle != p.Handle ||
+                p.CommittedPlan.Length != 1 || p.Polys.Length == 0 || p.Polys.Length >= NativePathCapacity || p.Index < 1 || p.Index >= p.Corners.Length ||
+                !BrakeFloorCurrent(p.Anchor)) return false;
+            p.Change = p.Mesh.TileChangeVersion; p.Data = p.Mesh.TileDataVersion; p.PendingBefore = nav.HasPendingTiles();
+            var build = p.Mesh.BuildParams; p.BuildBefore = new { Climb = build.agentMaxClimb, Slope = build.agentMaxSlope, Radius = build.agentRadius, Height = build.agentHeight };
+            if (!EpochNativeStateCurrent(p, true)) return false;
+            RustNavMeshPath original, actorOriginal, current, actorCurrent;
+            p.Failure = "EPOCH_ORIGINAL_NATIVE_QUERY";
+            if (!ReadNativePath(p.Mesh, p.From, p.Goal, p.Filter, out original, out actorOriginal)) return false;
+            p.OriginalQuery = NativePlanLeg(p.Mesh, p.From, p.Goal, p.Filter, p.Change, p.Data, original, actorOriginal);
+            bool oldValid, currentValid; p.OldRefsBefore = EpochRefs(p.Mesh, p.Polys, out oldValid);
+            p.Failure = "EPOCH_COMMITTED_GEOMETRY_CHANGED";
+            if (!original.polyRefs.Take(original.polyRefCount).SequenceEqual(p.Polys) || !original.corners.Select(c => c.Value).SequenceEqual(p.Corners) ||
+                !oldValid) return false;
+            p.Failure = "EPOCH_CURRENT_NATIVE_QUERY";
+            if (!ReadNativePath(p.Mesh, p.Actual, p.Goal, p.Filter, out current, out actorCurrent)) return false;
+            p.CurrentQuery = NativePlanLeg(p.Mesh, p.Actual, p.Goal, p.Filter, p.Change, p.Data, current, actorCurrent);
+            p.CurrentPolys = current.polyRefs.Take(current.polyRefCount).ToArray(); p.CurrentCorners = current.corners.Select(c => c.Value).ToArray();
+            p.CurrentRefsBefore = EpochRefs(p.Mesh, p.CurrentPolys, out currentValid); p.Suffix = p.Polys.Length - p.CurrentPolys.Length;
+            p.Failure = "EPOCH_CURRENT_COMMITTED_SUFFIX_CHANGED";
+            if (!currentValid || p.Suffix < 0 || !p.Polys.Skip(p.Suffix).SequenceEqual(p.CurrentPolys) || !p.Corners.Skip(p.Index).SequenceEqual(p.CurrentCorners.Skip(1))) return false;
+            p.NativeCompleted = Time.realtimeSinceStartupAsDouble; p.PendingAfterNative = nav.HasPendingTiles();
+            p.Failure = "EPOCH_CHANGED_DURING_NATIVE_PROOF";
+            return EpochNativeStateCurrent(p, true);
+        }
+
+        private bool EpochCorridorOnFirstLeg(NativeEpochProof p, Vector3[] points)
+        {
+            var leg = Horizontal(p.CurrentCorners[1] - p.Actual); float length = leg.magnitude;
+            if (length <= Numerical || points.Length < 3) return false;
+            foreach (var point in points) {
+                var delta = Horizontal(point - p.Actual); float along = Vector3.Dot(delta, leg.normalized);
+                if (along < -Numerical || along > length + Numerical || (delta - leg.normalized * along).magnitude > Numerical) return false;
+            }
+            return true;
+        }
+
+        private object EpochProofRow(NativeEpochProof p, bool accepted, string phase)
+        {
+            return new { Kind = "SAME_COMMITTED_ROUTE_EPOCH_V2", Accepted = accepted, Phase = phase, Actor = actor, World = world, Session = p.Session,
+                Attempt = p.Ordinal, Ordinal = p.Ordinal, MaxAttempts = MaxBrakeSteps, StartsBrake = p.StartsBrake, BeforeStep = p.BeforeStep, NextStep = p.BeforeStep + 1,
+                PreviousOrdinal = p.PreviousOrdinal, PreviousCommand = p.PreviousCommand, PreviousSequence = p.PreviousSequence, PreviousCompletedWall = p.PreviousCompleted,
+                PreviousAdmissionChange = p.PriorChange, PreviousAdmissionData = p.PriorData, BrakeClock = ClockRow(p.BrakeClock),
+                BrakeOrigin = P(p.BrakeOrigin), BrakeVelocity = P(p.BrakeVelocity), RecoveryAttempt = p.RecoveryAttempt,
+                Command = p.Command, Clock = ClockRow(p.Clock), StartedWall = p.Started, NativeCompletedWall = p.NativeCompleted, CompletedWall = p.Completed,
+                Mesh = p.Handle.ToString(), OriginalObjectMatched = p.OriginalObjectMatched, CurrentObjectMatched = p.CurrentObjectMatched,
+                ControlActive = active, ControlBlocked = blocked, ControlArrived = arrived, UnobservedTerminal = unobservedTerminal,
+                OldChange = p.OldChange, OldData = p.OldData, NewChange = p.Change, NewData = p.Data, Filter = p.Filter, OriginalIndex = p.Index,
+                RouteStartedWall = p.RouteStarted, From = P(p.From), Goal = P(p.Goal), Actual = P(p.Actual), Velocity = P(p.Velocity), NativeVelocity = P(p.NativeVelocity),
+                CommittedPlan = p.CommittedPlan, CommittedPolys = p.Polys.Select(r => r.ToString()).ToArray(), CommittedCorners = p.Corners.Select(P).ToArray(),
+                OriginalQuery = p.OriginalQuery, CurrentQuery = p.CurrentQuery, CurrentSuffix = p.Suffix, OldRefsBefore = p.OldRefsBefore, OldRefsAfter = p.OldRefsAfter,
+                CurrentRefsBefore = p.CurrentRefsBefore, CurrentRefsAfter = p.CurrentRefsAfter, GlobalPendingBefore = p.PendingBefore, GlobalPendingAfterNative = p.PendingAfterNative,
+                GlobalPendingAtSeal = p.PendingAtSeal, BuildBefore = p.BuildBefore, BuildAfter = p.BuildAfter, Body = p.Body, Floor = p.FloorRow, FloorCenter = P(p.FloorCenter), FloorSize = P(p.FloorSize),
+                Anchor = SupportRow(p.Anchor), RequiredDistance = p.Required, Corridor = p.Corridor, CorridorPoints = p.CorridorPoints == null ? null : p.CorridorPoints.Select(P).ToArray() };
+        }
+
+        private void RefuseEpochProof(Dictionary<string, object> frame, NativeEpochProof p, string why)
+        {
+            p.Completed = Time.realtimeSinceStartupAsDouble; p.Row = EpochProofRow(p, false, why);
+            RecordEpochProof(p);
+            frame["EpochRevalidation"] = p.Row; UnsafeBrake(frame, why);
+        }
+
+        private void RecordEpochProof(NativeEpochProof p)
+        {
+            if (epochProofJournal.Count != p.Ordinal - 1 || epochProofJournal.Count >= MaxBrakeSteps) throw new InvalidOperationException("EPOCH_JOURNAL_BUDGET_OR_ORDER");
+            epochProofJournal.Add(p.Row); // Flat immutable rows, never a nested previous-proof object.
+        }
+
+        private void AcknowledgeBrakeRest(Dictionary<string, object> frame, Vector3 actual)
+        {
+            var r = new BrakeRestContext { Session = motionSession, Step = brakeStep, Attempt = recoveryAttempts, Command = command,
+                Clock = currentClock, StartClock = brakeClock, Actual = actual, RigidbodyPosition = body.position, Goal = destination,
+                Origin = brakeOrigin, Velocity = brakeVelocity, FrozenBody = sessionGlobalDeadline.HasValue && acceptedBrakeZeroSession == motionSession &&
+                    acceptedBrakeZeroCommand == command && acceptedBrakeZeroSequence == currentClock.Sequence ? acceptedBrakeZeroBody : null };
+            if (!braking || !commandBraking || !RestContextCurrent(r, "REST_ACK")) {
+                frame["RestReplanGuard"] = r.LastGuard; BlockRest(frame, "BRAKE_REST_CONTEXT_UNCERTAIN"); return;
+            }
+            r.Admission = new { Policy = "EXACT_BRAKE_REST_V1", Session = r.Session, Command = r.Command, Step = r.Step, Attempt = r.Attempt,
+                Clock = ClockRow(r.Clock), BrakeClock = ClockRow(r.StartClock), Actual = P(r.Actual), RigidbodyPosition = P(r.RigidbodyPosition),
+                Goal = P(r.Goal), BrakeOrigin = P(r.Origin), BrakeVelocity = P(r.Velocity), Floor = brakeFloorRow, Guard = r.LastGuard, FrozenBody = StationaryBodyRow(r.FrozenBody) };
+            frame["RestAdmission"] = r.Admission; frame["Recovery"] = brakeReceipt; frame["Reason"] = "MEASURED_SUPPORTED_NATIVE_REST";
+            Emit("ACTUAL_REST", frame);
+            if (!RestContextCurrent(r, "AFTER_REST_SINK")) {
+                frame["RestReplanGuard"] = r.LastGuard; BlockRest(frame, "BRAKE_REST_CHANGED_AFTER_SINK"); return;
+            }
+            bool freshPlan = epochProofJournal.Count != 0 || !NavEpochMatches() || brakeReason == "DIAGNOSTIC_PLANNED_REPLAN";
+            if (freshPlan && sessionGlobalDeadline.HasValue) {
+                var current = Support(actual); var contacts = new List<object>(); bool clear = Overlaps(actual, current, contacts);
+                bool permission = Permission(actual); float water = WaterLevel.GetWaterSurface(actual, true, true, null) - actual.y;
+                if (!clear || !permission || !Finite(water) || water > 0.15f || !BeginStationaryReplan(frame, current, contacts.ToArray(), clear, permission, water, r)) {
+                    if (ControlCurrent()) BlockRest(frame, "STATIONARY_BRAKE_REST_ENTRY_REFUSED"); return;
+                }
+                ObserveStationaryReplan(frame, current, contacts.ToArray(), clear, permission, water); return;
+            }
+            braking = commandBraking = false; replanAfterRest = true;
+            if (freshPlan) {
+                bool planned = Plan(r.Goal, r);
+                if (!planned) RestContextCurrent(r, "REST_PLAN_REFUSED");
+                frame["RestReplan"] = new { Kind = "PLAN", Accepted = planned, Guard = r.LastGuard, Time = Time.realtimeSinceStartupAsDouble };
+                if (!planned) { BlockRest(frame, "BRAKE_REST_NATIVE_REPLAN_INVALID"); return; }
+                frame["Navigation"] = NavigationRow(); frame["Reason"] = brakeReason;
+                Emit("REPATH_AFTER_REST", frame); if (!ControlCurrent()) return;
+                replanAfterRest = false; Emit("REPATH", frame); return;
+            }
+            Obstacle(frame, brakeClassification, brakeReason, r);
+        }
+
+        private void BlockRest(Dictionary<string, object> frame, string why)
+        {
+            frame["NativeResult"] = "NOT_ISSUED"; frame["WriterCalled"] = false; frame["PendingDecision"] = null;
+            Block(frame, "UNKNOWN", why);
+        }
+
+        private bool RestContextCurrent(BrakeRestContext r, string phase)
+        {
+            var actual = npc.transform.position; var rigid = body.position; var native = body.linearVelocity;
+            bool bodyValid = BodyProblem() == null;
+            bool context = ControlCurrent() && r.Session == motionSession && r.Command == command && r.Step == brakeStep && r.Attempt == recoveryAttempts && r.Attempt == 1 &&
+                r.Step >= 1 && r.Step <= MaxBrakeSteps && !pending && commandClock.Sequence + 1 == currentClock.Sequence &&
+                r.Clock.Sequence == currentClock.Sequence && currentClock.Sequence == brakeClock.Sequence + brakeStep &&
+                r.StartClock.Sequence == brakeClock.Sequence && r.StartClock.WallTime == brakeClock.WallTime &&
+                (r.Origin - brakeOrigin).sqrMagnitude == 0 && (r.Velocity - brakeVelocity).sqrMagnitude == 0 && (r.Goal - destination).sqrMagnitude == 0 &&
+                (actual - r.Actual).sqrMagnitude == 0 && (rigid - r.RigidbodyPosition).sqrMagnitude == 0 && ExactZero(lastVelocity) && ExactZero(native) && bodyValid &&
+                (!sessionGlobalDeadline.HasValue || SameStationaryBody(r.FrozenBody));
+            SupportResult support = null; var overlaps = new List<object>(); bool clear = false, floor = false, permission = false; float? water = null;
+            if (context) {
+                support = Support(actual); clear = Overlaps(actual, support, overlaps); floor = BrakeFloorCurrent(support);
+                permission = Permission(actual); water = WaterLevel.GetWaterSurface(actual, true, true, null) - actual.y;
+            }
+            bool clock = ClockProblem(currentClock) == null && currentClock.WallTime - brakeClock.WallTime <= MaxBrakeSeconds &&
+                currentClock.FixedTime - brakeClock.FixedTime <= MaxBrakeSeconds;
+            bool unchanged = ControlCurrent() && (npc.transform.position - r.Actual).sqrMagnitude == 0 && (body.position - r.RigidbodyPosition).sqrMagnitude == 0 &&
+                ExactZero(body.linearVelocity) && ExactZero(lastVelocity) && BodyProblem() == null &&
+                (!sessionGlobalDeadline.HasValue || SameStationaryBody(r.FrozenBody)) &&
+                brakeFloor != null && brakeFloor.attachedRigidbody == null && BrakeFloorFingerprint(brakeFloor) == brakeFloorFingerprint &&
+                (brakeFloor.bounds.center - brakeFloorCenter).sqrMagnitude == 0 && (brakeFloor.bounds.size - brakeFloorSize).sqrMagnitude == 0;
+            double checkedWall = Time.realtimeSinceStartupAsDouble;
+            bool accepted = context && clear && floor && permission && water.HasValue && Finite(water.Value) && water.Value <= 0.15f && clock && unchanged &&
+                checkedWall >= r.Clock.WallTime && checkedWall - r.Clock.WallTime <= MaxTick;
+            r.LastGuard = new { Policy = "EXACT_BRAKE_REST_V1", Phase = phase, Accepted = accepted, Session = r.Session, Command = r.Command, Step = r.Step,
+                CheckedWall = checkedWall, Clock = ClockRow(r.Clock), Actual = P(npc.transform.position), RigidbodyPosition = P(body.position),
+                NativeVelocity = P(body.linearVelocity), MeasuredVelocity = P(lastVelocity), BodyValid = bodyValid, ContextMatched = context,
+                AcceptedBrakeZeroBody = StationaryBodyRow(r.FrozenBody), CurrentFrozenBody = sessionGlobalDeadline.HasValue ? StationaryBodyRow(CaptureStationaryBody()) : null,
+                ControlActive = active, ControlBlocked = blocked, ControlArrived = arrived, UnobservedTerminal = unobservedTerminal,
+                QueriesExecuted = context, FloorCurrent = context ? (bool?)floor : null, Support = support == null ? null : SupportRow(support), Overlaps = overlaps.ToArray(),
+                OverlapClear = context ? (bool?)clear : null, Permission = context ? (bool?)permission : null, WaterDepth = water, ClockAccepted = clock, Unchanged = unchanged };
+            return accepted;
+        }
+
+        private bool BrakeFloorCurrent(SupportResult s)
+        {
+            var entity = brakeFloor == null ? null : brakeFloor.GetComponentInParent<BaseEntity>();
+            return brakeFloor != null && brakeFloor.attachedRigidbody == null && !(entity is Door) && !(entity is BasePlayer) && !(entity is BaseVehicle) &&
+                s.Collider == brakeFloor && Supported(s) &&
+                BrakeFloorFingerprint(brakeFloor) == brakeFloorFingerprint &&
+                brakeFloor.bounds.center == brakeFloorCenter && brakeFloor.bounds.size == brakeFloorSize;
+        }
+
+        private string BrakeFloorFingerprint(Collider c)
+        {
+            if (c == null) return null;
+            var entity = c.GetComponentInParent<BaseEntity>();
+            return c.GetInstanceID() + "|" + c.GetType().FullName + "|" + c.gameObject.layer + "|" + c.enabled + "|" + c.isTrigger + "|" +
+                (entity == null ? "STATIC" : entity.GetType().FullName + ":" + (entity.net == null ? "NO_NET" : entity.net.ID.Value.ToString()) + ":" + entity.OwnerID + ":" + entity.PrefabName);
+        }
+
+        // No support projection is used to manufacture a new velocity. Each
+        // candidate follows the measured three-dimensional momentum and reduces
+        // it by 3m/s², leaving the original 4m/s² bound for float quantization.
+        private bool CheckBrakeCorridor(Vector3 actual, float dt, out Vector3 requested, out object[] corridor, out float required, out Vector3[] corridorPoints)
+        {
+            requested = actual; required = lastVelocity.sqrMagnitude / (2f * BrakeAcceleration) + lastVelocity.magnitude * dt + skin;
+            var points = new List<Vector3> { actual }; corridorPoints = new Vector3[0];
+            var rows = new List<object>(); corridor = new object[0];
+            Vector3 position = actual, velocity = lastVelocity; float length = 0; bool stopped = false;
+            for (int i = 0; i < MaxBrakeSteps - brakeStep; i++)
+            {
+                Vector3 nextVelocity = Vector3.MoveTowards(velocity, Vector3.zero, BrakeAcceleration * dt);
+                Vector3 next = position + nextVelocity * dt;
+                Vector3 measured = (next - position) / dt;
+                if (!Finite(measured) || measured.magnitude >= velocity.magnitude || measured.magnitude > maxSpeed ||
+                    (measured - velocity).magnitude / dt > MaxAcceleration + Numerical || Vector3.Dot(measured, lastVelocity) < 0 ||
+                    currentClock.FixedTime - brakeClock.FixedTime + (i + 1) * dt > MaxBrakeSeconds)
+                    return false;
+                object row;
+                points.Add(next);
+                if (!BrakeSegment(position, next, velocity, measured, dt, "DECELERATION", out row)) { rows.Add(row); corridor = rows.ToArray(); corridorPoints = points.ToArray(); return false; }
+                rows.Add(row); length += Vector3.Distance(position, next);
+                if (i == 0) requested = next;
+                position = next; velocity = measured;
+                if (velocity.sqrMagnitude == 0) { stopped = true; break; }
+            }
+            if (!stopped) { corridor = rows.ToArray(); return false; }
+            // Include v²/2a + one future dt + native skin, rather than checking
+            // only the first deceleration point and discovering a wall too late.
+            Vector3 reserve = position + lastVelocity.normalized * (Mathf.Max(0, required - length) + Numerical);
+            object reserveRow;
+            bool clear = BrakeSegment(position, reserve, Vector3.zero, Vector3.zero, dt, "RESERVE", out reserveRow);
+            rows.Add(reserveRow); corridor = rows.ToArray(); points.Add(reserve); corridorPoints = points.ToArray();
+            return clear && length + Vector3.Distance(position, reserve) + Numerical >= required;
+        }
+
+        private bool BrakeSegment(Vector3 from, Vector3 to, Vector3 prior, Vector3 velocity, float dt, string kind, out object row)
+        {
+            var support = Support(from); var landing = Support(to);
+            var overlaps = new List<object>(); var landingOverlaps = new List<object>(); var sweeps = new List<object>();
+            bool currentClear = Overlaps(from, support, overlaps), endClear = Overlaps(to, landing, landingOverlaps);
+            bool sweptClear = Sweep(from, to, support, sweeps), permission = Permission(from), landingPermission = Permission(to);
+            float water = WaterLevel.GetWaterSurface(from, true, true, null) - from.y, landingWater = WaterLevel.GetWaterSurface(to, true, true, null) - to.y;
+            row = new { Kind = kind, From = P(from), Requested = P(to), PriorVelocity = P(prior), Velocity = P(velocity), Dt = dt,
+                Support = SupportRow(support), Landing = SupportRow(landing), Sweeps = sweeps.ToArray(), Overlaps = overlaps.ToArray(), LandingOverlaps = landingOverlaps.ToArray(),
+                Permission = permission, WaterDepth = water, SupportAccepted = Supported(support), OverlapClear = currentClear,
+                LandingPermission = landingPermission, LandingWaterDepth = landingWater, LandingSupportAccepted = Supported(landing) };
+            return BrakeFloorCurrent(support) && BrakeFloorCurrent(landing) && currentClear && endClear && sweptClear && permission && landingPermission &&
+                Finite(water) && water <= 0.15f && Finite(landingWater) && landingWater <= 0.15f &&
+                Mathf.Abs(to.y - from.y) <= (to.y >= from.y ? maxStep : maxDrop);
+        }
+
+        private void IssueBrake(float now, float dt, Vector3 actual, NativeEpochProof staged = null)
+        {
+            var frame = Frame(now, actual);
+            if (!braking || pending || brakeStep >= MaxBrakeSteps || currentClock.Sequence != brakeClock.Sequence + brakeStep ||
+                currentClock.WallTime - brakeClock.WallTime > MaxBrakeSeconds || (staged == null ? !NavEpochMatches() : !EpochNativeStateCurrent(staged, true)) || !Finite(lastVelocity) || lastVelocity.sqrMagnitude == 0 ||
+                !Finite(body.linearVelocity) || Vector3.Distance(body.linearVelocity, lastVelocity) > Numerical)
+            { if (staged != null) RefuseEpochProof(frame, staged, "EPOCH_BRAKE_CONTEXT_CHANGED_OR_EXHAUSTED"); else UnsafeBrake(frame, "BRAKE_CONTEXT_CHANGED_OR_EXHAUSTED"); return; }
+            supportDirection = Horizontal(lastVelocity).normalized;
+            Vector3 requested; object[] corridor; float required; Vector3[] corridorPoints;
+            bool clear = CheckBrakeCorridor(actual, dt, out requested, out corridor, out required, out corridorPoints);
+            if (staged != null) { staged.Corridor = corridor; staged.CorridorPoints = corridorPoints; staged.Required = required; }
+            if (!clear) { brakeReceipt = RecoveryRow(corridor, required); if (staged != null) RefuseEpochProof(frame, staged, "BRAKE_INSUFFICIENT_SUPPORTED_SPACE"); else UnsafeBrake(frame, "BRAKE_INSUFFICIENT_SUPPORTED_SPACE"); return; }
+            if (staged == null) brakeStep++;
+            brakeReceipt = RecoveryRow(corridor, required);
+            var support = Support(actual); var overlaps = new List<object>(); bool overlapClear = Overlaps(actual, support, overlaps);
+            bool permission = Permission(actual); float water = WaterLevel.GetWaterSurface(actual, true, true, null) - actual.y;
+            if (!BrakeFloorCurrent(support) || !overlapClear || !permission || !Finite(water) || water > 0.15f)
+            { if (staged != null) RefuseEpochProof(frame, staged, "BRAKE_CURRENT_GEOMETRY_CHANGED"); else UnsafeBrake(frame, "BRAKE_CURRENT_GEOMETRY_CHANGED"); return; }
+            if (staged != null) {
+                if (!SealEpochProof(staged)) { RefuseEpochProof(frame, staged, staged.Failure); return; }
+                RecordEpochProof(staged);
+                epochProof = staged; nativeAdmission = null;
+                frame["EpochRevalidation"] = staged.Row; frame["Navigation"] = NavigationRow(); frame["Recovery"] = brakeReceipt; frame["Support"] = SupportRow(support); frame["Overlaps"] = overlaps.ToArray();
+                Conditions(frame, actual, support, overlapClear, permission, water);
+                frame["WriterCalled"] = false; frame["UnobservedCommand"] = false; frame["PendingDecision"] = null;
+                frame["Reason"] = "SAME_COMMITTED_ROUTE_BRAKE_ONLY"; frame["NativeResult"] = "REVALIDATED"; Emit("NATIVE_ROUTE_EPOCH_REVALIDATED", frame);
+                if (!ControlCurrent()) return;
+                if (staged.StartsBrake) { frame["Reason"] = "ROUTE_NO_SAFE_CANDIDATE:NATIVE_EPOCH_REVALIDATED_BRAKE"; Emit("BRAKE_REQUESTED", frame); }
+                if (!ControlCurrent()) return;
+                brakeStep++; brakeReceipt = RecoveryRow(corridor, required);
+            }
+            IssueSupportedMotion(now, dt, actual, requested, support, overlaps, overlapClear, permission, water, (requested - actual).sqrMagnitude == 0, true);
+        }
+
+        private bool SealEpochProof(NativeEpochProof p)
+        {
+            try {
+                p.Failure = "EPOCH_BRAKE_OUTSIDE_COMMITTED_FIRST_LEG";
+                if (!EpochCorridorOnFirstLeg(p, p.CorridorPoints)) return false;
+                bool oldValid, currentValid; p.OldRefsAfter = EpochRefs(p.Mesh, p.Polys, out oldValid); p.CurrentRefsAfter = EpochRefs(p.Mesh, p.CurrentPolys, out currentValid);
+                p.Failure = "EPOCH_CHANGED_DURING_CORRIDOR_PROOF";
+                if (!oldValid || !currentValid || !EpochNativeStateCurrent(p, true)) return false;
+                p.PendingAtSeal = RustNavigation.Instance.HasPendingTiles();
+                var build = p.Mesh.BuildParams; p.BuildAfter = new { Climb = build.agentMaxClimb, Slope = build.agentMaxSlope, Radius = build.agentRadius, Height = build.agentHeight };
+                if (!EpochNativeStateCurrent(p, true)) return false;
+                p.Completed = Time.realtimeSinceStartupAsDouble;
+                if (p.Completed - p.Clock.WallTime > MaxTick) return false;
+                p.Sealed = true; p.Row = EpochProofRow(p, true, "SEALED_BRAKE_ONLY"); return true;
+            } catch (Exception ex) { p.Failure = "EPOCH_SEAL_EXCEPTION:" + ex.GetType().Name; return false; }
         }
 
         private bool AcquisitionFloor(SupportResult s)
@@ -597,8 +1433,9 @@ namespace RustBots.Navigation
             frame["LandingPermission"] = landingPermission; frame["LandingWaterDepth"] = landingWater;
             frame["LandingSupportAccepted"] = Supported(landing);
             Emit("OBSTACLE_PROBE", frame);
+            if (!ControlCurrent()) return;
             if (!sweepClear || !endpointClear || !AcquisitionSupported(requested, landing) || !landingPermission || !Finite(landingWater) || landingWater > 0.15f)
-            { Emit("PHYSICAL_CONTACT", frame); Block(frame, "UNKNOWN", "ACQUISITION_TRAJECTORY_UNSAFE"); return; }
+            { Emit("PHYSICAL_CONTACT", frame); if (!ControlCurrent()) return; Block(frame, "UNKNOWN", "ACQUISITION_TRAJECTORY_UNSAFE"); return; }
             if (!NavEpochMatches() || evidence.Count >= MaxEvidence - 8)
             { Block(frame, "UNKNOWN", "ACQUISITION_NAV_OR_EVIDENCE_BUDGET"); return; }
             if (!PrepareNativeAdmission(frame, actual, requested)) { Block(frame, "UNKNOWN", "ACQUISITION_NATIVE_ROUTE_ADMISSION:" + nativePathReason); return; }
@@ -607,7 +1444,8 @@ namespace RustBots.Navigation
             if (!Finite(body.linearVelocity) || Vector3.Distance(body.linearVelocity, lastVelocity) > Numerical)
             { Block(frame, "UNKNOWN", "NATIVE_VELOCITY_BEFORE_ACQUISITION_ISSUE"); return; }
             frame["NativeResult"] = "PRECHECKED"; frame["IssuedClock"] = ClockRow(currentClock);
-            frame["DecisionPublishedWall"] = Time.realtimeSinceStartupAsDouble; Emit("MOVE_DECISION", frame);
+            frame["DecisionPublishedWall"] = Time.realtimeSinceStartupAsDouble;
+            if (!PublishDecision(frame, actual, requested)) return;
             if (!NativeAdmissionCurrent(actual, requested, true)) { RejectNativeIntent(frame, "ACQUISITION_NATIVE_ROUTE_CHANGED_BEFORE_WRITER"); return; }
             frame["FinalAdmission"] = finalNativeAdmission;
             command++; commanded = requested; commandFrom = actual; commandTime = now; commandClass = "CLEAR";
@@ -654,7 +1492,7 @@ namespace RustBots.Navigation
                 frame["NativeVelocityError"] = error; frame["NativeVelocityMatches"] = Finite(body.linearVelocity) && error <= Numerical;
                 frame["SweepClear"] = sweepClear;
                 frame["TerminalSupportValid"] = acquiring ? AcquisitionSupported(actual, support) : Supported(support);
-                frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : "SUPPORTED_ADVANCE";
+                frame["MotionMode"] = commandAcquisition ? commandHold ? "ACQUISITION_BRAKE_HOLD" : "FLOOR_ACQUISITION" : commandHold ? "BRAKE_HOLD" : commandBraking ? "ACTUAL_BRAKE" : "SUPPORTED_ADVANCE";
                 frame["NativeResult"] = "OBSERVED_WALL_LATE";
             }
             catch (Exception ex) { frame["ObservationError"] = ex.GetType().Name + ":" + ex.Message; }
@@ -670,6 +1508,7 @@ namespace RustBots.Navigation
             if (c.WallTime < startWallTime || wallNow < c.WallTime || clockReady && c.WallTime < previousClock.WallTime)
                 return "WALL_REGRESSION";
             if (c.WallTime - startWallTime > 120.0) return "WALL_DEADLINE";
+            if (sessionGlobalDeadline.HasValue && (c.WallTime > sessionGlobalDeadline.Value || wallNow > sessionGlobalDeadline.Value)) return "GLOBAL_DEADLINE";
             if (wallNow - c.WallTime > MaxTick + ClockPrecision) return "CALLBACK_EXECUTION_STALE";
             if (clockReady && c.WallTime - previousClock.WallTime > maxWallStall + ClockPrecision)
                 return "LONG_STALL_UNSAFE";
@@ -710,26 +1549,45 @@ namespace RustBots.Navigation
                 Sequence = c.Sequence, Frame = c.Frame, PhysicsMode = c.PhysicsMode, MaximumDelta = c.MaximumDelta };
         }
 
-        private bool Plan(Vector3 end)
+        private bool Plan(Vector3 end, BrakeRestContext rest = null, StationaryReplanContext stationaryPlan = null)
         {
+            if (!ControlCurrent()) return false;
+            if (stationaryPlan != null) {
+                stationaryPlan.PlanPhase = "READY_PREQUERY";
+                if (!StationaryQueryGuard(stationaryPlan, "READY_PREQUERY")) return false;
+            }
             var nav = RustNavigation.Instance;
             if (nav == null || nav.DefaultNavmesh == null || !nav.IsDefaultNavmeshBuilt() || nav.HasPendingTiles()) return false;
             var mesh = nav.DefaultNavmesh; var build = mesh.BuildParams;
             if (build.agentMaxClimb != navClimb || build.agentMaxSlope != navSlope || build.agentRadius != navRadius || build.agentHeight != navHeight) return false;
             int change = mesh.TileChangeVersion, data = mesh.TileDataVersion; IntPtr handle = mesh.NavMeshHandle;
             if (handle == IntPtr.Zero) return false;
-            routeFrom = npc.transform.position;
+            var plannedFrom = npc.transform.position;
             RustNavMeshPath path, corroboration; bool filter = agent.npcDoorsWillOpen;
-            bool calculated = ReadNativePath(mesh, routeFrom, end, filter, out path, out corroboration);
+            if (stationaryPlan != null) { stationaryPlan.NativeQueriesStarted = true; stationaryPlan.PlanPhase = "NATIVE_QUERY"; }
+            bool calculated = ReadNativePath(mesh, plannedFrom, end, filter, out path, out corroboration);
             routeStatus = calculated ? path.status.ToString() : "NATIVE_QUERY_FAILED:" + nativePathReason;
             if (!calculated || nav.HasPendingTiles() || agent.npcDoorsWillOpen != filter ||
                 nav.DefaultNavmesh != mesh || mesh.NavMeshHandle != handle || mesh.TileChangeVersion != change || mesh.TileDataVersion != data) return false;
+            var planRow = NativePlanLeg(mesh, plannedFrom, end, filter, change, data, path, corroboration);
+            if (stationaryPlan != null) {
+                stationaryPlan.PlanPhase = "READY_PRECOMMIT";
+                if (!StationaryQueryGuard(stationaryPlan, "READY_PRECOMMIT") || nav.HasPendingTiles() || nav.DefaultNavmesh != mesh ||
+                    mesh.NavMeshHandle != handle || mesh.TileChangeVersion != change || mesh.TileDataVersion != data || agent.npcDoorsWillOpen != filter || ClockProblem(currentClock) != null) return false;
+            }
+            if (rest != null && (!RestContextCurrent(rest, "REST_PLAN_PRECOMMIT") || nav.HasPendingTiles() || nav.DefaultNavmesh != mesh ||
+                mesh.NavMeshHandle != handle || mesh.TileChangeVersion != change || mesh.TileDataVersion != data || agent.npcDoorsWillOpen != filter || ClockProblem(currentClock) != null)) return false;
+            if (!ControlCurrent()) return false;
             routeMesh = mesh; routeTileChangeVersion = change; routeTileDataVersion = data;
+            routeFrom = plannedFrom;
             routeMeshHandle = handle;
             routePolys = path.polyRefs.Take(path.polyRefCount).ToArray();
             routeFilter = filter;
-            routePlanLegs = new[] { NativePlanLeg(mesh, routeFrom, end, filter, change, data, path, corroboration) };
-            route.Clear(); route.AddRange(path.corners.Select(x => x.Value)); routeIndex = 1; return true;
+            epochProof = null;
+            routePlanLegs = new[] { planRow };
+            route.Clear(); route.AddRange(path.corners.Select(x => x.Value)); routeIndex = 1;
+            if (stationaryPlan != null) stationaryPlan.PlanPhase = "COMMITTED_NATIVE";
+            return true;
         }
 
         private object NativePlanLeg(RustNavmesh mesh, Vector3 from, Vector3 to, bool filter, int change, int data, RustNavMeshPath path, RustNavMeshPath corroboration)
@@ -784,9 +1642,11 @@ namespace RustBots.Navigation
             RustNavMeshPath path, corroboration;
             if (!ReadNativePath(mesh, from, destination, filter, out path, out corroboration)) {
                 frame["NativeAdmissionFailure"] = new { Reason = nativePathReason, GlobalPending = globalBefore,
+                    StartedWall = started, CompletedWall = Time.realtimeSinceStartupAsDouble, NativePhaseSeconds = Time.realtimeSinceStartupAsDouble - started,
                     NativeStatus = path.status.ToString(), ActorStatus = corroboration.status.ToString(), path.polyRefCount, Corners = path.corners.Count };
                 return false;
             }
+            double nativeCompleted = Time.realtimeSinceStartupAsDouble;
             var polys = path.polyRefs.Take(path.polyRefCount).ToArray();
             var oldRows = new List<object>(); var freshRows = new List<object>(); bool valid = true;
             foreach (var p in routePolys) { bool v = p != 0 && mesh.IsValidPolyRef(p); oldRows.Add(new { Ref = p.ToString(), Valid = v }); valid &= v; }
@@ -798,9 +1658,19 @@ namespace RustBots.Navigation
                 along > leg.magnitude + Numerical || (delta - leg.normalized * along).magnitude > Numerical)) return false;
             bool globalAfter = nav.HasPendingTiles(); double completed = Time.realtimeSinceStartupAsDouble;
             nativePathReason = "NATIVE_ROUTE_CHANGED_DURING_CHECK";
-            if (!valid || handle == IntPtr.Zero || nav.DefaultNavmesh != mesh || mesh.NavMeshHandle != handle || mesh.TileChangeVersion != change || mesh.TileDataVersion != data ||
-                agent.npcDoorsWillOpen != filter || (npc.transform.position - from).sqrMagnitude != 0 ||
-                started < currentClock.WallTime || completed < started || completed - currentClock.WallTime > MaxTick) return false;
+            bool contextMatches = valid && handle != IntPtr.Zero && nav.DefaultNavmesh == mesh && mesh.NavMeshHandle == handle &&
+                mesh.TileChangeVersion == change && mesh.TileDataVersion == data && agent.npcDoorsWillOpen == filter && (npc.transform.position - from).sqrMagnitude == 0;
+            bool fresh = started >= currentClock.WallTime && completed >= started && completed - currentClock.WallTime <= MaxTick;
+            if (!contextMatches || !fresh) {
+                if (contextMatches && !fresh) nativePathReason = "NATIVE_ROUTE_CHECK_STALE";
+                frame["NativeAdmissionFailure"] = new { Reason = nativePathReason, StartedWall = started, NativeCompletedWall = nativeCompleted, CompletedWall = completed,
+                    NativePhaseSeconds = nativeCompleted - started, ValidationPhaseSeconds = completed - nativeCompleted, ReadDelay = completed - currentClock.WallTime,
+                    ContextMatches = contextMatches, Fresh = fresh, ValidPolys = valid, MeshMatches = nav.DefaultNavmesh == mesh && mesh.NavMeshHandle == handle,
+                    ChangeBefore = change, ChangeAfter = mesh.TileChangeVersion, DataBefore = data, DataAfter = mesh.TileDataVersion,
+                    FilterBefore = filter, FilterAfter = agent.npcDoorsWillOpen, PoseMatches = (npc.transform.position - from).sqrMagnitude == 0,
+                    GlobalPendingBefore = globalBefore, GlobalPendingAfter = globalAfter };
+                return false;
+            }
             nativeAdmission = new NativeRouteReceipt { Mesh = mesh, Handle = handle, From = from, Requested = requested, Filter = filter, Change = change, Data = data,
                 Sequence = currentClock.Sequence, Started = started, Completed = completed, Polys = polys };
             nativeAdmission.Row = new Dictionary<string, object> {
@@ -835,12 +1705,20 @@ namespace RustBots.Navigation
                 foreach (var p in routePolys) { bool v = p != 0 && a.Mesh.IsValidPolyRef(p); oldRows.Add(new { Ref = p.ToString(), Valid = v }); valid &= v; }
                 foreach (var p in a.Polys) { bool v = p != 0 && a.Mesh.IsValidPolyRef(p); freshRows.Add(new { Ref = p.ToString(), Valid = v }); valid &= v; }
                 var after = nav.DefaultNavmesh; bool filterAfter = agent.npcDoorsWillOpen, globalAfter = nav.HasPendingTiles();
+                var expectedVelocity = lastVelocity; var nativeVelocity = body.linearVelocity;
+                bool expectedFinite = Finite(expectedVelocity), nativeFinite = Finite(nativeVelocity);
+                float? velocityError = expectedFinite && nativeFinite ? (float?)Vector3.Distance(nativeVelocity, expectedVelocity) : null;
+                bool velocityMatches = velocityError.HasValue && velocityError.Value <= Numerical;
+                double velocityCheckedWall = Time.realtimeSinceStartupAsDouble;
+                bool stationaryBodyRequired = stationary != null && stationary.FirstWriterCommand == 0 && actuations == stationary.BaseActuations;
+                bool stationaryBodyMatched = !stationaryBodyRequired || stationary.State == "COMMITTED" && stationary.PlanAccepted && StationaryPoseCurrent(stationary);
+                var currentStationaryBody = stationaryBodyRequired ? StationaryBodyRow(CaptureStationaryBody()) : null;
                 bool clock = ClockProblem(currentClock) == null; double checkedWall = Time.realtimeSinceStartupAsDouble;
                 bool accepted = active && before == a.Mesh && after == a.Mesh && a.Mesh.NavMeshHandle == a.Handle && NavEpochMatches() &&
                     changeBefore == a.Change && dataBefore == a.Data && a.Mesh.TileChangeVersion == a.Change && a.Mesh.TileDataVersion == a.Data &&
                     built && onMesh && bodyValid && profileMatches && valid && filterBefore == a.Filter && filterAfter == a.Filter &&
                     a.Sequence == currentClock.Sequence && (a.From - from).sqrMagnitude == 0 && (a.Requested - requested).sqrMagnitude == 0 &&
-                    (measured - from).sqrMagnitude == 0 && (npc.transform.position - measured).sqrMagnitude == 0 && clock &&
+                    (measured - from).sqrMagnitude == 0 && (npc.transform.position - measured).sqrMagnitude == 0 && velocityMatches && stationaryBodyMatched && clock &&
                     checkedWall >= a.Completed && checkedWall - currentClock.WallTime <= MaxTick;
                 if (final) finalNativeAdmission = new { Kind = "POST_SINK_NATIVE_GUARD_V1", Accepted = accepted, Error = (string)null,
                     Sequence = currentClock.Sequence, StartedWall = started, CheckedWall = checkedWall, From = P(measured), Requested = P(requested),
@@ -849,13 +1727,19 @@ namespace RustBots.Navigation
                     DataBefore = dataBefore, DataAfter = after == null ? -1 : after.TileDataVersion,
                     FilterBefore = filterBefore, FilterAfter = filterAfter, DefaultBuilt = built, OnNavMesh = onMesh, ProfileMatches = profileMatches,
                     BodyValid = bodyValid, ClockAccepted = clock, ControlActive = active, RoutePolys = oldRows.ToArray(), NativePolys = freshRows.ToArray(),
+                    StationaryBodyRequired = stationaryBodyRequired, StationaryBodyMatched = stationaryBodyRequired ? (bool?)stationaryBodyMatched : null, StationaryBody = currentStationaryBody,
+                    VelocityPolicy = "NATIVE_POST_SINK_VELOCITY_V1", ExpectedVelocity = P(expectedVelocity), NativeVelocity = P(nativeVelocity),
+                    ExpectedVelocityFinite = expectedFinite, NativeVelocityFinite = nativeFinite, VelocityError = velocityError, VelocityMatches = velocityMatches, VelocityCheckedWall = velocityCheckedWall,
                     GlobalPendingBefore = globalBefore, GlobalPendingAfter = globalAfter };
                 return accepted;
             }
             catch (Exception ex)
             {
                 if (final) finalNativeAdmission = new { Kind = "POST_SINK_NATIVE_GUARD_V1", Accepted = false, Error = "NATIVE_EXCEPTION:" + ex.GetType().Name,
-                    Sequence = currentClock.Sequence, StartedWall = started, CheckedWall = Time.realtimeSinceStartupAsDouble, From = P(measured), Requested = P(requested) };
+                    Sequence = currentClock.Sequence, StartedWall = started, CheckedWall = Time.realtimeSinceStartupAsDouble, From = P(measured), Requested = P(requested),
+                    VelocityPolicy = "NATIVE_POST_SINK_VELOCITY_V1", ExpectedVelocity = P(lastVelocity), NativeVelocity = (float[])null,
+                    ExpectedVelocityFinite = Finite(lastVelocity), NativeVelocityFinite = (bool?)null, VelocityError = (float?)null,
+                    VelocityMatches = false, VelocityCheckedWall = (double?)null };
                 return false;
             }
         }
@@ -866,19 +1750,39 @@ namespace RustBots.Navigation
             frame["WriterCalled"] = false; frame["Actuations"] = actuations; frame["Reason"] = why;
             Emit("MOVE_REJECTED", frame); Block(frame, "UNKNOWN", why);
         }
+        private bool PublishDecision(Dictionary<string, object> frame, Vector3 actual, Vector3 requested)
+        {
+            try { Emit("MOVE_DECISION", frame); return ControlCurrent(); }
+            catch (Exception ex)
+            {
+                // A scene admission/evidence sink may refuse an intent. Retain
+                // that published intent and explicitly cancel it before any
+                // pending metadata, writer call or actuation credit exists.
+                double observed = Time.realtimeSinceStartupAsDouble;
+                finalNativeAdmission = new { Kind = "POST_SINK_NATIVE_GUARD_V1", Accepted = false, Error = "DECISION_SINK_REFUSED:" + ex.GetType().Name,
+                    Sequence = currentClock.Sequence, StartedWall = observed, CheckedWall = observed, From = P(npc.transform.position), Requested = P(requested) };
+                RejectNativeIntent(frame, "DECISION_SINK_REFUSED"); return false;
+            }
+        }
         private void PublishNativeIssue(Dictionary<string, object> frame)
         {
             // MovePosition returned; actual movement still needs the next native witness.
             var issued = Copy(frame); issued["NativeResult"] = "ISSUED"; issued["WriterCalled"] = true; issued["Actuations"] = actuations;
             Emit("MOVE_ISSUED", issued);
+            if (!ControlCurrent()) return;
+            if (commandBraking) Emit("BRAKE_ISSUED", issued);
         }
 
         private bool NavEpochMatches()
         {
             var nav = RustNavigation.Instance;
             return nav != null && nav.DefaultNavmesh != null && nav.DefaultNavmesh == routeMesh && routeMesh.NavMeshHandle == routeMeshHandle && routeMeshHandle != IntPtr.Zero &&
-                routeMesh.TileChangeVersion == routeTileChangeVersion && routeMesh.TileDataVersion == routeTileDataVersion;
+                (epochProof == null || epochProof.Sealed && EpochProofContextMatches(epochProof)) &&
+                routeMesh.TileChangeVersion == AdmissionChange && routeMesh.TileDataVersion == AdmissionData;
         }
+
+        private int AdmissionChange { get { return epochProof == null ? routeTileChangeVersion : epochProof.Change; } }
+        private int AdmissionData { get { return epochProof == null ? routeTileDataVersion : epochProof.Data; } }
 
         private object NavigationRow()
         {
@@ -889,14 +1793,18 @@ namespace RustBots.Navigation
                 Admission = nativeAdmission == null ? null : nativeAdmission.Row,
                 RouteFrom = P(routeFrom), RouteTo = P(destination), Corners = route.Select(P).ToArray(),
                 PlannedTileChangeVersion = routeTileChangeVersion, PlannedTileDataVersion = routeTileDataVersion,
+                AdmissionTileChangeVersion = AdmissionChange, AdmissionTileDataVersion = AdmissionData, EpochRevalidation = epochProof == null ? null : epochProof.Row,
                 TileChangeVersion = mesh == null ? -1 : mesh.TileChangeVersion, TileDataVersion = mesh == null ? -1 : mesh.TileDataVersion,
                 PlannedMesh = routeMesh == null ? null : routeMeshHandle.ToString(), Mesh = mesh == null ? null : mesh.NavMeshHandle.ToString() };
         }
 
-        private void Obstacle(Dictionary<string, object> frame, string classification, string why)
+        private void Obstacle(Dictionary<string, object> frame, string classification, string why, BrakeRestContext rest = null)
         {
+            if (!ControlCurrent()) return;
             frame["Classification"] = classification; frame["Reason"] = why;
             if (pending) { Block(frame, classification, why); return; }
+            if (braking) { UnsafeBrake(frame, "BRAKING_COMMAND_REFUSED:" + why); return; }
+            if (lastVelocity.sqrMagnitude != 0) { RequestBrake(frame, classification, why); return; }
             if (retries++ == 0)
             {
                 Vector3 actual = npc.transform.position;
@@ -905,7 +1813,8 @@ namespace RustBots.Navigation
                 List<Vector3> best = null; ulong[] bestPolys = null; object[] bestLegs = null; float bestLength = float.PositiveInfinity;
                 var nav = RustNavigation.Instance; var mesh = routeMesh;
                 if (nav == null || mesh == null || !NavEpochMatches() || agent.npcDoorsWillOpen != routeFilter)
-                { Block(frame, classification, why + ":NATIVE_REPATH_CONTEXT_UNKNOWN"); return; }
+                { if (rest != null) { frame["RestReplan"] = new { Kind = "OBSTACLE", Accepted = false, Guard = rest.LastGuard, Time = Time.realtimeSinceStartupAsDouble }; BlockRest(frame, why + ":NATIVE_REPATH_CONTEXT_UNKNOWN"); }
+                    else Block(frame, classification, why + ":NATIVE_REPATH_CONTEXT_UNKNOWN"); return; }
                 int change = mesh.TileChangeVersion, data = mesh.TileDataVersion; var handle = mesh.NavMeshHandle; bool filter = routeFilter;
                 for (int sign = -1; sign <= 1; sign += 2)
                 {
@@ -925,12 +1834,23 @@ namespace RustBots.Navigation
                 frame["Retry"] = retries; frame["Route"] = best == null ? new float[0][] : best.Select(P).ToArray();
                 if (best != null && NavEpochMatches() && nav.DefaultNavmesh == mesh && mesh.NavMeshHandle == handle &&
                     mesh.TileChangeVersion == change && mesh.TileDataVersion == data && agent.npcDoorsWillOpen == filter && bestPolys.All(p => p != 0 && mesh.IsValidPolyRef(p))) {
+                    if (rest != null && (!RestContextCurrent(rest, "REST_OBSTACLE_PRECOMMIT") || !NavEpochMatches() || nav.DefaultNavmesh != mesh ||
+                        mesh.NavMeshHandle != handle || mesh.TileChangeVersion != change || mesh.TileDataVersion != data || agent.npcDoorsWillOpen != filter || ClockProblem(currentClock) != null)) {
+                        RestContextCurrent(rest, "REST_OBSTACLE_REFUSED");frame["RestReplanGuard"] = rest.LastGuard; BlockRest(frame, "BRAKE_REST_CHANGED_DURING_NATIVE_REPATH"); return;
+                    }
+                    if (!ControlCurrent()) return;
                     route.Clear(); route.AddRange(best); routePolys = bestPolys; routePlanLegs = bestLegs; routeIndex = 1; routeFrom = actual;
-                    routeStatus = "PathComplete"; lastTime = (float)frame["Time"]; frame["Navigation"] = NavigationRow(); Emit("REPATH", frame); return;
+                    routeStatus = "PathComplete"; lastTime = (float)frame["Time"]; frame["Navigation"] = NavigationRow();
+                    if (rest != null) frame["RestReplan"] = new { Kind = "OBSTACLE", Accepted = true, Guard = rest.LastGuard, Time = Time.realtimeSinceStartupAsDouble };
+                    if (replanAfterRest) { frame["Recovery"] = brakeReceipt; Emit("REPATH_AFTER_REST", frame); if (!ControlCurrent()) return; replanAfterRest = false; }
+                    Emit("REPATH", frame); return;
                 }
+                if (rest != null) frame["RestReplan"] = new { Kind = "OBSTACLE", Accepted = false, Guard = rest.LastGuard, Time = Time.realtimeSinceStartupAsDouble };
                 Emit("REPATH", frame);
+                if (!ControlCurrent()) return;
             }
-            Block(frame, classification, why + ":BOUNDED_REPATH_EXHAUSTED");
+            if (rest != null) { frame["RestReplan"] = new { Kind = "OBSTACLE", Accepted = false, Guard = rest.LastGuard, Time = Time.realtimeSinceStartupAsDouble }; BlockRest(frame, why + ":BOUNDED_REPATH_EXHAUSTED"); }
+            else Block(frame, classification, why + ":BOUNDED_REPATH_EXHAUSTED");
         }
 
         private SupportResult Support(Vector3 position)
@@ -1120,7 +2040,7 @@ namespace RustBots.Navigation
         }
         private Dictionary<string, object> Frame(float now, Vector3 actual)
         {
-            return new Dictionary<string, object> { { "Schema", 2 }, { "Actor", actor }, { "World", world }, { "Stage", stage }, { "Time", now }, { "Tick", ticks },
+            return new Dictionary<string, object> { { "Schema", 2 }, { "RecoveryPolicy", RecoveryPolicy }, { "MotionSession", motionSession }, { "Actor", actor }, { "World", world }, { "Stage", stage }, { "Time", now }, { "Tick", ticks },
                 { "Command", command }, { "Classification", "UNKNOWN" }, { "Reason", reason }, { "Body", BodyRow() }, { "Profile", profile },
                 { "From", P(actual) }, { "Requested", P(actual) }, { "Actual", P(actual) }, { "PreviousTime", lastTime },
                 { "Dt", clockContext ? (object)currentClock.Delta : null }, { "FixedDt", clockContext ? (object)(double)currentClock.Delta : null },
@@ -1140,6 +2060,10 @@ namespace RustBots.Navigation
         }
         private void Block(Dictionary<string, object> frame, string classification, string why)
         {
+            StationaryFailure(why, "BLOCK");
+            if (stationary != null && stationary.FirstWriterCommand == 0 && !pending && actuations == stationary.BaseActuations) {
+                frame["NativeResult"] = "NOT_ISSUED"; frame["WriterCalled"] = false; frame["PendingDecision"] = null;
+            }
             active = false; arrived = false; blocked = true; reason = why;
             frame["Classification"] = classification; frame["Reason"] = why; frame["UnobservedCommand"] = pending;
             Emit("BLOCKED", frame); agent.isStopped = true;
@@ -1148,6 +2072,11 @@ namespace RustBots.Navigation
         {
             if (evidence.Count >= MaxEvidence) { active = false; blocked = true; arrived = false; reason = "EVIDENCE_BUDGET"; return; }
             var row = Copy(frame); row["Event"] = name; row["Casts"] = casts; row["QueryMilliseconds"] = queryClock.Elapsed.TotalMilliseconds;
+            if (name == "MOVE_ISSUED" && stationary != null && stationary.FirstWriterCommand == 0 && actuations > stationary.BaseActuations) {
+                stationary.FirstWriterCommand = command; stationary.State = "WRITTEN";
+            }
+            row["GlobalDeadline"] = sessionGlobalDeadline;
+            row["StationaryReplan"] = StationaryReplanSnapshot();
             if (clockContext) {
                 var telemetry = new Dictionary<string, object> {
                     { "CallbackGap", currentClock.WallTime - (clockReady ? previousClock.WallTime : startWallTime) },
@@ -1167,5 +2096,7 @@ namespace RustBots.Navigation
         private static bool Finite(float v) { return !float.IsNaN(v) && !float.IsInfinity(v); }
         private static bool Finite(double v) { return !double.IsNaN(v) && !double.IsInfinity(v); }
         private static bool Finite(Vector3 v) { return Finite(v.x) && Finite(v.y) && Finite(v.z); }
+        private static bool ExactZero(Vector3 v) { return Finite(v) && v.x == 0 && v.y == 0 && v.z == 0; }
+        private bool ControlCurrent() { return active && !blocked && !arrived && !unobservedTerminal; }
     }
 }

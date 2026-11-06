@@ -72,8 +72,64 @@ function Assert-PortsFree {
     $udp = @(Get-NetUDPEndpoint -ErrorAction Stop | Where-Object { $_.LocalPort -in $ports })
     if ($tcp.Count + $udp.Count) { throw 'BLOCKED: test ports occupied; no foreign shutdown attempted' }
 }
+function Get-ProbeNavigationReference([string]$root,[string]$token,$expected=$null) {
+    if($token -cnotmatch '^[0-9a-f]{32}$'){throw 'Invalid primary reference run token'}
+    Assert-ProbePlainPath $root
+    if($null -ne $expected -and ($expected.Policy -cne 'TRAVERSAL_PRIMARY_REFERENCE_V1' -or $expected.Schema -is [string] -or $expected.Schema -is [bool] -or $expected.Schema -ne 1 -or
+        $expected.File -cne 'plugin-result.json' -or $expected.RunId -cne $token -or $expected.SHA256 -notmatch '^[0-9A-Fa-f]{64}$' -or
+        $null -eq $expected.Length -or $expected.Length -isnot [ValueType] -or $expected.Length -is [bool])){throw 'Invalid primary reference binding'}
+    $path=Join-Path $root 'plugin-result.json';Assert-ProbePlainPath $path
+    $file=Get-Item -LiteralPath $path -Force
+    if($file.PSIsContainer -or $file.Length -le 0){throw 'Missing primary navigation artifact'}
+    $length=$file.Length;$hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash;$file.Refresh()
+    if($file.Length -ne $length){throw 'Primary navigation changed while hashing'}
+    if($null -ne $expected -and ([decimal]$expected.Length -ne [decimal]$length -or $expected.SHA256 -ine $hash)){throw 'Primary navigation length/hash mismatch'}
+    [pscustomobject]@{Policy='TRAVERSAL_PRIMARY_REFERENCE_V1';Schema=1;File='plugin-result.json';RunId=$token;Length=$length;SHA256=$hash}
+}
+function Read-ProbeReportNavigation($saved,[string]$root) {
+    $reference=$saved.NavigationReference
+    if($null -eq $reference){
+        if($null -eq $saved.Navigation -or $saved.Navigation -is [string]){throw 'Report has no verified navigation artifact'}
+        return $saved.Navigation
+    }
+    if($saved.Navigation -cne 'PRIMARY_REFERENCE' -or $saved.TraversalBench -isnot [bool] -or -not $saved.TraversalBench){throw 'Invalid primary-reference report marker'}
+    $null=Get-ProbeNavigationReference $root $saved.RunId $reference
+    $text=[IO.File]::ReadAllText((Join-Path $root 'plugin-result.json'),(New-Object Text.UTF8Encoding($false,$true))).TrimStart([char]0xFEFF)
+    if($text.Contains([char]0)){throw 'Primary navigation contains NUL'}
+    $navigation=$text|ConvertFrom-Json;$text=$null
+    # Bind the bytes actually parsed as well as the file before the read.
+    $null=Get-ProbeNavigationReference $root $saved.RunId $reference
+    if($navigation.RunId -cne $saved.RunId){throw 'Primary navigation run token mismatch'}
+    $navigation
+}
 function Save-Report {
-    $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runtime 'result.json') -Encoding UTF8
+    if(-not $TraversalBench){
+        $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runtime 'result.json') -Encoding UTF8
+        return
+    }
+    # The primary already preserves the complete numeric tree. Never enumerate
+    # Navigation while writing the small bench envelope, even on export failure.
+    $marker='NOT_VERIFIED'
+    try {
+        if((Test-Path -LiteralPath (Join-Path $runtime 'plugin-result.json')) -or $report.Contains('NavigationReference')){
+            $report['NavigationReference']=Get-ProbeNavigationReference $runtime $report.RunId $report.NavigationReference
+            $marker='PRIMARY_REFERENCE'
+        }elseif($null -ne $report.Navigation -and $report.Navigation -isnot [string]){throw 'Completed bench result lacks its primary artifact'}
+    }catch{
+        if(-not $report.Contains('RunnerStatusBeforeReportError')){$report['RunnerStatusBeforeReportError']=$report.Status;$report['RunnerReasonBeforeReportError']=$report.Reason}
+        $report['NavigationReportError']=$_.Exception.Message;$report.Status='FAILED';$report.Reason='Primary navigation reference export failed: '+$_.Exception.Message;$marker='PRIMARY_REFERENCE_UNAVAILABLE'
+    }
+    $envelope=[ordered]@{}
+    foreach($key in $report.Keys){if($key -ne 'Navigation'){$envelope[$key]=$report[$key]}}
+    $envelope['Navigation']=$marker
+    Assert-ProbePlainPath $runtime
+    $destination=Join-Path $runtime 'result.json'
+    if(Test-Path -LiteralPath $destination){Assert-ProbePlainPath $destination}
+    $temporary=Join-Path $runtime ('result-'+[Guid]::NewGuid().ToString('N')+'.tmp')
+    try{
+        $envelope|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $temporary -Encoding UTF8
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    }finally{if(Test-Path -LiteralPath $temporary){Remove-Item -LiteralPath $temporary -Force}}
 }
 
 try {
@@ -378,8 +434,8 @@ try {
             try { Assert-AvatarSafety $report }
             catch { $report.Status='FAILED'; $report.Reason=$_.Exception.Message }
         }
-        if (Test-Path -LiteralPath $runtime) { Save-Report }
         try {
+            if (Test-Path -LiteralPath $runtime) { Save-Report }
             if($FirstHome -and $cache -and $report.Cache.Promoted -and $report.Navigation.FirstHome.SaveReady -and $report.Status -in @('GREEN','PARTIAL')){
                 Write-FirstHomeSaveProof $runtime $cache.Root
             }elseif ($AvatarSurvival -and (-not $RestoreFrom -or $WorldEconomy) -and $cache -and $report.Cache.Promoted -and $report.Status -eq 'GREEN') {

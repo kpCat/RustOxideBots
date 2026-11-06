@@ -1,0 +1,10 @@
+# P2 — вторичный отчёт теряет `Navigation.RoutePlan` векторы
+
+Проверено в 019 GitHub source: `scripts/Invoke-NavigationProbe.ps1` `Save-Report` около line75 делает `$report | ConvertTo-Json -Depth 8 | Set-Content .../result.json`. Первичный `plugin-result.json` — копия исходного результата плагина и корректно валидируется `Assert-TraversalResult`; вторичный `result.json.Navigation.Frames[first MOVE_DECISION].Navigation.RoutePlan[0].NativeCorners[0]` превращается в whitespace string вместо массива из трёх чисел. Аудит frozen 019 фиксирует P2.
+
+**До любого нового игрового PID:**
+- Выяснить точный PowerShell5.1 contract и промежуточные `ConvertFrom-Json` PSObjects/hashtables. Не предполагать, что `-Depth 100` бесплатно решает и время, и память; если он нужен, ограничить применением к подробным traversal reports и установить размер/время, не менять безопасность и старые restore-контракты.
+- Предпочесть lossless **сохранение** вложенных numerical triplets в wrapper либо осмысленный wrapper с явной ссылкой/хешем на первичный файл и сохранением обратной совместимости для всех старых потребителей. Если меняется schema, раздельно и безопасно обновить только доказанные consumers и тесты. Не переписывать frozen raw 019.
+- Offline revalidate exact frozen primary (read-only): сравнить deep shapes (`RoutePlan[].NativeCorners` / `ActorCorners` / `NativePolys`, etc) и numeric semantics первичного и **нового** вторичного файла. Корректный `Assert-TraversalResult` на обоих, либо новый wrapper validator при documented references; no false flag. Проверить JSON depth, UTF8/NUL и сохранение private secret exclusion. Не публиковать private raw.
+- Проверить прошлые runner paths: WorldRoam/Avatar/FirstHome/RESTORE и partial failure report не ухудшаются; no extra game PID to resolve serialization. Если полное исправление требует широкого изменения схемы для restore и превышает узкий scope — P2 оставить задокументированным, не рисковать основным progress G4.
+- Runner file можно добавить в exact allowlist после обоснования и independent review. Commit только публичный код + tests, raw/`secrets.json` никогда.

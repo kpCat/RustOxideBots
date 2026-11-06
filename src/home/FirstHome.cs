@@ -40,6 +40,8 @@ namespace Oxide.Plugins
         private readonly List<object> homeApproaches=new List<object>(),homeTileStates=new List<object>();
         private float homeTilesDeadline;
         private bool homeTilesPending;
+        private readonly HashSet<int> homeSyncRebuilds=new HashSet<int>();
+        private sealed class HomeRebuildPose {public float[] Position,RigidbodyPosition,Rotation;}
         private readonly List<object> homeTcPreviews=new List<object>();
         private sealed class HomeTcDiagnostic {
             public bool OnTerrain,NativePreview,NativeLos,InsideObject,DeployBlocked,CanBuild,HookDenied,Unchanged,LegacyUnchanged;
@@ -67,6 +69,8 @@ namespace Oxide.Plugins
         private readonly List<object> homeToolSwitches=new List<object>();
         private Item homeGatherTool;
         private object homeSiteReceipt,homeUpkeep,homeRebind,homePortal,homeDoorClosed,homeTcAuthorization;
+        private object homeFoundationPreview,homeActualStandGate;
+        private Vector3 homeFoundationPreviewEyes,homeFoundationPreviewRayOrigin,homeFoundationPreviewRayDirection;
         private readonly Dictionary<string,Item> homeTools=new Dictionary<string,Item>();
         private string HomeData { get { return Data("economy.home.json"); } }
         private void HomeIssueFixture() {
@@ -219,7 +223,7 @@ namespace Oxide.Plugins
             for(int count=0;count<64 && homeSearchIndex<HomeSearchLimit;count++) {
                 int index=homeSearchIndex++,i=index/4+1;var rot=Quaternion.Euler(0,Mathf.Floor(Halton(i<=512?i:i-512,5)*8)*45+(index%4)*90,0);Vector3 p;
                 if(i<=512) {
-                    float angle=Halton(i,2)*Mathf.PI*2,r=traversalBench?8+Halton(i,3)*64:8+Halton(i,3)*160;
+                    float angle=Halton(i,2)*Mathf.PI*2,r=traversalBench?6+Halton(i,3)*24:8+Halton(i,3)*160;
                     p=homeSearchOrigin+new Vector3(Mathf.Cos(angle),0,Mathf.Sin(angle))*r;
                 }else {
                     i-=512;p=TerrainMeta.Position+new Vector3((0.05f+Halton(i,2)*0.9f)*TerrainMeta.Size.x,0,(0.05f+Halton(i,3)*0.9f)*TerrainMeta.Size.z);
@@ -231,7 +235,7 @@ namespace Oxide.Plugins
             }
             if(homeSearchIndex>=HomeSearchLimit)throw new InvalidOperationException("Bounded safe home site unavailable before materials");
         }
-        private bool HomeCheckSite(Vector3 p,Quaternion rot) {
+        private bool HomeCheckSite(Vector3 p,Quaternion rot,bool actualStand=false) {
                 var reasons=new List<string>();
                 float min,max;bool water;HomeSurface(p,rot,out min,out max,out water);p.y=max+0.12f;
                 Vector3 foot=Vector3.zero;bool sampled=false;
@@ -239,12 +243,33 @@ namespace Oxide.Plugins
                 // Native terrain yaw follows the planning ray. Recompute the -Z doorway approach after each prediction.
                 for(int pass=0;pass<4;pass++) {
                     var outside=p+rot*new Vector3(0,0,-3);outside.y=TerrainMeta.HeightMap.GetHeight(outside);NavHit navHit;
-                    sampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(outside),out navHit,new Vector3(0.25f,0.5f,0.25f),false) && Ground(navHit.position.Value,out foot);
-                    if(!sampled || !HomeFoundationPreview(p,foot,out preview))break;
+                    sampled=actualStand?TraversalBuildSample(outside,out foot):
+                        RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(outside),out navHit,new Vector3(0.25f,0.5f,0.25f),false) && Ground(navHit.position.Value,out foot);
+                    if(!sampled || !HomeFoundationPreview(p,actualStand?npc.transform.position:foot,out preview,actualStand))break;
                     float turn=Quaternion.Angle(preview.rotation,rot);rot=preview.rotation;
                     HomeSurface(p,rot,out min,out max,out water);float height=max+0.12f;
                     nativePreview=turn<0.05f && Mathf.Abs(height-p.y)<0.01f && Vector3.Distance(preview.position,p)<0.05f;
                     p.y=height;if(nativePreview)break;
+                }
+                if(actualStand) {
+                    var actual=npc.transform.position;var capsule=npc.GetComponent<CapsuleCollider>();var center=capsule.transform.TransformPoint(capsule.center);
+                    float half=capsule.height*0.5f-capsule.radius,tolerance=Physics.defaultContactOffset*2+0.05f;NavHit actualNav;
+                    bool currentSampled=RustNavigation.Instance.DefaultNavmesh.SamplePosition(new NavVector3(actual),out actualNav,new Vector3(0.25f,0.5f,0.25f),false);
+                    var rays=Physics.RaycastAll(actual+Vector3.up*4,Vector3.down,8,-1,QueryTriggerInteraction.Ignore)
+                        .Where(h=>h.collider.GetComponentInParent<BaseEntity>()!=npc).OrderBy(h=>h.distance).ToArray();
+                    var floors=rays.Where(h=>h.collider is TerrainCollider && h.normal.y>=0.85f && Mathf.Abs(actual.y-h.point.y)<=tolerance).ToArray();
+                    var overlaps=Physics.OverlapCapsule(center-capsule.transform.up*half,center+capsule.transform.up*half,capsule.radius,-1,QueryTriggerInteraction.Ignore)
+                        .Where(c=>c.GetComponentInParent<BaseEntity>()!=npc).ToArray();
+                    float currentWater=WaterLevel.GetWaterSurface(actual,true,true,null)-actual.y;
+                    bool grounded=floors.Length>0,clear=overlaps.Length==0;
+                    if(!currentSampled || !agent.isOnNavMesh)reasons.Add("ACTUAL_STAND_NAV");
+                    if(!grounded)reasons.Add("ACTUAL_STAND_SUPPORT");if(!clear)reasons.Add("ACTUAL_STAND_COLLISION");
+                    if(!HomeFinite(currentWater) || currentWater>0.15f)reasons.Add("ACTUAL_STAND_WATER");
+                    homeActualStandGate=new {Position=Point(actual),Sampled=currentSampled,OnNavmesh=agent.isOnNavMesh,NavPoint=currentSampled?Point(actualNav.position.Value):null,
+                        Grounded=grounded,Clear=clear,WaterDepth=currentWater,SupportTolerance=tolerance,Radius=capsule.radius,Height=capsule.height,Mask=-1,Triggers="Ignore",
+                        A=Point(center-capsule.transform.up*half),B=Point(center+capsule.transform.up*half),
+                        RayHits=rays.Select(h=>new {Collider=HomeCollider(h.collider),Point=Point(h.point),Normal=Point(h.normal),Distance=h.distance}).ToArray(),
+                        Overlaps=overlaps.Select(HomeCollider).ToArray()};
                 }
                 float depth=homeDefinitions["FOUNDATION"].bounds.size.y;
                 float entryDelta=p.y-TerrainMeta.HeightMap.GetHeight(p+rot*new Vector3(0,0,-1.5f));
@@ -309,18 +334,29 @@ namespace Oxide.Plugins
                 if(WaterLevel.GetWaterSurface(q,true,true,null)>h-0.1f)water=true;
             }
         }
-        private bool HomeFoundationPreview(Vector3 position,Vector3 stand,out Construction.Placement selected) {
+        private bool HomeFoundationPreview(Vector3 position,Vector3 stand,out Construction.Placement selected,bool actualStand=false) {
             var c=homeDefinitions["FOUNDATION"];var t=HomeTarget(c,null,null,position);
-            if(!t.valid){selected=default(Construction.Placement);return false;}
+            if(!t.valid){selected=default(Construction.Placement);if(actualStand)homeFoundationPreview=new {Accepted=false,ValidTarget=false,ActorPosition=Point(npc.transform.position),Eyes=Point(npc.eyes.position),RayOrigin=Point(t.ray.origin),RayDirection=Point(t.ray.direction),Target=Point(t.position)};return false;}
             // Planning ray from the proposed approach, not the distant actor. Actual Planner still uses real eyes.
-            var eye=stand+(npc.eyes.position-npc.transform.position);t.ray=new Ray(eye,(position-eye).normalized);
+            var eye=actualStand?npc.eyes.position:stand+(npc.eyes.position-npc.transform.position);t.ray=new Ray(eye,(position-eye).normalized);
+            if(actualStand){homeFoundationPreviewEyes=eye;homeFoundationPreviewRayOrigin=t.ray.origin;homeFoundationPreviewRayDirection=t.ray.direction;}
             var male=new List<Socket_Base>();c.FindMaleSockets(t,male);var valid=new List<Construction.Placement>();
             foreach(var socket in male.Where(x=>!x.maleDummy)) {
                 var p=socket.DoPlacement(t);if(p.isPopulated && socket.CheckSocketMods(ref p))valid.Add(p);
             }
-            selected=valid.Count==1?valid[0]:default(Construction.Placement);return valid.Count==1;
+            selected=valid.Count==1?valid[0]:default(Construction.Placement);
+            if(actualStand)homeFoundationPreview=new {Accepted=valid.Count==1,ValidTarget=true,ActorPosition=Point(npc.transform.position),Eyes=Point(eye),RayOrigin=Point(t.ray.origin),RayDirection=Point(t.ray.direction),
+                Target=Point(t.position),Normal=Point(t.normal),TargetRotation=Point(t.rotation),ValidPlacements=valid.Count,Position=valid.Count==1?Point(selected.position):null,
+                Rotation=valid.Count==1?new[] {selected.rotation.x,selected.rotation.y,selected.rotation.z,selected.rotation.w}:null};
+            return valid.Count==1;
         }
         private void HomeMove(Vector3 destination,string stage) {
+            if(traversalBench && homeEntities.ContainsKey("FOUNDATION") && stage.StartsWith("BUILD_",StringComparison.Ordinal)) {
+                TraversalBuildMove(destination,stage);return;
+            }
+            HomeMoveLeg(destination,stage);
+        }
+        private void HomeMoveLeg(Vector3 destination,string stage) {
             var path=new RustNavMeshPath();
             if(!CalculateRoute(destination,path) || path.status!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV "+stage+" "+path.status);
             homeTravelSeconds=Mathf.Ceil(path.GetPathLength()/(localMotion==null?3:Mathf.Min(1.2f,agent.walkSpeed))+30);
@@ -328,14 +364,17 @@ namespace Oxide.Plugins
             homeNavStart=npc.transform.position;target=destination;homeLegTime=progressTime=Time.realtimeSinceStartup;progress=homeNavStart;repaths=0;
             if(localMotion!=null){if(!IssueTraversal(destination,"HOME_"+stage))throw new InvalidOperationException("Home checked movement rejected: "+localMotion.Reason);}
             else{if(!agent.SetDestination(destination))throw new InvalidOperationException("Home SetDestination rejected");agent.isStopped=false;agent.speed=3;}
-            navigating=true;homeNav.Add(new {Event="ISSUED",Stage=stage,Start=Point(homeNavStart),Target=Point(destination),Path=path.status.ToString(),Length=path.GetPathLength(),Time=homeLegTime});
+            navigating=true;homeNav.Add(new {Event=localMotion==null?"ISSUED":"QUEUED",Stage=stage,Start=Point(homeNavStart),Target=Point(destination),Path=path.status.ToString(),Length=path.GetPathLength(),Time=homeLegTime});
         }
         private bool HomeArrived(float now) {
+            if(traversalBench && traversalDestination!=null)return false;
             float distance=Vector3.Distance(npc.transform.position,target);
             if(localMotion!=null && localMotion.Blocked)throw new InvalidOperationException("HOME_NAV checked movement blocked: "+localMotion.Reason);
             if((localMotion==null || localMotion.Arrived) && distance<=0.3f) {
                 homeNav.Add(new {Event="ARRIVED",Start=Point(homeNavStart),Position=Point(npc.transform.position),Target=Point(target),Time=now,Path=agent.pathStatus.ToString(),agent.hasPath,agent.remainingDistance});
-                navigating=false;agent.isStopped=true;return true;
+                navigating=false;agent.isStopped=true;
+                if(traversalBench && TraversalBuildContinue(now))return false;
+                return true;
             }
             if(localMotion==null){if(!agent.hasPath || agent.pathStatus!=NavMeshPathStatus.PathComplete)throw new InvalidOperationException("HOME_NAV lost before physical arrival: "+agent.pathStatus+" distance="+distance);}
             else if(!localMotion.Active && !localMotion.Arrived)throw new InvalidOperationException("HOME_NAV checked route lost before physical arrival");
@@ -431,6 +470,7 @@ namespace Oxide.Plugins
             if(!t.valid)throw new InvalidOperationException("Native placement support surface unavailable");
             bool hookDenied=Oxide.Core.Interface.CallHook("CanBuild",planner,c,t)!=null;
             if(hookDenied)throw new InvalidOperationException("Native CanBuild hook denied home");
+            if(traversalBench && role=="FOUNDATION")TraversalFoundationPaymentGuard(t);
             HomeTcDiagnostic diagnostic=null;
             if(role=="TC") {
                 if(homeTcAttempted)throw new InvalidOperationException("TC paid retry forbidden");
@@ -448,6 +488,10 @@ namespace Oxide.Plugins
             var costs=definition=="DOOR" || definition=="TC"?new List<Cost>{new Cost {Shortname=tool,Amount=1}}:HomeCosts(c.defaultGrade.CostToBuild((BuildingGrade.Enum)(-1)));
             var before=Contents();HomeStartPayment("BUILD_"+role,new {Target=Point(position),Socket=socket==null?null:socket.socketName,Costs=costs});
             Log("HOME_NATIVE_ATTEMPT",new {Role=role,Definition=definition,Target=Point(t.position),RayOrigin=Point(t.ray.origin),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Owner=npc.userID.ToString(),Time=Time.realtimeSinceStartup});
+            if(traversalBench && role=="FOUNDATION") {
+                traversalFoundationAdmission["NativeAttemptTarget"]=Point(t.position);
+                traversalFoundationAdmission["NativeAttemptTime"]=Time.realtimeSinceStartupAsDouble;
+            }
             var created=planner.DoBuild(t,c) as DecayEntity;
             string nativeDebug=Construction.lastPlacementErrorDebug,nativePhrase=Construction.lastPlacementError==null?null:Construction.lastPlacementError.translated;
             var placement=new {Role=role,NativeCall="Planner.DoBuild(Construction.Target,Construction)",Target=Point(t.position),Socket=socket==null?null:socket.socketName,Parent=Id(parent),Entity=Id(created),Error=nativeDebug,Phrase=nativePhrase,Detailed=Construction.lastPlacementErrorIsDetailed,Diagnostic=diagnostic,Before=before,After=Contents(),Time=Time.realtimeSinceStartup};
@@ -466,16 +510,34 @@ namespace Oxide.Plugins
             }
             return created;
         }
+        private string HomeBuildRole() {
+            var roles=traversalBench?new[] {"FOUNDATION","WALL_N","DOORWAY","DOOR","TC","WALL_E","WALL_W","ROOF"}:
+                new[] {"FOUNDATION","WALL_N","WALL_E","WALL_W","DOORWAY","ROOF","TC","DOOR"};
+            if(homeStep<0 || homeStep>=roles.Length)throw new InvalidOperationException("Home native build order exhausted");return roles[homeStep];
+        }
         private void HomeBuildStep() {
-            if(homeStep==0){var block=HomePlace("FOUNDATION","FOUNDATION","building.planner",null,null,homeSite);homeSite=block.transform.position;homeRotation=block.transform.rotation;homeStep++;return;}
-            var foundation=(BuildingBlock)homeEntities["FOUNDATION"];
-            if(homeStep>=1 && homeStep<=4) {
-                string[] roles={"WALL_N","WALL_E","WALL_W","DOORWAY"};int[] sockets={3,4,2,1};string role=roles[homeStep-1];
-                var socket=HomeSocket(foundation,"/wall-female/"+sockets[homeStep-1]);var p=foundation.transform.TransformPoint(socket.position);
-                HomePlace(role,role=="DOORWAY"?"DOORWAY":"WALL","building.planner",foundation,socket,p);homeStep++;return;
+            string role=HomeBuildRole();
+            if(role=="FOUNDATION"){
+                try {
+                    if(traversalBench)TraversalBuildPreflight();var block=HomePlace("FOUNDATION","FOUNDATION","building.planner",null,null,homeSite);
+                    if(traversalBench) {
+                        float positionDelta=Vector3.Distance(block.transform.position,homeSite),rotationDelta=Quaternion.Angle(block.transform.rotation,homeRotation);
+                        traversalFoundationAdmission["BuiltFoundation"]=HomeRow("FOUNDATION",(DecayEntity)block);
+                        traversalFoundationAdmission["BuiltPositionDelta"]=positionDelta;traversalFoundationAdmission["BuiltRotationDelta"]=rotationDelta;
+                        traversalFoundationAdmission["BuiltMatched"]=positionDelta<=0.05f && rotationDelta<=0.05f;
+                        if(positionDelta>0.05f || rotationDelta>0.05f)throw new InvalidOperationException("Paid native foundation differs from admitted actual preview; no next build");
+                    }
+                    homeSite=block.transform.position;homeRotation=block.transform.rotation;homeStep++;return;
+                }catch(Exception ex){if(traversalBench)TraversalFoundationAdmissionFailed(ex.Message);throw;}
             }
-            if(homeStep==5){var wall=homeEntities["WALL_N"];var socket=HomeRoofSocket(wall);HomePlace("ROOF","ROOF","building.planner",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;return;}
-            if(homeStep==6){
+            var foundation=(BuildingBlock)homeEntities["FOUNDATION"];
+            if(role.StartsWith("WALL_",StringComparison.Ordinal) || role=="DOORWAY") {
+                int suffix=role=="WALL_N"?3:role=="WALL_E"?4:role=="WALL_W"?2:1;
+                var socket=HomeSocket(foundation,"/wall-female/"+suffix);var p=foundation.transform.TransformPoint(socket.position);
+                HomePlace(role,role=="DOORWAY"?"DOORWAY":"WALL","building.planner",foundation,socket,p);
+            }
+            else if(role=="ROOF"){var wall=homeEntities["WALL_N"];var socket=HomeRoofSocket(wall);HomePlace("ROOF","ROOF","building.planner",wall,socket,wall.transform.TransformPoint(socket.position));}
+            else if(role=="TC"){
                 var tc=(BuildingPrivlidge)HomePlace("TC","TC","cupboard.tool",foundation,null,foundation.transform.TransformPoint(new Vector3(0.65f,0,0.6f)));
                 var prior=tc.authorizedPlayers.OrderBy(x=>x).ToArray();bool automatic=tc.IsAuthed(npc);var row=HomeRow("TC",tc);
                 Log("HOME_TC_NEW_STATE",new {Owner=tc.OwnerID.ToString(),Actor=npc.userID.ToString(),Authorized=prior,Inventory=HomeTcItems(),Structure=row,NativeAutoauth=automatic});
@@ -489,35 +551,45 @@ namespace Oxide.Plugins
                 homeTcAuthorization=new {TcNetId=Id(tc),Owner=tc.OwnerID.ToString(),Actor=npc.userID.ToString(),BeforeAuthorized=prior,AfterAuthorized=tc.authorizedPlayers.OrderBy(x=>x).ToArray(),InventoryCount=tc.inventory.itemList.Count,
                     NativeAutoauth=automatic,NativeAddCalled=!automatic,AuthorizationHookAllowed=hookAllowed,Authed=tc.IsAuthed(npc),CanBuild=tc.CanBuild(npc),Registered=row.Registered,BuildingId=tc.buildingID.ToString(),ExpectedBuildingId=foundation.buildingID.ToString()};
                 Log("HOME_TC_AUTH",homeTcAuthorization);
-                if(!tc.IsAuthed(npc) || !tc.CanBuild(npc) || tc.authorizedPlayers.Any(x=>x!=npc.userID))throw new InvalidOperationException("Native TC auth refused before final door");homeStep++;return;
+                if(!tc.IsAuthed(npc) || !tc.CanBuild(npc) || tc.authorizedPlayers.Any(x=>x!=npc.userID))throw new InvalidOperationException("Native TC auth refused");
             }
-            if(homeStep==7){var wall=homeEntities["DOORWAY"];var socket=HomeSocket(wall,"/doorway-female/1");HomePlace("DOOR","DOOR","door.hinged.wood",wall,socket,wall.transform.TransformPoint(socket.position));homeStep++;homeWait=Time.realtimeSinceStartup+8;homePhase="VERIFY";return;}
+            else if(role=="DOOR"){var wall=homeEntities["DOORWAY"];var socket=HomeSocket(wall,"/doorway-female/1");HomePlace("DOOR","DOOR","door.hinged.wood",wall,socket,wall.transform.TransformPoint(socket.position));}
+            else throw new InvalidOperationException("Unknown native home role");
+            homeStep++;
+            if(homeStep==8){homeWait=Time.realtimeSinceStartup+8;homePhase="VERIFY";}
+            else if(traversalBench && role=="DOOR")TraversalFixturePause();
         }
         private Vector3 HomeBuildStand() {
             var foundation=homeEntities["FOUNDATION"];BaseEntity parent=foundation;Socket_Base socket=null;
-            string definition;Vector3 place;
-            if(homeStep<=4) {
-                int[] suffix={3,4,2,1};socket=HomeSocket(foundation,"/wall-female/"+suffix[homeStep-1]);
-                definition=homeStep==4?"DOORWAY":"WALL";place=foundation.transform.TransformPoint(socket.position);
-            }else if(homeStep==5) {
+            string role=HomeBuildRole(),definition;Vector3 place;
+            if(role.StartsWith("WALL_",StringComparison.Ordinal) || role=="DOORWAY") {
+                int suffix=role=="WALL_N"?3:role=="WALL_E"?4:role=="WALL_W"?2:1;socket=HomeSocket(foundation,"/wall-female/"+suffix);
+                definition=role=="DOORWAY"?"DOORWAY":"WALL";place=foundation.transform.TransformPoint(socket.position);
+            }else if(role=="ROOF") {
                 parent=homeEntities["WALL_N"];socket=HomeRoofSocket(parent);definition="ROOF";place=parent.transform.TransformPoint(socket.position);
-            }else if(homeStep==6) {
+            }else if(role=="TC") {
                 definition="TC";place=foundation.transform.TransformPoint(new Vector3(0.65f,0,0.6f));
             }else {
                 definition="DOOR";parent=homeEntities["DOORWAY"];socket=HomeSocket(parent,"/doorway-female/1");place=parent.transform.TransformPoint(socket.position);
             }
             var c=homeDefinitions[definition];Vector3 foot;
             // Observe the exact old composite at the post-TC boundary before evaluating new candidates.
-            if(homeStep==7)HomeLegacyApproach();
-            if(HomeApproach(npc.transform.position,"CURRENT",c,parent,place,out foot))return npc.transform.position;
+            if(role=="DOOR" && !traversalBench)HomeLegacyApproach();
+            if(HomeApproach(npc.transform.position,"CURRENT",c,parent,place,out foot) &&
+                (!traversalBench || TraversalBuildOutside(npc.transform.position)))return npc.transform.position;
             var outward=place-foundation.transform.position;outward.y=0;
-            if(homeStep>=6)outward=homeEntities["DOORWAY"].transform.position-foundation.transform.position;
+            if(role=="TC" || role=="DOOR")outward=homeEntities["DOORWAY"].transform.position-foundation.transform.position;
             outward.y=0;if(outward.sqrMagnitude<0.01f)outward=foundation.transform.forward;outward.Normalize();
-            var edge=homeStep>=6?homeEntities["DOORWAY"].transform.position:place;
-            foreach(float distance in new[] {0.75f,1.25f,1.75f,2.25f})foreach(float side in new[] {0f,-0.6f,0.6f}) {
+            var edge=role=="TC" || role=="DOOR"?homeEntities["DOORWAY"].transform.position:place;
+            if(traversalBench && role=="TC") {
+                // G4 already proved the closed Door. The still-open +X side gives
+                // a legal native TC placement ray without opening that Door early.
+                outward=homeRotation*Vector3.right;edge=foundation.transform.TransformPoint(new Vector3(homeDefinitions["FOUNDATION"].bounds.max.x,0,0.6f));
+            }
+            foreach(float distance in traversalBench?new[] {1.25f,1.75f,2.25f,0.75f}:new[] {0.75f,1.25f,1.75f,2.25f})foreach(float side in new[] {0f,-0.6f,0.6f}) {
                 var candidate=edge+outward*distance+Vector3.Cross(Vector3.up,outward)*side;
                 candidate.y=TerrainMeta.HeightMap.GetHeight(candidate);
-                if(HomeApproach(candidate,"GEOMETRY",c,parent,place,out foot))return foot;
+                if(HomeApproach(candidate,"GEOMETRY",c,parent,place,out foot) && (!traversalBench || TraversalBuildOutside(foot)))return foot;
             }
             throw new InvalidOperationException("No physical building approach; see HOME_APPROACH subreasons step="+homeStep);
         }
@@ -632,7 +704,7 @@ namespace Oxide.Plugins
             if(float.IsNaN(minutes) || float.IsInfinity(minutes) || minutes<=beforeMinutes || minutes<60)throw new InvalidOperationException("Native TC protection >=60 minutes not proven");
             HomeWriteIntent("COMMITTED",homeUpkeep);homeIntent=null;Log("HOME_UPKEEP",homeUpkeep);
             Activate(product.uid);homePhase="NAV_WAIT";homeWait=Time.realtimeSinceStartup+30;
-            if(traversalBench){homePhase="FIXTURE";traversalPhase="FIXTURE_WAIT";}
+            if(traversalBench)TraversalFixtureHomeReady();
         }
         private bool HomeInterior(out Vector3 point) {
             var foundation=homeEntities["FOUNDATION"];point=Vector3.zero;
@@ -936,6 +1008,68 @@ namespace Oxide.Plugins
             var door=homeEntities["DOOR"];var outside=door.transform.position+(door.transform.position-homeSite).normalized*1.6f;outside.y=TerrainMeta.HeightMap.GetHeight(outside);Vector3 foot;
             if(!NavSample(outside,out foot))throw new InvalidOperationException("Restored outside path unavailable");homeOutside=foot;homePhase="RESTORE_TRAVEL";HomeMove(foot,"RESTORE_OUTSIDE");
         }
+        private HomeRebuildPose HomeRebuildActualPose() {
+            var q=npc.transform.rotation;return new HomeRebuildPose {Position=Point(npc.transform.position),RigidbodyPosition=Point(npc.GetComponent<Rigidbody>().position),Rotation=new[] {q.x,q.y,q.z,q.w}};
+        }
+        private object HomeRebuildState() {
+            var capsule=npc.GetComponent<CapsuleCollider>();var q=capsule.transform.rotation;
+            return new {Body=TraversalWarmupBody(),Pose=HomeRebuildActualPose(),CapsulePosition=Point(capsule.transform.position),CapsuleRotation=new[] {q.x,q.y,q.z,q.w},
+                NativeVelocity=Point(npc.GetComponent<Rigidbody>().linearVelocity),MeasuredVelocity=Point(traversalLastWitnessNativeVelocity),
+                MeasuredSpeed=traversalLastAcceptedWitness==null?null:traversalLastAcceptedWitness["Speed"],Witness=traversalLastAcceptedWitness==null?null:new {
+                    Command=traversalLastAcceptedWitness["Command"],Stage=traversalLastAcceptedWitness["Stage"],Clock=traversalLastAcceptedWitness["Clock"],Actual=traversalLastAcceptedWitness["Actual"],
+                    Speed=traversalLastAcceptedWitness["Speed"],Body=traversalLastAcceptedWitness["Body"]},
+                Active=localMotion.Active,Blocked=localMotion.Blocked,Arrived=localMotion.Arrived,QueuedDestination=traversalDestination!=null,Navigating=navigating,
+                HostActive=active,Finished=finished,PendingIntent=homeIntent!=null,Phase=homePhase,Step=homeStep,Wait=homeWait,Deadline=homeTilesDeadline,GlobalDeadline=deadline,
+                Actuations=localMotion.Actuations,Issued=traversalIssuedCommands,Accepted=traversalAcceptedWitnesses,Placements=homePlacements.Count,Operations=homeOperations.Count,
+                Native=TraversalReadDestinationNativeReadiness(),Wall=Time.realtimeSinceStartupAsDouble};
+        }
+        private void HomeRequireRebuildRest() {
+            TraversalRequireFoundationRest();
+            var actual=HomeRebuildActualPose();var witnessed=JsonConvert.DeserializeObject<HomeRebuildPose>(JsonConvert.SerializeObject(traversalLastAcceptedWitness["Body"]));
+            var capsule=npc.GetComponent<CapsuleCollider>();var q=capsule.transform.rotation;
+            if(!active || finished || navigating || JsonConvert.SerializeObject(actual)!=JsonConvert.SerializeObject(witnessed) ||
+                !TraversalExactPose(capsule.transform.position,npc.transform.position) || q.x!=actual.Rotation[0] || q.y!=actual.Rotation[1] || q.z!=actual.Rotation[2] || q.w!=actual.Rotation[3])
+                throw new InvalidOperationException("Native rebuild requires unchanged original observed body pose");
+        }
+        private void HomeRebuildAtRest(Bounds bounds,float tick,string role) {
+            var receipt=new Dictionary<string,object> {{"Policy","BENCH_SYNC_NATIVE_REQUEST_V1"},{"Event","REBUILD_REQUEST"},{"Step",homeStep},{"Role",role},
+                {"Entity",homeEntities.ContainsKey(role)?Id(homeEntities[role]):null},{"Center",Point(bounds.center)},{"Size",Point(bounds.size)},{"Time",tick},
+                {"Wait",homeWait},{"Deadline",homeTilesDeadline},{"GlobalDeadline",deadline},{"Phase",homePhase},{"RequestedSync",true},{"Called",false},{"Returned",false},{"Accepted",false},
+                {"StartedWall",Time.realtimeSinceStartupAsDouble},{"CallStartedWall",null},{"CallCompletedWall",null},{"CompletedWall",null},{"Before",null},{"After",null},{"Failure",null}};
+            homeTileStates.Add(receipt);string phase="ENTRY";
+            try {
+                if(!traversalBench || !firstHome || !homeSmoke || mode!="BUILD_SMOKE" || !TestRoot() || saved || restored || homeIntent!=null ||
+                    Directory.GetParent(root).Name!=token || !File.Exists(Path.Combine(root,"rustbots-build-smoke.marker")) || File.ReadAllText(Path.Combine(root,"rustbots-build-smoke.marker"))!=token ||
+                    homeEntities.Count!=homeStep || homePlacements.Count!=homeStep || !homeEntities.ContainsKey(role) || !homeSyncRebuilds.Add(homeStep))
+                    throw new InvalidOperationException("Native synchronous rebuild outside single paid diagnostic boundary");
+                var owned=homeEntities.ToArray();
+                if(owned.Any(x=>x.Value==null || x.Value.OwnerID!=npc.userID || !x.Value.enableSaving || !BaseEntity.saveList.Contains(x.Value)))
+                    throw new InvalidOperationException("Native rebuild lost owned paid structures");
+                receipt["Owned"]=owned.Select(x=>new {Role=x.Key,Entity=Id(x.Value),Owner=x.Value.OwnerID.ToString(),Saving=x.Value.enableSaving,Registered=BaseEntity.saveList.Contains(x.Value),
+                    Center=Point(x.Value.WorldSpaceBounds().ToBounds().center),Size=Point(x.Value.WorldSpaceBounds().ToBounds().size)}).ToArray();
+                HomeRequireRebuildRest();receipt["Before"]=HomeRebuildState();
+                string originalBody=JsonConvert.SerializeObject(TraversalWarmupBody()),originalPose=JsonConvert.SerializeObject(HomeRebuildActualPose());
+                int actuations=localMotion.Actuations,issued=traversalIssuedCommands,accepted=traversalAcceptedWitnesses,placements=homePlacements.Count,operations=homeOperations.Count,step=homeStep;
+                float tileEnd=homeTilesDeadline,globalEnd=deadline,wait=homeWait;string homeState=homePhase;
+                double call=Time.realtimeSinceStartupAsDouble;
+                if(call>tileEnd || call>globalEnd)throw new InvalidOperationException("Native rebuild original deadline expired before request");
+                phase="NATIVE_REQUEST";receipt["Called"]=true;receipt["CallStartedWall"]=call;
+                RustNavigation.Instance.RebuildTilesInBounds(bounds,true);
+                receipt["Returned"]=true;receipt["CallCompletedWall"]=Time.realtimeSinceStartupAsDouble;phase="POST_RETURN";
+                receipt["After"]=HomeRebuildState();HomeRequireRebuildRest();
+                if(originalBody!=JsonConvert.SerializeObject(TraversalWarmupBody()) || originalPose!=JsonConvert.SerializeObject(HomeRebuildActualPose()) ||
+                    actuations!=localMotion.Actuations || issued!=traversalIssuedCommands || accepted!=traversalAcceptedWitnesses || placements!=homePlacements.Count || operations!=homeOperations.Count ||
+                    homeStep!=step || homePhase!=homeState || homeWait!=wait || homeTilesDeadline!=tileEnd || deadline!=globalEnd || homeIntent!=null ||
+                    homeEntities.Count!=owned.Length || owned.Any(x=>!homeEntities.ContainsKey(x.Key) || !object.ReferenceEquals(x.Value,homeEntities[x.Key]) || x.Value.OwnerID!=npc.userID || !x.Value.enableSaving || !BaseEntity.saveList.Contains(x.Value)))
+                    throw new InvalidOperationException("Native rebuild changed observed rest/body/counters/owned references");
+                double completed=Time.realtimeSinceStartupAsDouble;receipt["CompletedWall"]=completed;
+                if(completed>tileEnd || completed>globalEnd)throw new InvalidOperationException("Native rebuild exceeded original tile/global deadline");
+                receipt["Accepted"]=true;
+            }catch(Exception ex) {
+                receipt["CompletedWall"]=Time.realtimeSinceStartupAsDouble;
+                receipt["Failure"]=new {Phase=phase,Reason=ex.GetType().Name+": "+ex.Message,Time=receipt["CompletedWall"]};throw;
+            }finally {Log("HOME_TILES",receipt);}
+        }
         private bool HomeTick() {
             try{return HomeTickCore();}
             catch{homeWatching=homeObserving=false;if(agent!=null)agent.isStopped=true;navigating=false;throw;}
@@ -968,14 +1102,19 @@ namespace Oxide.Plugins
                 if(homePhase=="NAV_WAIT")homeWait=now+30;return true;
             }
             if(homePhase=="BUILD"){
+                string paidRole=traversalBench?HomeBuildRole():null;
                 HomeBuildStep();
-                if(homePhase=="BUILD") {
-                    homePhase="BUILD_WAIT";homeWait=now+2;homeTilesDeadline=now+30;homeTilesPending=false;
+                if(homePhase=="BUILD" || traversalBench) {
+                    if(homePhase=="BUILD"){homePhase="BUILD_WAIT";homeWait=now+2;}
+                    homeTilesDeadline=now+30;homeTilesPending=false;
                     var built=homeEntities.Values.Select(x=>x.WorldSpaceBounds().ToBounds()).ToArray();var bounds=built[0];
                     foreach(var b in built)bounds.Encapsulate(b);
-                    bool before=RustNavigation.Instance.HasPendingTiles();RustNavigation.Instance.RebuildTilesInBounds(bounds,false);
-                    var tiles=new {Step=homeStep,Event="REBUILD_REQUEST",Before=before,After=RustNavigation.Instance.HasPendingTiles(),Center=Point(bounds.center),Size=Point(bounds.size),Time=now};
-                    homeTileStates.Add(tiles);Log("HOME_TILES",tiles);
+                    if(traversalBench)HomeRebuildAtRest(bounds,now,paidRole);
+                    else {
+                        bool before=RustNavigation.Instance.HasPendingTiles();RustNavigation.Instance.RebuildTilesInBounds(bounds,false);
+                        var tiles=new {Step=homeStep,Event="REBUILD_REQUEST",Before=before,After=RustNavigation.Instance.HasPendingTiles(),Center=Point(bounds.center),Size=Point(bounds.size),Time=now};
+                        homeTileStates.Add(tiles);Log("HOME_TILES",tiles);
+                    }
                 }return true;
             }
             if(homePhase=="BUILD_WAIT") {
@@ -987,7 +1126,10 @@ namespace Oxide.Plugins
                 if(now<homeWait)return true;
                 var stand=HomeBuildStand();if(Vector3.Distance(npc.transform.position,stand)<=0.3f)homePhase="BUILD";else{HomeMove(stand,"BUILD_"+homeStep);homePhase="BUILD_TRAVEL";}return true;
             }
-            if(homePhase=="VERIFY"){if(now>=homeWait)HomeAuthorizeAndUpkeep();return true;}
+            if(homePhase=="VERIFY"){
+                if(traversalBench && RustNavigation.Instance.HasPendingTiles()){if(now>=homeTilesDeadline)throw new InvalidOperationException("Full fixture native tiles pending timeout");return true;}
+                if(now>=homeWait)HomeAuthorizeAndUpkeep();return true;
+            }
             if(homePhase=="NAV_WAIT") {
                 if(RustNavigation.Instance.HasPendingTiles()){if(now>=homeWait)throw new InvalidOperationException("Native home rebuild pending timeout");return true;}
                 if(!HomeInterior(out homeInside)){if(now>=homeWait)throw new InvalidOperationException("HOME_NAV native floor/clearance/sample unavailable after rebuild");return true;}
